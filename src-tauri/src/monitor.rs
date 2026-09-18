@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -11,8 +11,8 @@ use tauri::{AppHandle, Emitter};
 use crate::ssh::{ClientHandler, DiskUsage, SessionId, StaticInfo};
 
 /// Visibility registry: monitor tasks poll slower when their tab is hidden.
-static VISIBILITY_MAP: StdMutex<HashMap<SessionId, Arc<AtomicBool>>> =
-    StdMutex::new(HashMap::new());
+static VISIBILITY_MAP: LazyLock<StdMutex<HashMap<SessionId, Arc<AtomicBool>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 fn vis_lock() -> MutexGuard<'static, HashMap<SessionId, Arc<AtomicBool>>> {
     VISIBILITY_MAP.lock().unwrap()
@@ -82,13 +82,13 @@ async fn exec_capture(handle: &client::Handle<ClientHandler>, cmd: &str) -> Resu
     let mut out = Vec::new();
     loop {
         match channel.wait().await {
-            Ok(Some(russh::ChannelMsg::Data { ref data })) => out.extend_from_slice(&data[..]),
-            Ok(Some(russh::ChannelMsg::ExtendedData { ref data, .. })) => {
+            Some(russh::ChannelMsg::Data { ref data }) => out.extend_from_slice(&data[..]),
+            Some(russh::ChannelMsg::ExtendedData { ref data, .. }) => {
                 out.extend_from_slice(&data[..])
             }
-            Ok(Some(russh::ChannelMsg::Eof)) => {}
-            Ok(Some(russh::ChannelMsg::ExitStatus { .. })) => {}
-            Ok(Some(russh::ChannelMsg::Close)) | Ok(None) | Err(_) => break,
+            Some(russh::ChannelMsg::Eof) => {}
+            Some(russh::ChannelMsg::ExitStatus { .. }) => {}
+            Some(russh::ChannelMsg::Close) | None => break,
             _ => {}
         }
     }
@@ -431,7 +431,7 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
 
 pub fn spawn(
     sid: SessionId,
-    handle: client::Handle<ClientHandlerPub>,
+    handle: Arc<client::Handle<ClientHandler>>,
     closed: Arc<AtomicBool>,
     app: AppHandle,
     interval: Duration,

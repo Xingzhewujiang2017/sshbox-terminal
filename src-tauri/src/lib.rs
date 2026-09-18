@@ -11,6 +11,7 @@ pub fn run() {
             ssh::term_write,
             ssh::term_resize,
             ssh::disconnect,
+            ssh::list_sessions,
             ssh::monitor_set_visible
         ])
         .run(tauri::generate_context!())

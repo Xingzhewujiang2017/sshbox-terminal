@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use russh::client;
 use russh::{ChannelMsg, Disconnect};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::monitor;
 
@@ -42,16 +42,22 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
+        _key: &russh::keys::PublicKeyOrCertificate,
+    ) -> std::result::Result<bool, Self::Error> {
         // TODO(M6): host key fingerprint verification / known_hosts
         Ok(true)
     }
 }
 
+/// Commands sent to the PTY pump task (owns the interactive channel).
+pub enum PtyCmd {
+    Data(Vec<u8>),
+    Resize(u32, u32),
+}
+
 pub struct Session {
-    pub handle: client::Handle<ClientHandler>,
-    pub pty_channel_id: russh::ChannelId,
+    pub handle: Arc<client::Handle<ClientHandler>>,
+    pub cmd_tx: mpsc::UnboundedSender<PtyCmd>,
     pub host: String,
     pub username: String,
     pub closed: Arc<AtomicBool>,
@@ -59,7 +65,7 @@ pub struct Session {
 
 #[derive(Default)]
 pub struct SessionManager {
-    pub sessions: Mutex<HashMap<SessionId, Arc<Mutex<Session>>>>,
+    pub sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,27 +78,22 @@ pub struct ConnectParams {
     pub key_passphrase: Option<String>,
 }
 
-fn err_str(e: &anyhow::Error) -> String {
-    format!("{:#}", e)
-}
-
 #[tauri::command]
 pub async fn connect(
     params: ConnectParams,
     state: State<'_, SessionManager>,
     app: AppHandle,
-) -> Result<SessionId, String> {
-    let sid = do_connect(params, state, app).await.map_err(err_str)?;
-    Ok(sid)
+) -> std::result::Result<SessionId, String> {
+    do_connect(params, state.inner(), app).await.map_err(|e| format!("{:#}", e))
 }
 
 async fn do_connect(
     params: ConnectParams,
-    state: State<'_, SessionManager>,
+    state: &SessionManager,
     app: AppHandle,
 ) -> Result<SessionId> {
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(30)),
+        inactivity_timeout: Some(Duration::from_secs(60)),
         keepalive_interval: Some(Duration::from_secs(15)),
         ..<_>::default()
     });
@@ -107,7 +108,7 @@ async fn do_connect(
         handle
             .authenticate_password(&params.username, pw)
             .await
-            .context("密码认证失败")?
+            .context("密码认证请求失败")?
     } else if let Some(key_pem) = &params.private_key {
         let key_pair = russh::keys::ssh_key::PrivateKey::from_openssh(key_pem)
             .context("私钥格式无效(仅支持 OpenSSH 格式)")?;
@@ -118,54 +119,61 @@ async fn do_connect(
                 russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
             )
             .await
-            .context("私钥认证失败")?
+            .context("私钥认证请求失败")?
     } else {
         bail!("需要提供密码或私钥");
     };
     if !auth_res.success() {
-        bail!("认证被服务器拒绝");
+        bail!("认证被服务器拒绝(检查用户名/密码/私钥)");
     }
 
     // Open PTY channel
-    let mut channel = handle.channel_open_session().await.context("打开会话通道失败")?;
-    channel.request_pty(false, "xterm-256color", 80, 24, 0.0, 0.0, &[]).await?;
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .context("打开会话通道失败")?;
+    channel
+        .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
+        .await?;
     channel.request_shell(true).await?;
-    let pty_id = channel.id();
 
     let sid = uuid::Uuid::new_v4().to_string();
     let closed = Arc::new(AtomicBool::new(false));
 
-    // Pump PTY output -> frontend event
+    // PTY pump task: owns the channel; forwards output to frontend events and
+    // accepts Data/Resize commands.
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PtyCmd>();
     {
         let app2 = app.clone();
         let sid2 = sid.clone();
         let closed2 = closed.clone();
         tokio::spawn(async move {
+            let emit = |data: &[u8]| {
+                let b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+                let _ = app2.emit("ssh://data", serde_json::json!({ "sid": sid2, "data": b64 }));
+            };
             loop {
-                match channel.wait().await {
-                    Ok(Some(ChannelMsg::Data { ref data })) => {
-                        let b64 = base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data[..],
-                        );
-                        let _ = app2.emit(
-                            "ssh://data",
-                            serde_json::json!({ "sid": sid2, "data": b64 }),
-                        );
+                tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        match cmd {
+                            PtyCmd::Data(bytes) => {
+                                if channel.data(&bytes[..]).await.is_err() { break; }
+                            }
+                            PtyCmd::Resize(cols, rows) => {
+                                let _ = channel.window_change(cols, rows, 0, 0).await;
+                            }
+                        }
                     }
-                    Ok(Some(ChannelMsg::ExtendedData { ref data, ext: 1 })) => {
-                        let b64 = base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &data[..],
-                        );
-                        let _ = app2.emit(
-                            "ssh://data",
-                            serde_json::json!({ "sid": sid2, "data": b64 }),
-                        );
+                    msg = channel.wait() => {
+                        match msg {
+                            Some(ChannelMsg::Data { ref data }) => emit(&data[..]),
+                            Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => emit(&data[..]),
+                            Some(ChannelMsg::Eof) | Some(ChannelMsg::ExitStatus { .. }) => {}
+                            Some(ChannelMsg::Close) | None => break,
+                            _ => {}
+                        }
                     }
-                    Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::ExitStatus { .. })) => {}
-                    Ok(Some(ChannelMsg::Close)) | Ok(None) | Err(_) => break,
-                    _ => {}
                 }
             }
             closed2.store(true, Ordering::SeqCst);
@@ -173,20 +181,24 @@ async fn do_connect(
         });
     }
 
+    let handle = Arc::new(handle);
     let session = Session {
         handle: handle.clone(),
-        pty_channel_id: pty_id,
+        cmd_tx,
         host: params.host.clone(),
         username: params.username.clone(),
         closed: closed.clone(),
     };
-    let session_arc = Arc::new(Mutex::new(session));
-    state.sessions.lock().await.insert(sid.clone(), session_arc.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(sid.clone(), Arc::new(session));
 
-    // Spawn monitor task
+    // Spawn monitor task (shares the same SSH connection)
     monitor::spawn(
         sid.clone(),
-        handle.clone(),
+        handle,
         closed,
         app.clone(),
         Duration::from_secs(2),
@@ -196,34 +208,41 @@ async fn do_connect(
 }
 
 #[tauri::command]
-pub async fn term_write(sid: SessionId, data: String, state: State<'_, SessionManager>) -> Result<(), String> {
+pub async fn term_write(
+    sid: SessionId,
+    data: String,
+    state: State<'_, SessionManager>,
+) -> std::result::Result<(), String> {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&sid).ok_or("会话不存在")?;
-    let session = session.lock().await;
     session
-        .handle
-        .data(session.pty_channel_id, data.into_bytes().into())
-        .await
-        .map_err(|e| format!("写入失败: {}", e))
+        .cmd_tx
+        .send(PtyCmd::Data(data.into_bytes()))
+        .map_err(|_| "会话已关闭".to_string())
 }
 
 #[tauri::command]
-pub async fn term_resize(sid: SessionId, cols: u32, rows: u32, state: State<'_, SessionManager>) -> Result<(), String> {
+pub async fn term_resize(
+    sid: SessionId,
+    cols: u32,
+    rows: u32,
+    state: State<'_, SessionManager>,
+) -> std::result::Result<(), String> {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(&sid).ok_or("会话不存在")?;
-    let session = session.lock().await;
     session
-        .handle
-        .window_change(session.pty_channel_id, cols, rows, 0, 0)
-        .await
-        .map_err(|e| format!("resize 失败: {}", e))
+        .cmd_tx
+        .send(PtyCmd::Resize(cols, rows))
+        .map_err(|_| "会话已关闭".to_string())
 }
 
 #[tauri::command]
-pub async fn disconnect(sid: SessionId, state: State<'_, SessionManager>) -> Result<(), String> {
+pub async fn disconnect(
+    sid: SessionId,
+    state: State<'_, SessionManager>,
+) -> std::result::Result<(), String> {
     let mut sessions = state.sessions.lock().await;
     if let Some(session) = sessions.remove(&sid) {
-        let session = session.lock().await;
         let _ = session
             .handle
             .disconnect(Disconnect::ByApplication, "user closed", "en");
@@ -232,7 +251,15 @@ pub async fn disconnect(sid: SessionId, state: State<'_, SessionManager>) -> Res
 }
 
 #[tauri::command]
-pub fn monitor_set_visible(sid: SessionId, visible: bool) -> Result<(), String> {
+pub async fn list_sessions(
+    state: State<'_, SessionManager>,
+) -> std::result::Result<Vec<String>, String> {
+    let sessions = state.sessions.lock().await;
+    Ok(sessions.keys().cloned().collect())
+}
+
+#[tauri::command]
+pub fn monitor_set_visible(sid: SessionId, visible: bool) -> std::result::Result<(), String> {
     monitor::set_visible(&sid, visible);
     Ok(())
 }
