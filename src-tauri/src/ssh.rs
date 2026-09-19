@@ -639,6 +639,13 @@ pub async fn session_alive(
         .unwrap_or(false))
 }
 
+/// Static snapshot collected at connect time. Panels ask for it on mount —
+/// the `ssh://static` event can fire before a listener exists.
+#[tauri::command]
+pub fn monitor_static(sid: SessionId) -> Option<StaticInfo> {
+    monitor::cached_static(&sid)
+}
+
 #[tauri::command]
 pub fn monitor_set_visible(sid: SessionId, visible: bool) -> std::result::Result<(), String> {
     monitor::set_visible(&sid, visible);

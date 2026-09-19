@@ -6,7 +6,7 @@
 //! previous sample. No dependency on `top`/`vmstat` (format differs per distro,
 //! busybox images often lack them) and no disturbance to the user's PTY.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -32,6 +32,25 @@ struct TaskHandle {
 
 static REGISTRY: LazyLock<StdMutex<HashMap<SessionId, TaskHandle>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Last static snapshot per session.
+///
+/// `ssh://static` is a one-shot event that fires milliseconds after the
+/// connection, while the UI needs a full IPC round trip just to register a
+/// listener — whoever loses that race used to stare at "采集系统信息中…" until
+/// the session was reconnected (the password-dialog path loses it every time,
+/// because the panel mounts later). The panel now asks for this cache on mount.
+static STATIC_CACHE: LazyLock<StdMutex<HashMap<SessionId, StaticInfo>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// The static snapshot for a session, if it has been collected yet.
+pub fn cached_static(sid: &SessionId) -> Option<StaticInfo> {
+    STATIC_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sid)
+        .cloned()
+}
 
 fn registry() -> MutexGuard<'static, HashMap<SessionId, TaskHandle>> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
@@ -184,13 +203,15 @@ for h in __SYS__/class/hwmon/hwmon*; do
     [ -r "$h/temp${i}_input" ] || continue
     lbl=$(cat "$h/temp${i}_label" 2>/dev/null)
     [ -n "$lbl" ] || lbl="temp$i"
-    echo "$chip|$lbl|$(cat "$h/temp${i}_input" 2>/dev/null)"
+    # ${h##*/} = hwmon 目录名。芯片名会重（两块 NVMe 都叫 nvme），目录名不会，
+    # 所以去重要靠它 —— 按读数条数去重会把一颗多核 CPU 拆成一堆假芯片。
+    echo "${h##*/}|$chip|$lbl|$(cat "$h/temp${i}_input" 2>/dev/null)"
   done
 done | head -40
 # Thermal zones are the fallback for boxes with no hwmon (ARM boards, VMs).
 for z in __SYS__/class/thermal/thermal_zone*; do
   [ -r "$z/temp" ] || continue
-  echo "thermal|$(cat "$z/type" 2>/dev/null)|$(cat "$z/temp" 2>/dev/null)"
+  echo "${z##*/}|thermal|$(cat "$z/type" 2>/dev/null)|$(cat "$z/temp" 2>/dev/null)"
 done | head -8
 echo "@@HW_FAN@@"
 for h in __SYS__/class/hwmon/hwmon*; do
@@ -200,7 +221,7 @@ for h in __SYS__/class/hwmon/hwmon*; do
     [ -r "$h/fan${i}_input" ] || continue
     lbl=$(cat "$h/fan${i}_label" 2>/dev/null)
     [ -n "$lbl" ] || lbl="fan$i"
-    echo "$chip|$lbl|$(cat "$h/fan${i}_input" 2>/dev/null)"
+    echo "${h##*/}|$chip|$lbl|$(cat "$h/fan${i}_input" 2>/dev/null)"
   done
 done | head -12
 echo "@@HW_GPU@@"
@@ -771,20 +792,50 @@ fn opt_int(s: &str) -> Option<u64> {
     opt_num(s).map(|v| v.max(0.0) as u64)
 }
 
+/// 显示名：芯片名重复时（两块 NVMe 都叫 nvme）加 #1/#2，否则保持原名。
+///
+/// 去重必须按 **hwmon 目录**，不能按读数条数：一颗 8 核 CPU 的 coretemp 有 9
+/// 个温度读数，按条数去重会把它拆成 coretemp#1..#9 —— 面板上就成了 9 颗芯片。
+fn unique_names(rows: &[(&str, &str)]) -> HashMap<String, String> {
+    // dir, chip
+    let mut dirs_per_chip: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (dir, chip) in rows {
+        dirs_per_chip.entry(chip).or_default().insert(dir);
+    }
+    let mut per_dir: HashMap<String, String> = HashMap::new();
+    let mut seq: HashMap<&str, u32> = HashMap::new();
+    for (dir, chip) in rows {
+        if per_dir.contains_key(*dir) {
+            continue;
+        }
+        let shared = dirs_per_chip.get(chip).map_or(1, |s| s.len()) > 1;
+        let name = if shared {
+            let n = seq.entry(chip).or_insert(0);
+            *n += 1;
+            format!("{chip}#{n}")
+        } else {
+            (*chip).to_string()
+        };
+        per_dir.insert((*dir).to_string(), name);
+    }
+    per_dir
+}
+
 /// Parse the HW_TEMP / HW_FAN / HW_GPU sections of the slow script. Absent
 /// sections are normal — plenty of machines (containers, VMs, WSL) expose no
 /// sensors at all, and that must stay silent rather than look like an error.
 pub fn parse_hardware(s: &HashMap<String, Vec<String>>) -> HardwareInfo {
     let mut out = HardwareInfo::default();
 
-    let mut raw: Vec<(String, String, f64)> = Vec::new();
+    // (dir, chip, label, value)
+    let mut raw: Vec<(String, String, String, f64)> = Vec::new();
     if let Some(lines) = s.get("HW_TEMP") {
         for line in lines {
             let f: Vec<&str> = line.split('|').collect();
-            if f.len() < 3 {
+            if f.len() < 4 {
                 continue;
             }
-            let Some(milli) = f[2].trim().parse::<f64>().ok() else {
+            let Some(milli) = f[3].trim().parse::<f64>().ok() else {
                 continue;
             };
             // sysfs is millidegrees for hwmon and thermal zones alike.
@@ -792,28 +843,23 @@ pub fn parse_hardware(s: &HashMap<String, Vec<String>>) -> HardwareInfo {
             if !plausible_temp(c) {
                 continue;
             }
-            raw.push((f[0].trim().to_string(), f[1].trim().to_string(), c));
+            raw.push((
+                f[0].trim().to_string(),
+                f[1].trim().to_string(),
+                f[2].trim().to_string(),
+                c,
+            ));
         }
     }
 
-    // Two NVMe drives both call themselves "nvme", and the UI would show two
-    // identical rows. Suffix the chip only when the name really repeats, so
-    // the ordinary single-chip machine stays clean.
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for (chip, _, _) in &raw {
-        *counts.entry(chip.clone()).or_default() += 1;
-    }
-    let mut seen: HashMap<String, u32> = HashMap::new();
-    for (chip, label, celsius) in raw {
-        let name = if counts.get(chip.as_str()).copied().unwrap_or(0) > 1 {
-            let n = seen.entry(chip.clone()).or_insert(0);
-            *n += 1;
-            format!("{chip}#{n}")
-        } else {
-            chip
-        };
+    let keys: Vec<(&str, &str)> = raw
+        .iter()
+        .map(|(d, c, _, _)| (d.as_str(), c.as_str()))
+        .collect();
+    let names = unique_names(&keys);
+    for (dir, _, label, celsius) in raw {
         out.temps.push(TempReading {
-            chip: name,
+            chip: names.get(&dir).cloned().unwrap_or_default(),
             label,
             celsius,
         });
@@ -824,13 +870,14 @@ pub fn parse_hardware(s: &HashMap<String, Vec<String>>) -> HardwareInfo {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let mut raw_fans: Vec<(String, String, String, u32)> = Vec::new();
     if let Some(lines) = s.get("HW_FAN") {
         for line in lines {
             let f: Vec<&str> = line.split('|').collect();
-            if f.len() < 3 {
+            if f.len() < 4 {
                 continue;
             }
-            let Some(rpm) = f[2].trim().parse::<u32>().ok() else {
+            let Some(rpm) = f[3].trim().parse::<u32>().ok() else {
                 continue;
             };
             if rpm == 0 {
@@ -838,12 +885,25 @@ pub fn parse_hardware(s: &HashMap<String, Vec<String>>) -> HardwareInfo {
                 // header that is simply not wired up would be noise.
                 continue;
             }
-            out.fans.push(FanReading {
-                chip: f[0].trim().to_string(),
-                label: f[1].trim().to_string(),
+            raw_fans.push((
+                f[0].trim().to_string(),
+                f[1].trim().to_string(),
+                f[2].trim().to_string(),
                 rpm,
-            });
+            ));
         }
+    }
+    let fan_keys: Vec<(&str, &str)> = raw_fans
+        .iter()
+        .map(|(d, c, _, _)| (d.as_str(), c.as_str()))
+        .collect();
+    let fan_names = unique_names(&fan_keys);
+    for (dir, _, label, rpm) in raw_fans {
+        out.fans.push(FanReading {
+            chip: fan_names.get(&dir).cloned().unwrap_or_default(),
+            label,
+            rpm,
+        });
     }
 
     if let Some(lines) = s.get("HW_GPU") {
@@ -1158,6 +1218,10 @@ pub fn spawn(
         // One-shot static info
         match collect_static(&handle).await {
             Ok(info) => {
+                STATIC_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(sid.clone(), info.clone());
                 let _ = app.emit(
                     "ssh://static",
                     serde_json::json!({ "sid": sid, "info": info }),
@@ -1274,6 +1338,10 @@ pub fn spawn(
             }
         }
         registry().remove(&sid);
+        STATIC_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sid);
     });
 }
 
@@ -1615,9 +1683,9 @@ mod tests {
         let h = hw(&[(
             "HW_TEMP",
             &[
-                "coretemp|Package id 0|45000",
-                "coretemp|Core 0|39000",
-                "nvme|Composite|32850",
+                "hwmon0|coretemp|Package id 0|45000",
+                "hwmon0|coretemp|Core 0|39000",
+                "hwmon1|nvme|Composite|32850",
             ],
         )]);
         assert_eq!(h.temps.len(), 3);
@@ -1634,10 +1702,10 @@ mod tests {
         let h = hw(&[(
             "HW_TEMP",
             &[
-                "coretemp|Package id 0|0",
-                "coretemp|Core 0|100000000",
-                "acpitz|temp1|1000",
-                "coretemp|Core 1|51000",
+                "hwmon0|coretemp|Package id 0|0",
+                "hwmon0|coretemp|Core 0|100000000",
+                "hwmon1|acpitz|temp1|1000",
+                "hwmon0|coretemp|Core 1|51000",
             ],
         )]);
         assert_eq!(h.temps.len(), 1, "只剩一条可信读数: {:?}", h.temps);
@@ -1649,14 +1717,67 @@ mod tests {
         let h = hw(&[(
             "HW_TEMP",
             &[
-                "nvme|Composite|40000",
-                "nvme|Composite|41000",
-                "coretemp|Package id 0|50000",
+                "hwmon1|nvme|Composite|40000",
+                "hwmon2|nvme|Composite|41000",
+                "hwmon0|coretemp|Package id 0|50000",
             ],
         )]);
         let chips: Vec<&str> = h.temps.iter().map(|t| t.chip.as_str()).collect();
         assert!(chips.contains(&"nvme#1") && chips.contains(&"nvme#2"), "{:?}", chips);
         assert!(chips.contains(&"coretemp"), "唯一的名字不该加后缀: {:?}", chips);
+    }
+
+    /// 回归：一颗芯片多个读数不能被当成多颗芯片。coretemp 每个核一个温度，
+    /// 早期按"读数条数"去重，面板上就出现了 coretemp#1..#9 这样的假芯片。
+    #[test]
+    fn parse_hardware_does_not_suffix_a_chip_that_has_many_readings() {
+        let h = hw(&[(
+            "HW_TEMP",
+            &[
+                "hwmon0|coretemp|Package id 0|51000",
+                "hwmon0|coretemp|Core 0|47000",
+                "hwmon0|coretemp|Core 1|45000",
+                "hwmon0|coretemp|Core 2|82000",
+            ],
+        )]);
+        assert_eq!(h.temps.len(), 4);
+        assert!(
+            h.temps.iter().all(|t| t.chip == "coretemp"),
+            "同一颗芯片的读数不该各带一个后缀: {:?}",
+            h.temps
+        );
+    }
+
+    /// 反过来：两块 NVMe 同名，必须分开 —— 但同一目录的多个风扇也不能被拆。
+    #[test]
+    fn parse_hardware_suffixes_by_directory_not_by_reading() {
+        let h = hw(&[
+            (
+                "HW_TEMP",
+                &[
+                    "hwmon0|coretemp|Core 0|40000",
+                    "hwmon1|nvme|Composite|41000",
+                    "hwmon2|nvme|Composite|42000",
+                ],
+            ),
+            (
+                "HW_FAN",
+                &[
+                    "hwmon3|nct6775|fan1|1200",
+                    "hwmon3|nct6775|fan2|900",
+                    "hwmon4|nct6775|fan1|1500",
+                ],
+            ),
+        ]);
+        let chips: Vec<&str> = h.temps.iter().map(|t| t.chip.as_str()).collect();
+        assert!(chips.contains(&"coretemp"), "单颗芯片保持原名: {:?}", chips);
+        assert!(chips.contains(&"nvme#1") && chips.contains(&"nvme#2"), "{:?}", chips);
+        let fans: Vec<(&str, u32)> = h.fans.iter().map(|f| (f.chip.as_str(), f.rpm)).collect();
+        assert_eq!(
+            fans,
+            vec![("nct6775#1", 1200), ("nct6775#1", 900), ("nct6775#2", 1500)],
+            "同一目录的两个风扇要共享一个后缀"
+        );
     }
 
     #[test]
@@ -1697,7 +1818,11 @@ mod tests {
     fn parse_hardware_keeps_fans_and_skips_unwired_zeros() {
         let h = hw(&[(
             "HW_FAN",
-            &["nct6775|fan1|1200", "nct6775|fan2|0", "nct6775|fan3|junk"],
+            &[
+                "hwmon3|nct6775|fan1|1200",
+                "hwmon3|nct6775|fan2|0",
+                "hwmon3|nct6775|fan3|junk",
+            ],
         )]);
         assert_eq!(h.fans.len(), 1);
         assert_eq!(h.fans[0].rpm, 1200);
@@ -1709,7 +1834,7 @@ mod tests {
         let h = hw(&[]);
         assert!(h.temps.is_empty() && h.fans.is_empty() && h.gpus.is_empty());
         // 有 section 但全是垃圾行，同样要安静
-        let h2 = hw(&[("HW_TEMP", &["", "garbage", "a|b"]), ("HW_GPU", &["n|"])]);
+        let h2 = hw(&[("HW_TEMP", &["", "garbage", "a|b", "d|c|e"]), ("HW_GPU", &["n|"])]);
         assert!(h2.temps.is_empty() && h2.gpus.is_empty());
     }
 }
@@ -1951,26 +2076,34 @@ mod live_tests {
     /// Regression guard for the whole process pipeline: a shell loop must show
     /// up as a hot process. This is what catches shell-level field-index bugs
     /// (`$12` vs `${12}`) that synthetic unit tests cannot see.
-    /// 一棵假的 sysfs 树：coretemp（含一个 0°C 的假传感器）+ nvme +
+    /// 一棵假的 sysfs 树：coretemp（含一个 0°C 的假传感器）+ 两块同名 NVMe +
     /// thermal zone + 一个 AMD GPU。测试机（WSL）本身没有任何传感器，
     /// "有传感器"这条路只能靠它覆盖。
+    ///
+    /// 路径和内容都跟 `.dev/fake_sys.sh`（UI 测试用）保持一致，但**故意用不同
+    /// 的目录**：跑一遍 live 测试不能把 UI 那棵树删掉。改这里记得同步改那边。
     const FAKE_SYS_SETUP: &str = r#"
-root=/tmp/sshbox-fake-sys
+root=/tmp/sshbox-fake-sys-test
 rm -rf "$root"
-mkdir -p "$root/class/hwmon/hwmon0" "$root/class/hwmon/hwmon1" \
+mkdir -p "$root/class/hwmon/hwmon0" "$root/class/hwmon/hwmon1" "$root/class/hwmon/hwmon2" \
          "$root/class/thermal/thermal_zone0" "$root/class/drm/card0/device" \
          "$root/drivers/amdgpu"
 printf 'coretemp\n' > "$root/class/hwmon/hwmon0/name"
-printf '45000\n' > "$root/class/hwmon/hwmon0/temp1_input"
-printf 'Package id 0\n' > "$root/class/hwmon/hwmon0/temp1_label"
-printf '0\n' > "$root/class/hwmon/hwmon0/temp2_input"
-printf '1200\n' > "$root/class/hwmon/hwmon0/fan1_input"
+printf '51000\n' > "$root/class/hwmon/hwmon0/temp1_input"; printf 'Package id 0\n' > "$root/class/hwmon/hwmon0/temp1_label"
+printf '47000\n' > "$root/class/hwmon/hwmon0/temp2_input"; printf 'Core 0\n' > "$root/class/hwmon/hwmon0/temp2_label"
+printf '45000\n' > "$root/class/hwmon/hwmon0/temp3_input"; printf 'Core 1\n' > "$root/class/hwmon/hwmon0/temp3_label"
+printf '82000\n' > "$root/class/hwmon/hwmon0/temp4_input"; printf 'Core 2\n' > "$root/class/hwmon/hwmon0/temp4_label"
+printf '0\n'     > "$root/class/hwmon/hwmon0/temp5_input"; printf 'Core 3\n' > "$root/class/hwmon/hwmon0/temp5_label"
+printf '65000\n' > "$root/class/hwmon/hwmon0/temp6_input"; printf 'Core 4\n' > "$root/class/hwmon/hwmon0/temp6_label"
+printf '1200\n'  > "$root/class/hwmon/hwmon0/fan1_input";  printf 'CPU Fan\n' > "$root/class/hwmon/hwmon0/fan1_label"
 printf 'nvme\n' > "$root/class/hwmon/hwmon1/name"
-printf '32850\n' > "$root/class/hwmon/hwmon1/temp1_input"
+printf '32850\n' > "$root/class/hwmon/hwmon1/temp1_input"; printf 'Composite\n' > "$root/class/hwmon/hwmon1/temp1_label"
+printf 'nvme\n' > "$root/class/hwmon/hwmon2/name"
+printf '41000\n' > "$root/class/hwmon/hwmon2/temp1_input"; printf 'Composite\n' > "$root/class/hwmon/hwmon2/temp1_label"
 printf 'x86_pkg_temp\n' > "$root/class/thermal/thermal_zone0/type"
 printf '48000\n' > "$root/class/thermal/thermal_zone0/temp"
 ln -s "$root/drivers/amdgpu" "$root/class/drm/card0/device/driver"
-printf '7\n' > "$root/class/drm/card0/device/gpu_busy_percent"
+printf '34\n' > "$root/class/drm/card0/device/gpu_busy_percent"
 printf '1610612736\n' > "$root/class/drm/card0/device/mem_info_vram_used"
 printf '8589934592\n' > "$root/class/drm/card0/device/mem_info_vram_total"
 echo ok
@@ -1995,26 +2128,58 @@ echo ok
 
         // SSHBOX_SYSFS 是本进程的环境变量，所以这个测试别和别的动
         // slow_script() 的测试并行跑（live 测试一律 --test-threads=1）。
-        std::env::set_var("SSHBOX_SYSFS", "/tmp/sshbox-fake-sys");
+        std::env::set_var("SSHBOX_SYSFS", "/tmp/sshbox-fake-sys-test");
         let raw = exec_capture(&h, &slow_script()).await.expect("慢脚本失败");
         std::env::remove_var("SSHBOX_SYSFS");
         let hw = parse_hardware(&sections(&raw));
         eprintln!("假树读数: {:?}", hw);
 
-        assert_eq!(hw.temps.len(), 3, "0°C 的假传感器必须被丢掉: {:?}", hw.temps);
+        // 假树：8 条可信读数 + 1 条 0°C 的假传感器（必须被丢掉）
+        assert_eq!(hw.temps.len(), 8, "0°C 的假传感器必须被丢掉: {:?}", hw.temps);
         assert!(
-            (hw.temps[0].celsius - 48.0).abs() < 0.01,
+            hw.temps.iter().all(|t| (5.0..=125.0).contains(&t.celsius)),
+            "不该有越界读数: {:?}",
+            hw.temps
+        );
+        assert!(
+            !hw.temps.iter().any(|t| t.label == "Core 3"),
+            "0°C 那条（Core 3）必须被丢掉: {:?}",
+            hw.temps
+        );
+        assert!(
+            (hw.temps[0].celsius - 82.0).abs() < 0.01,
             "最热的排第一: {:?}",
             hw.temps
         );
         assert!(hw
             .temps
             .iter()
-            .any(|t| t.label == "Package id 0" && (t.celsius - 45.0).abs() < 0.01));
+            .any(|t| t.label == "Package id 0" && (t.celsius - 51.0).abs() < 0.01));
         assert!(hw
             .temps
             .iter()
-            .any(|t| t.chip == "nvme" && (t.celsius - 32.85).abs() < 0.01));
+            .any(|t| t.label == "Core 4" && (t.celsius - 65.0).abs() < 0.01));
+        // 两块 NVMe 同名 -> 加后缀；thermal zone 的 chip 固定是 "thermal"
+        assert_eq!(
+            hw.temps.iter().filter(|t| t.label == "Composite").count(),
+            2
+        );
+        assert!(
+            hw.temps.iter().any(|t| t.chip.starts_with("nvme#")),
+            "重复的芯片名要加后缀: {:?}",
+            hw.temps
+        );
+        // 反过来：coretemp 有 5 条读数却只有一颗芯片，绝不能出现 coretemp#N
+        assert!(
+            hw.temps.iter().filter(|t| t.chip == "coretemp").count() == 5,
+            "同一颗芯片的读数必须共用一个名字: {:?}",
+            hw.temps
+        );
+        assert!(
+            !hw.temps.iter().any(|t| t.chip.starts_with("coretemp#")),
+            "一颗芯片被按读数条数拆开了: {:?}",
+            hw.temps
+        );
         assert!(hw
             .temps
             .iter()
@@ -2023,7 +2188,7 @@ echo ok
         assert_eq!(hw.fans[0].rpm, 1200);
         assert_eq!(hw.gpus.len(), 1);
         assert_eq!(hw.gpus[0].name, "AMD GPU (amdgpu)");
-        assert_eq!(hw.gpus[0].util_pct, Some(7.0));
+        assert_eq!(hw.gpus[0].util_pct, Some(34.0));
         assert_eq!(hw.gpus[0].mem_total_mb, Some(8192));
 
         // 同一台机器、真 /sys：没有任何传感器 —— 安静，而不是造数据
@@ -2036,7 +2201,7 @@ echo ok
             hwr
         );
 
-        let _ = exec_capture(&h, "rm -rf /tmp/sshbox-fake-sys").await;
+        let _ = exec_capture(&h, "rm -rf /tmp/sshbox-fake-sys-test").await;
     }
 
     #[tokio::test]

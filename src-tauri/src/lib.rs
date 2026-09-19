@@ -26,6 +26,7 @@ pub fn run() {
             ssh::disconnect,
             ssh::list_sessions,
             ssh::session_alive,
+            ssh::monitor_static,
             ssh::monitor_set_visible,
             ssh::monitor_restart,
             ssh::monitor_set_paused,

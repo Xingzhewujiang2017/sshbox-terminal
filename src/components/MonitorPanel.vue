@@ -246,6 +246,14 @@ onMounted(async () => {
   unlistenHardware = await listen<{ sid: string; hardware: HardwareInfo }>('ssh://hardware', (e) => {
     if (e.payload.sid === props.sid) hardware.value = e.payload.hardware
   })
+  // 一次性事件可能在我们订阅之前就发过了（密码弹窗那条路径必然如此），
+  // 所以订阅之后补拉一次后端缓存 —— 否则表头永远停在"采集系统信息中…"。
+  try {
+    const snap = (await api.monitorStatic(props.sid)) as StaticInfo | null
+    if (snap && !info.value) info.value = snap
+  } catch {
+    /* 还没采到就等事件 */
+  }
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
     const m = e.payload.metrics

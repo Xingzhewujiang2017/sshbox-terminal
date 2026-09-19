@@ -291,6 +291,8 @@ export const api = {
     call<void>('term_resize', { sid, cols, rows }),
   listSessions: () => call<SessionInfo[]>('list_sessions'),
   sessionAlive: (sid: string) => call<boolean>('session_alive', { sid }),
+  /** 静态信息快照：面板挂载时补拉一次，避免错过一次性事件。 */
+  monitorStatic: (sid: string) => call<Record<string, unknown> | null>('monitor_static', { sid }),
   monitorSetVisible: (sid: string, visible: boolean) =>
     call<void>('monitor_set_visible', { sid, visible }),
   monitorRestart: (sid: string) => call<void>('monitor_restart', { sid }),
