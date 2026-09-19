@@ -374,6 +374,17 @@ async fn do_connect(
     };
 
     // --- Authentication ---
+    log::info!(
+        "[连接 {}:{}] TCP+握手完成，开始认证 user={} 方式={}",
+        params.host,
+        port,
+        params.username,
+        if params.password.is_some() {
+            "password"
+        } else {
+            "publickey"
+        }
+    );
     let auth_res = if let Some(pw) = params.password.as_ref().filter(|p| !p.is_empty()) {
         handle
             .authenticate_password(&params.username, pw)
@@ -445,18 +456,22 @@ async fn do_connect(
     }
 
     // --- PTY channel ---
+    log::info!("[连接 {}:{}] 认证结果 success={}", params.host, port, auth_res.success());
     let mut channel = handle
         .channel_open_session()
         .await
         .map_err(|e| err_kind("pty_failed", format!("打开会话通道失败: {}", e)))?;
+    log::info!("[连接 {}:{}] 会话通道已打开，请求 PTY", params.host, port);
     channel
         .request_pty(false, "xterm-256color", 80, 24, 0, 0, &[])
         .await
         .map_err(|e| err_kind("pty_failed", format!("请求 PTY 失败: {}", e)))?;
+    log::info!("[连接 {}:{}] PTY 已请求，启动 shell", params.host, port);
     channel
         .request_shell(true)
         .await
         .map_err(|e| err_kind("pty_failed", format!("启动 shell 失败: {}", e)))?;
+    log::info!("[连接 {}:{}] shell 请求已发送", params.host, port);
 
     let sid = uuid::Uuid::new_v4().to_string();
     let closed = Arc::new(AtomicBool::new(false));

@@ -48,8 +48,20 @@ export async function call<T>(cmd: string, args?: Record<string, unknown>): Prom
   try {
     return await invoke<T>(cmd, args)
   } catch (e) {
-    throw toSshboxError(e)
+    const err = toSshboxError(e)
+    void uiLog(`${cmd} 失败 kind=${err.kind}: ${err.message}`, err.kind === 'unknown' ? 'error' : 'warn')
+    throw err
   }
+}
+
+/**
+ * Push a UI event into the backend log file.
+ *
+ * WebView2 is not scriptable from outside the app, so this is how frontend
+ * state transitions become observable when debugging "nothing happened".
+ */
+export function uiLog(msg: string, level: 'info' | 'warn' | 'error' | 'debug' = 'info'): Promise<void> {
+  return invoke<void>('ui_log', { msg, level }).catch(() => {})
 }
 
 // --- types mirroring the Rust structs -------------------------------------

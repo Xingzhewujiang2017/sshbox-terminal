@@ -46,6 +46,7 @@ pub fn run() {
             commands::hosts_export,
             commands::hosts_import,
             commands::app_paths,
+            commands::ui_log,
         ])
         .setup(|_app| {
             log::info!(

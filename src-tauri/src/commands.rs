@@ -203,3 +203,19 @@ pub fn app_paths() -> AppPaths {
         credential_store_ok: store::credential_store_ok(),
     }
 }
+
+/// Frontend → backend log bridge.
+///
+/// The WebView is not scriptable from outside, so UI state transitions are
+/// pushed through this command and land in the same log file as the backend's
+/// — which is the only way to see what the frontend did when a dialog is
+/// expected but does not appear.
+#[tauri::command]
+pub fn ui_log(msg: String, level: Option<String>) {
+    match level.as_deref() {
+        Some("error") => log::error!("[ui] {}", msg),
+        Some("warn") => log::warn!("[ui] {}", msg),
+        Some("debug") => log::debug!("[ui] {}", msg),
+        _ => log::info!("[ui] {}", msg),
+    }
+}

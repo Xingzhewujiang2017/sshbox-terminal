@@ -11,6 +11,7 @@ import SettingsDialog from './components/SettingsDialog.vue'
 import {
   api,
   SshboxError,
+  uiLog,
   type AppPaths,
   type ErrPayload,
   type Host,
@@ -131,6 +132,15 @@ async function connectHost(host: Host, opts: {
   tabId?: string
 } = {}) {
   busyHostId.value = host.id
+  uiLog(
+    `连接请求 ${host.username}@${host.host}:${host.port} 参数=${JSON.stringify({
+      pw: !!opts.password,
+      ph: !!opts.keyPassphrase,
+      acceptKey: !!opts.acceptHostKey,
+      save: !!opts.savePassword,
+      reconnect: !!opts.tabId,
+    })}`,
+  )
   try {
     const sid = await api.connectHost({
       hostId: host.id,
@@ -140,6 +150,7 @@ async function connectHost(host: Host, opts: {
       savePassword: opts.savePassword,
     })
     addTab(sid, host, undefined, opts.tabId)
+    uiLog(`连接成功 sid=${sid}`)
     banner.value = null
   } catch (e) {
     handleConnectError(e as SshboxError, host, opts)
@@ -150,9 +161,11 @@ async function connectHost(host: Host, opts: {
 
 function handleConnectError(err: SshboxError, host: Host, opts: Record<string, unknown>) {
   const p = err.payload ?? ({ kind: 'unknown', message: err.message } as ErrPayload)
+  uiLog(`连接失败 kind=${p.kind}: ${p.message}`, 'warn')
   switch (p.kind) {
     case 'host_key_unknown':
     case 'host_key_changed':
+      uiLog('已打开主机密钥确认框')
       hostKeyPrompt.value = {
         payload: p,
         retry: () => {
@@ -165,6 +178,7 @@ function handleConnectError(err: SshboxError, host: Host, opts: Record<string, u
     case 'auth_failed':
     case 'need_passphrase':
     case 'key_passphrase_wrong':
+      uiLog('已打开密码/口令输入框')
       passwordPrompt.value = {
         payload: p,
         hostLabel: `${host.username}@${host.host}${host.port !== 22 ? ':' + host.port : ''}`,
