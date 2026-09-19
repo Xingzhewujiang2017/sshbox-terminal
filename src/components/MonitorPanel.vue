@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, computed, nextTick } from 'vue'
+import { onMounted, onBeforeUnmount, ref, computed, nextTick, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
+import { chartPalette, themeVersion } from '../theme'
 import { api, type DiskUsage, type Metrics } from '../api'
 
 interface StaticInfo {
@@ -110,8 +111,48 @@ let netChart: echarts.ECharts | null = null
 let ioChart: echarts.ECharts | null = null
 let ro: ResizeObserver | null = null
 
-const AXIS = { fontSize: 9, color: '#6c7086' }
-const LEGEND = { textStyle: { fontSize: 10 }, top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
+const AXIS = { fontSize: 9 }
+const LEGEND = { top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
+
+/** 主题相关的那部分图表配置。切换主题时只重发这些，不碰数据。
+ *  画布是像素，读不到 CSS 变量，所以颜色必须运行时从 chartPalette() 取。 */
+function colorOption(p: ReturnType<typeof chartPalette>, seriesColors: string[]) {
+  return {
+    textStyle: { color: p.text },
+    legend: { textStyle: { fontSize: 10, color: p.axis } },
+    tooltip: { backgroundColor: p.surface1, borderColor: p.split, textStyle: { color: p.text } },
+    xAxis: { axisLabel: { color: p.axis }, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: {
+      axisLabel: { color: p.axis },
+      splitLine: { lineStyle: { color: p.split } },
+      axisLine: { lineStyle: { color: p.split } },
+    },
+    series: seriesColors.map((c) => ({
+      itemStyle: { color: c },
+      lineStyle: { color: c },
+      areaStyle: { color: c },
+    })),
+  }
+}
+
+/** 三个图的系列配色（和下面仪表环保持一致：CPU 蓝、内存绿、读橙、写紫）。 */
+function seriesColors(): string[][] {
+  const p = chartPalette()
+  return [
+    [p.blue, p.green],
+    [p.green, p.blue],
+    [p.peach, p.mauve],
+  ]
+}
+
+/** 主题变了：只重发颜色，不动已经攒下来的历史数据。 */
+function repaint() {
+  const p = chartPalette()
+  const cols = seriesColors()
+  cpuChart?.setOption(colorOption(p, cols[0]))
+  netChart?.setOption(colorOption(p, cols[1]))
+  ioChart?.setOption(colorOption(p, cols[2]))
+}
 
 /** 温度分档：<60 正常，60-79 偏热，>=80 该看一眼了。 */
 function heat(c: number): string {
@@ -171,32 +212,44 @@ const netTotals = computed(() => {
 
 /** Percent chart (fixed 0-100 axis). */
 function initPct(el: HTMLDivElement): echarts.ECharts {
-  const c = echarts.init(el, 'dark')
+  const p = chartPalette()
+  const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
+    ...colorOption(p, seriesColors()[0]),
     grid: { left: 34, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: ['CPU %', '内存 %'] },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => v.toFixed(1) + '%' },
     xAxis: { type: 'category', data: [], axisLabel: AXIS },
-    yAxis: { type: 'value', min: 0, max: 100, axisLabel: AXIS, splitLine: { lineStyle: { color: '#313244' } } },
-    series: [
-      { name: 'CPU %', type: 'line', data: [], smooth: true, showSymbol: false, lineStyle: { width: 1.5 }, areaStyle: { opacity: 0.15 } },
-      { name: '内存 %', type: 'line', data: [], smooth: true, showSymbol: false, lineStyle: { width: 1.5 }, areaStyle: { opacity: 0.15 } },
-    ],
+    yAxis: { type: 'value', min: 0, max: 100, axisLabel: AXIS },
+    // 系列在这里重建，会盖掉上面 colorOption 展开的 series，所以颜色必须显式带上，
+    // 否则这张图会退回 ECharts 自带调色板，切主题时颜色会跳一下。
+    series: [['CPU %', p.blue], ['内存 %', p.green]].map(([name, color]) => ({
+      name,
+      type: 'line',
+      data: [],
+      smooth: true,
+      showSymbol: false,
+      lineStyle: { width: 1.5, color },
+      itemStyle: { color },
+      areaStyle: { opacity: 0.15, color },
+    })),
   })
   return c
 }
 
 /** Rate chart (bytes/s, auto-scaled axis with human labels). */
 function initRate(el: HTMLDivElement, names: string[], colors: string[]): echarts.ECharts {
-  const c = echarts.init(el, 'dark')
+  const p = chartPalette()
+  const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
+    ...colorOption(p, colors),
     grid: { left: 46, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: names },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => fmtBytes(v) },
     xAxis: { type: 'category', data: [], axisLabel: AXIS },
-    yAxis: { type: 'value', min: 0, axisLabel: { ...AXIS, formatter: fmtRateShort }, splitLine: { lineStyle: { color: '#313244' } } },
+    yAxis: { type: 'value', min: 0, axisLabel: { ...AXIS, formatter: fmtRateShort } },
     series: names.map((n, i) => ({
       name: n, type: 'line', data: [], smooth: true, showSymbol: false,
       lineStyle: { width: 1.5, color: colors[i] },
@@ -213,10 +266,14 @@ function initRate(el: HTMLDivElement, names: string[], colors: string[]): echart
  * in onMounted.
  */
 function ensureCharts() {
+  const cols = seriesColors()
   if (!cpuChart && cpuEl.value) cpuChart = initPct(cpuEl.value)
-  if (!netChart && netEl.value) netChart = initRate(netEl.value, ['↓ 下行', '↑ 上行'], ['#a6e3a1', '#89b4fa'])
-  if (!ioChart && ioEl.value) ioChart = initRate(ioEl.value, ['读', '写'], ['#fab387', '#cba6f7'])
+  if (!netChart && netEl.value) netChart = initRate(netEl.value, ['↓ 下行', '↑ 上行'], cols[1])
+  if (!ioChart && ioEl.value) ioChart = initRate(ioEl.value, ['读', '写'], cols[2])
 }
+
+/** 主题一变立刻重上色，不等下一个采样点。 */
+watch(themeVersion, () => repaint())
 
 function updateCharts() {
   const h = history.value
@@ -330,13 +387,13 @@ onBeforeUnmount(() => {
     <template v-if="metrics">
       <div class="gauges">
         <div class="gauge">
-          <div class="ring" :style="{ '--pct': metrics.cpu_pct + '%', '--color': metrics.cpu_pct > 85 ? '#f38ba8' : '#89b4fa' }">
+          <div class="ring" :style="{ '--pct': metrics.cpu_pct + '%', '--color': metrics.cpu_pct > 85 ? 'var(--ctp-red)' : 'var(--ctp-blue)' }">
             <div class="ring-val">{{ metrics.cpu_pct.toFixed(0) }}%</div>
           </div>
           <div class="gauge-label">CPU</div>
         </div>
         <div class="gauge">
-          <div class="ring" :style="{ '--pct': metrics.mem_pct + '%', '--color': metrics.mem_pct > 85 ? '#f38ba8' : '#a6e3a1' }">
+          <div class="ring" :style="{ '--pct': metrics.mem_pct + '%', '--color': metrics.mem_pct > 85 ? 'var(--ctp-red)' : 'var(--ctp-green)' }">
             <div class="ring-val">{{ metrics.mem_pct.toFixed(0) }}%</div>
           </div>
           <div class="gauge-label">{{ fmtKB(metrics.mem_used_kb) }} / {{ fmtKB(metrics.mem_total_kb) }}</div>
@@ -484,108 +541,108 @@ onBeforeUnmount(() => {
 .monitor {
   height: 100%;
   overflow-y: auto;
-  background: #181825;
-  color: #cdd6f4;
+  background: var(--ctp-mantle);
+  color: var(--ctp-text);
   font-size: 12px;
   padding: 10px;
   box-sizing: border-box;
 }
 .bar { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }
-.bar-label { color: #6c7086; font-size: 11px; margin-right: 2px; }
+.bar-label { color: var(--ctp-overlay0); font-size: 11px; margin-right: 2px; }
 .bar-spacer { flex: 1; }
 .chip {
-  background: #1e1e2e; color: #a6adc8; border: 1px solid #313244; border-radius: 5px;
+  background: var(--ctp-base); color: var(--ctp-subtext0); border: 1px solid var(--ctp-surface0); border-radius: 5px;
   font-size: 11px; padding: 2px 7px; cursor: pointer; font-family: inherit;
 }
-.chip:hover { border-color: #585b70; color: #cdd6f4; }
-.chip.on { background: #89b4fa; border-color: #89b4fa; color: #11111b; font-weight: 600; }
-.chip.warn { background: #f9e2af; border-color: #f9e2af; color: #11111b; font-weight: 600; }
+.chip:hover { border-color: var(--ctp-surface2); color: var(--ctp-text); }
+.chip.on { background: var(--ctp-blue); border-color: var(--ctp-blue); color: var(--on-accent); font-weight: 600; }
+.chip.warn { background: var(--ctp-yellow); border-color: var(--ctp-yellow); color: var(--on-accent); font-weight: 600; }
 .paused-banner {
-  background: #313244; color: #f9e2af; border-radius: 6px; padding: 5px 8px;
+  background: var(--ctp-surface0); color: var(--ctp-yellow); border-radius: 6px; padding: 5px 8px;
   margin-bottom: 8px; font-size: 11px; text-align: center;
 }
-.placeholder { color: #6c7086; padding: 20px 0; text-align: center; }
-.static-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.host { font-size: 15px; font-weight: 600; margin-bottom: 6px; color: #89b4fa; }
+.placeholder { color: var(--ctp-overlay0); padding: 20px 0; text-align: center; }
+.static-box { background: var(--ctp-base); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.host { font-size: 15px; font-weight: 600; margin-bottom: 6px; color: var(--ctp-blue); }
 .row { display: flex; gap: 6px; padding: 2px 0; }
-.row span { color: #6c7086; min-width: 36px; }
+.row span { color: var(--ctp-overlay0); min-width: 36px; }
 .gauges { display: flex; gap: 10px; justify-content: space-around; margin-bottom: 10px; }
 .gauge { text-align: center; }
 .ring {
   width: 72px; height: 72px; border-radius: 50%;
-  background: conic-gradient(var(--color) var(--pct), #313244 0);
+  background: conic-gradient(var(--color) var(--pct), var(--ctp-surface0) 0);
   display: flex; align-items: center; justify-content: center;
   margin: 0 auto;
 }
 .ring::before { content: ''; position: absolute; }
 .ring-val {
-  width: 56px; height: 56px; border-radius: 50%; background: #181825;
+  width: 56px; height: 56px; border-radius: 50%; background: var(--ctp-mantle);
   display: flex; align-items: center; justify-content: center;
   font-size: 14px; font-weight: 600;
 }
-.gauge-label { margin-top: 4px; color: #a6adc8; font-size: 11px; }
-.section-title { font-weight: 600; color: #a6adc8; margin: 8px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.section-title .unit { color: #585b70; font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }
-.card, .net-box, .disk-box { background: #1e1e2e; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+.gauge-label { margin-top: 4px; color: var(--ctp-subtext0); font-size: 11px; }
+.section-title { font-weight: 600; color: var(--ctp-subtext0); margin: 8px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.section-title .unit { color: var(--ctp-surface2); font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }
+.card, .net-box, .disk-box { background: var(--ctp-base); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
 .net-total { display: flex; gap: 16px; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
-.down { color: #a6e3a1; } .up { color: #89b4fa; }
-.net-if, .io-row { display: flex; gap: 10px; color: #a6adc8; padding: 1px 0; }
-.ifname { color: #6c7086; min-width: 56px; }
+.down { color: var(--ctp-green); } .up { color: var(--ctp-blue); }
+.net-if, .io-row { display: flex; gap: 10px; color: var(--ctp-subtext0); padding: 1px 0; }
+.ifname { color: var(--ctp-overlay0); min-width: 56px; }
 .disk-row { margin-bottom: 6px; }
 .disk-head { display: flex; justify-content: space-between; margin-bottom: 2px; }
-.bar { height: 6px; background: #313244; border-radius: 3px; overflow: hidden; }
-.bar-fill { height: 100%; background: #89b4fa; border-radius: 3px; transition: width 0.5s; }
-.bar-fill.warn { background: #f38ba8; }
+.bar { height: 6px; background: var(--ctp-surface0); border-radius: 3px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--ctp-blue); border-radius: 3px; transition: width 0.5s; }
+.bar-fill.warn { background: var(--ctp-red); }
 .chart-box { height: 116px; width: 100%; }
-.load-box { color: #6c7086; text-align: center; padding: 4px 0; }
-.svc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.svc-ok { color: #a6e3a1; font-size: 11px; padding: 2px 0 4px; }
-.svc-sub { color: #a6adc8; font-size: 11px; margin: 6px 0 3px; }
-.svc-sub.muted { color: #585b70; }
-.fail-head { color: #f38ba8; font-size: 11px; font-weight: 600; margin-bottom: 3px; }
+.load-box { color: var(--ctp-overlay0); text-align: center; padding: 4px 0; }
+.svc-box { background: var(--ctp-base); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.svc-ok { color: var(--ctp-green); font-size: 11px; padding: 2px 0 4px; }
+.svc-sub { color: var(--ctp-subtext0); font-size: 11px; margin: 6px 0 3px; }
+.svc-sub.muted { color: var(--ctp-surface2); }
+.fail-head { color: var(--ctp-red); font-size: 11px; font-weight: 600; margin-bottom: 3px; }
 .fail-row { display: flex; gap: 8px; padding: 1px 0; font-size: 11px; }
-.fail-name { color: #f38ba8; min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fail-desc { color: #6c7086; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fail-name { color: var(--ctp-red); min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fail-desc { color: var(--ctp-overlay0); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .port-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
 .port-chip {
-  background: #313244; color: #cdd6f4; border-radius: 4px;
+  background: var(--ctp-surface0); color: var(--ctp-text); border-radius: 4px;
   padding: 1px 5px; font-size: 10px; font-family: ui-monospace, monospace;
 }
-.port-more { color: #6c7086; font-size: 10px; padding: 1px 3px; }
+.port-more { color: var(--ctp-overlay0); font-size: 10px; padding: 1px 3px; }
 .ctr-row { display: flex; gap: 8px; padding: 1px 0; font-size: 11px; }
-.ctr-name { color: #89b4fa; min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ctr-status { color: #a6e3a1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctr-name { color: var(--ctp-blue); min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctr-status { color: var(--ctp-green); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gpu-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; flex-wrap: wrap; }
-.gpu-name { color: #89b4fa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
-.gpu-bar { display: inline-block; width: 46px; height: 6px; background: #313244; border-radius: 3px; overflow: hidden; }
+.gpu-name { color: var(--ctp-blue); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+.gpu-bar { display: inline-block; width: 46px; height: 6px; background: var(--ctp-surface0); border-radius: 3px; overflow: hidden; }
 .gpu-bar i { display: block; height: 100%; border-radius: 3px; }
-.gpu-bar i.ok { background: #a6e3a1; }
-.gpu-bar i.warm { background: #f9e2af; }
-.gpu-bar i.hot { background: #f38ba8; }
-.gpu-pct { color: #cdd6f4; font-family: ui-monospace, monospace; }
-.gpu-vram { color: #6c7086; }
-.gpu-w { color: #6c7086; font-family: ui-monospace, monospace; }
+.gpu-bar i.ok { background: var(--ctp-green); }
+.gpu-bar i.warm { background: var(--ctp-yellow); }
+.gpu-bar i.hot { background: var(--ctp-red); }
+.gpu-pct { color: var(--ctp-text); font-family: ui-monospace, monospace; }
+.gpu-vram { color: var(--ctp-overlay0); }
+.gpu-w { color: var(--ctp-overlay0); font-family: ui-monospace, monospace; }
 .temp-chip {
-  background: #313244; border-radius: 4px; padding: 1px 5px;
+  background: var(--ctp-surface0); border-radius: 4px; padding: 1px 5px;
   font-size: 10px; font-family: ui-monospace, monospace;
 }
-.temp-chip.ok { color: #a6e3a1; }
-.temp-chip.warm { color: #f9e2af; }
-.temp-chip.hot { color: #f38ba8; }
+.temp-chip.ok { color: var(--ctp-green); }
+.temp-chip.warm { color: var(--ctp-yellow); }
+.temp-chip.hot { color: var(--ctp-red); }
 .temp-more {
-  background: transparent; border: 1px solid #45475a; color: #6c7086;
+  background: transparent; border: 1px solid var(--ctp-surface1); color: var(--ctp-overlay0);
   border-radius: 4px; padding: 0 5px; font-size: 10px; cursor: pointer;
 }
-.temp-more:hover { color: #cdd6f4; border-color: #6c7086; }
-.fan-chip { color: #a6adc8; font-family: ui-monospace, monospace; margin-left: 6px; }
-.proc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.proc-count { color: #6c7086; font-weight: 400; font-size: 10px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
+.temp-more:hover { color: var(--ctp-text); border-color: var(--ctp-overlay0); }
+.fan-chip { color: var(--ctp-subtext0); font-family: ui-monospace, monospace; margin-left: 6px; }
+.proc-box { background: var(--ctp-base); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.proc-count { color: var(--ctp-overlay0); font-weight: 400; font-size: 10px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
 .proc-head, .proc-row { display: grid; grid-template-columns: 50px 1fr 52px 66px; gap: 6px; align-items: center; }
-.proc-head { color: #6c7086; font-size: 10px; padding-bottom: 4px; border-bottom: 1px solid #313244; margin-bottom: 4px; }
+.proc-head { color: var(--ctp-overlay0); font-size: 10px; padding-bottom: 4px; border-bottom: 1px solid var(--ctp-surface0); margin-bottom: 4px; }
 .proc-row { padding: 2px 0; font-size: 11px; }
-.proc-row .pid { color: #6c7086; }
+.proc-row .pid { color: var(--ctp-overlay0); }
 .proc-row .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.proc-row .pcpu { text-align: right; color: #a6e3a1; }
-.proc-row .pcpu.hot { color: #f38ba8; font-weight: 600; }
-.proc-row .pmem { text-align: right; color: #a6adc8; }
+.proc-row .pcpu { text-align: right; color: var(--ctp-green); }
+.proc-row .pcpu.hot { color: var(--ctp-red); font-weight: 600; }
+.proc-row .pmem { text-align: right; color: var(--ctp-subtext0); }
 </style>

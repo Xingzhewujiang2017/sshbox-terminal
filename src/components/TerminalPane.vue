@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { api } from '../api'
 import { listen } from '@tauri-apps/api/event'
+import { terminalTheme, themeVersion } from '../theme'
 
 const props = defineProps<{ sid: string; active: boolean }>()
 
@@ -14,6 +15,12 @@ let unlisten: (() => void) | null = null
 let ro: ResizeObserver | null = null
 let resizeTimer: number | undefined
 let currentSid = ''
+
+// 主题切换：xterm 的配色是创建时传的，但支持运行时改，所以不用重建终端
+// （重建会丢掉回滚缓冲和当前会话状态）。
+watch(themeVersion, () => {
+  if (term) term.options.theme = terminalTheme()
+})
 
 function b64decode(b64: string): Uint8Array {
   const bin = atob(b64)
@@ -39,12 +46,7 @@ onMounted(async () => {
     cursorBlink: true,
     fontSize: 14,
     fontFamily: 'Cascadia Mono, Consolas, "Courier New", monospace',
-    theme: {
-      background: '#1e1e2e',
-      foreground: '#cdd6f4',
-      cursor: '#f5e0dc',
-      selectionBackground: '#45475a',
-    },
+    theme: terminalTheme(),
     scrollback: 10000,
   })
   fit = new FitAddon()
@@ -111,7 +113,7 @@ onBeforeUnmount(() => {
 .term-wrap {
   height: 100%;
   width: 100%;
-  background: #1e1e2e;
+  background: var(--ctp-base);
 }
 .term {
   height: 100%;

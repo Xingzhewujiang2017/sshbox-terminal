@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import type { AppPaths, KnownHostEntry, Settings } from '../api'
+import type { ThemeMode } from '../theme'
 
 const props = defineProps<{
   settings: Settings
@@ -16,7 +17,30 @@ const emit = defineEmits<{
   (e: 'exportHosts', path: string, includeSecrets: boolean): void
   (e: 'importHosts', path: string): void
   (e: 'restartMonitor'): void
+  (e: 'theme', mode: ThemeMode): void
 }>()
+
+const THEMES: { v: ThemeMode; t: string }[] = [
+  { v: 'dark', t: '深色' },
+  { v: 'light', t: '浅色' },
+  { v: 'system', t: '跟随系统' },
+]
+
+// 主题也可能从标题栏那个按钮改（比如设置面板开着时被外部改了），
+// 这里跟一下，保证面板里显示的就是当前真实模式。
+watch(
+  () => props.settings.theme,
+  (t) => {
+    if (t && t !== form.value.theme) form.value.theme = t as ThemeMode
+  }
+)
+
+/** 主题和其它设置不一样：改完立刻生效并落盘，不等"保存"。
+ *  否则用户点了"取消"，界面却还留着预览过的颜色。 */
+function pickTheme(m: ThemeMode) {
+  form.value.theme = m
+  emit('theme', m)
+}
 
 const tab = ref<'general' | 'hostkeys' | 'io' | 'about'>('general')
 const form = ref<Settings>({ ...props.settings })
@@ -50,6 +74,19 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
 
       <!-- 常规 -->
       <div v-if="tab === 'general'" class="pane">
+        <label>主题</label>
+        <div class="seg">
+          <button
+            v-for="m in THEMES"
+            :key="m.v"
+            :class="{ sel: form.theme === m.v }"
+            @click="pickTheme(m.v)"
+          >{{ m.t }}</button>
+        </div>
+        <p class="hintline">
+          立即生效并保存。选“跟随系统”时，系统切换深/浅色会跟着变。
+        </p>
+
         <label>监控采样间隔（秒）</label>
         <div class="seg">
           <button
@@ -192,75 +229,75 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
 
 <style scoped>
 .mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  position: fixed; inset: 0; background: var(--mask);
   display: flex; align-items: center; justify-content: center; z-index: 105;
 }
 .dlg {
-  background: #1e1e2e; border: 1px solid #313244; border-radius: 10px;
+  background: var(--ctp-base); border: 1px solid var(--ctp-surface0); border-radius: 10px;
   padding: 16px; width: 520px; max-height: 86vh; display: flex; flex-direction: column; gap: 10px;
 }
-.tabs { display: flex; gap: 4px; border-bottom: 1px solid #313244; padding-bottom: 8px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--ctp-surface0); padding-bottom: 8px; }
 .tabs button {
-  background: none; border: none; color: #6c7086; font-size: 12.5px;
+  background: none; border: none; color: var(--ctp-overlay0); font-size: 12.5px;
   padding: 5px 9px; border-radius: 5px; cursor: pointer;
 }
-.tabs button.on { background: #313244; color: #cdd6f4; }
-.badge { color: #89b4fa; font-size: 11px; }
+.tabs button.on { background: var(--ctp-surface0); color: var(--ctp-text); }
+.badge { color: var(--ctp-blue); font-size: 11px; }
 .pane { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; }
-label { font-size: 11px; color: #a6adc8; margin-top: 6px; }
+label { font-size: 11px; color: var(--ctp-subtext0); margin-top: 6px; }
 input:not([type='checkbox']) {
-  background: #11111b; border: 1px solid #313244; border-radius: 6px;
-  color: #cdd6f4; padding: 7px 9px; font-size: 12.5px; width: 100%; box-sizing: border-box;
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); border-radius: 6px;
+  color: var(--ctp-text); padding: 7px 9px; font-size: 12.5px; width: 100%; box-sizing: border-box;
 }
-input:focus { outline: 1px solid #89b4fa; }
+input:focus { outline: 1px solid var(--ctp-blue); }
 .seg { display: flex; gap: 6px; }
 .seg button {
-  flex: 1; background: #11111b; border: 1px solid #313244; color: #a6adc8;
+  flex: 1; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
   border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px;
 }
-.seg button.sel { border-color: #89b4fa; color: #89b4fa; }
+.seg button.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .check { display: flex; align-items: center; gap: 7px; margin-top: 9px; cursor: pointer; }
 .check input { width: auto; }
-.check span { font-size: 12px; color: #a6adc8; }
+.check span { font-size: 12px; color: var(--ctp-subtext0); }
 .rowline { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; }
-.rowline span { font-size: 12px; color: #a6adc8; }
+.rowline span { font-size: 12px; color: var(--ctp-subtext0); }
 .nums { display: flex; gap: 6px; }
 .num { width: 64px !important; }
-.hintline { font-size: 11px; color: #6c7086; line-height: 1.6; }
-.hintline.warn { color: #f9e2af; }
+.hintline { font-size: 11px; color: var(--ctp-overlay0); line-height: 1.6; }
+.hintline.warn { color: var(--ctp-yellow); }
 .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
 .ghost {
-  background: #11111b; border: 1px solid #313244; color: #a6adc8;
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
   border-radius: 6px; padding: 7px 12px; cursor: pointer; font-size: 12.5px;
 }
 .primary {
-  background: #89b4fa; color: #11111b; border: none; border-radius: 6px;
+  background: var(--ctp-blue); color: var(--on-accent); border: none; border-radius: 6px;
   padding: 7px 16px; font-weight: 600; cursor: pointer; font-size: 12.5px;
 }
 .kh-list { max-height: 300px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 .kh {
-  display: flex; align-items: center; gap: 8px; background: #11111b;
+  display: flex; align-items: center; gap: 8px; background: var(--ctp-crust);
   border-radius: 6px; padding: 7px 9px;
 }
 .kh-main { flex: 1; min-width: 0; }
-.kh-host { font-size: 12.5px; color: #cdd6f4; }
-.kh-fp { font-size: 10.5px; color: #6c7086; font-family: Consolas, monospace; word-break: break-all; }
+.kh-host { font-size: 12.5px; color: var(--ctp-text); }
+.kh-fp { font-size: 10.5px; color: var(--ctp-overlay0); font-family: Consolas, monospace; word-break: break-all; }
 .del {
-  background: none; border: 1px solid #313244; color: #f38ba8;
+  background: none; border: 1px solid var(--ctp-surface0); color: var(--ctp-red);
   border-radius: 5px; padding: 3px 8px; cursor: pointer; font-size: 11px; flex-shrink: 0;
 }
-.hashnote { font-size: 10px; color: #45475a; }
-.empty { color: #45475a; font-size: 12px; padding: 16px 0; text-align: center; }
-.sep { height: 1px; background: #313244; margin: 14px 0 4px; }
-.msg { font-size: 11.5px; color: #a6e3a1; margin-top: 8px; }
-.about-title { font-size: 20px; font-weight: 700; color: #89b4fa; }
+.hashnote { font-size: 10px; color: var(--ctp-surface1); }
+.empty { color: var(--ctp-surface1); font-size: 12px; padding: 16px 0; text-align: center; }
+.sep { height: 1px; background: var(--ctp-surface0); margin: 14px 0 4px; }
+.msg { font-size: 11.5px; color: var(--ctp-green); margin-top: 8px; }
+.about-title { font-size: 20px; font-weight: 700; color: var(--ctp-blue); }
 .paths { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
 .p { display: flex; gap: 10px; font-size: 11.5px; }
-.p span { color: #6c7086; min-width: 84px; flex-shrink: 0; }
-.p code { color: #a6adc8; font-family: Consolas, monospace; word-break: break-all; }
+.p span { color: var(--ctp-overlay0); min-width: 84px; flex-shrink: 0; }
+.p code { color: var(--ctp-subtext0); font-family: Consolas, monospace; word-break: break-all; }
 .close-row { display: flex; justify-content: flex-end; }
 .close-row button {
-  padding: 6px 14px; border-radius: 6px; border: 1px solid #313244;
-  background: #11111b; color: #a6adc8; cursor: pointer; font-size: 12.5px;
+  padding: 6px 14px; border-radius: 6px; border: 1px solid var(--ctp-surface0);
+  background: var(--ctp-crust); color: var(--ctp-subtext0); cursor: pointer; font-size: 12.5px;
 }
 </style>

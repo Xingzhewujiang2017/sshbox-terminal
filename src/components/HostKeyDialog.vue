@@ -60,32 +60,32 @@ const target = computed(() =>
 
 <style scoped>
 .mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+  position: fixed; inset: 0; background: var(--mask);
   display: flex; align-items: center; justify-content: center; z-index: 110;
 }
 .dlg {
-  background: #1e1e2e; border: 1px solid #313244; border-radius: 10px;
+  background: var(--ctp-base); border: 1px solid var(--ctp-surface0); border-radius: 10px;
   padding: 18px; width: 470px; display: flex; flex-direction: column; gap: 10px;
 }
-.dlg.danger { border-color: #f38ba8; }
-h3 { font-size: 15px; color: #cdd6f4; }
-.lead { font-size: 12.5px; color: #a6adc8; line-height: 1.7; }
-.danger-text { color: #f38ba8; }
-.fp-box { background: #11111b; border-radius: 7px; padding: 10px; display: flex; flex-direction: column; gap: 5px; }
+.dlg.danger { border-color: var(--ctp-red); }
+h3 { font-size: 15px; color: var(--ctp-text); }
+.lead { font-size: 12.5px; color: var(--ctp-subtext0); line-height: 1.7; }
+.danger-text { color: var(--ctp-red); }
+.fp-box { background: var(--ctp-crust); border-radius: 7px; padding: 10px; display: flex; flex-direction: column; gap: 5px; }
 .fp-row { display: flex; gap: 10px; font-size: 12px; }
-.fp-row .k { color: #6c7086; min-width: 76px; flex-shrink: 0; }
-.fp-row .v { color: #cdd6f4; word-break: break-all; }
+.fp-row .k { color: var(--ctp-overlay0); min-width: 76px; flex-shrink: 0; }
+.fp-row .v { color: var(--ctp-text); word-break: break-all; }
 .mono { font-family: Consolas, monospace; font-size: 11.5px; }
-.hintline { font-size: 11px; color: #6c7086; line-height: 1.6; }
+.hintline { font-size: 11px; color: var(--ctp-overlay0); line-height: 1.6; }
 .hintline code {
-  background: #11111b; padding: 1px 4px; border-radius: 3px;
-  font-family: Consolas, monospace; color: #a6adc8;
+  background: var(--ctp-crust); padding: 1px 4px; border-radius: 3px;
+  font-family: Consolas, monospace; color: var(--ctp-subtext0);
 }
 .btns { display: flex; gap: 8px; justify-content: flex-end; }
 .btns button {
-  padding: 7px 15px; border-radius: 6px; border: 1px solid #313244;
-  background: #11111b; color: #a6adc8; cursor: pointer; font-size: 13px;
+  padding: 7px 15px; border-radius: 6px; border: 1px solid var(--ctp-surface0);
+  background: var(--ctp-crust); color: var(--ctp-subtext0); cursor: pointer; font-size: 13px;
 }
-.btns .primary { background: #89b4fa; color: #11111b; border: none; font-weight: 600; }
-.btns .primary.danger { background: #f38ba8; }
+.btns .primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
+.btns .primary.danger { background: var(--ctp-red); }
 </style>

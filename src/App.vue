@@ -14,6 +14,12 @@ import HostKeyDialog from './components/HostKeyDialog.vue'
 import PasswordDialog from './components/PasswordDialog.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import {
+  applyTheme,
+  watchSystem,
+  type ResolvedTheme,
+  type ThemeMode,
+} from './theme'
+import {
   api,
   SshboxError,
   uiLog,
@@ -99,6 +105,10 @@ function toast(kind: 'error' | 'info', text: string) {
 async function loadAll() {
   hosts.value = await api.hostsList()
   settings.value = await api.settingsGet()
+  // 主题要在设置读回来之后校正一次（启动时用的是 localStorage 缓存值）
+  themeMode.value = (settings.value.theme as ThemeMode) || 'dark'
+  applyThemeNow()
+  rearmSystemWatch()
   paths.value = await api.appPaths()
   knownHosts.value = await api.knownHostsList()
 }
@@ -124,6 +134,8 @@ onMounted(async () => {
   })
   window.addEventListener('keydown', onKey)
 })
+
+onBeforeUnmount(() => unwatchSystem?.())
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
@@ -382,6 +394,46 @@ function duplicateHost(host: Host) {
   hostDialog.value = { open: true, host: { ...host, id: '', name: `${host.name} 副本` } }
 }
 
+/* ---------- 主题 ----------
+   三态：dark / light / system。CSS 侧靠 <html data-theme> 生效，
+   xterm 与 ECharts 读 themeVersion 重新上色（见 theme.ts）。 */
+const THEME_LABELS: Record<ThemeMode, string> = {
+  dark: '深色',
+  light: '浅色',
+  system: '跟随系统',
+}
+const themeMode = ref<ThemeMode>('dark')
+const resolvedTheme = ref<ResolvedTheme>('dark')
+let unwatchSystem: (() => void) | null = null
+
+/** 立即上色，并把解析结果同步给终端/图表。不落盘（落盘走 saveTheme）。 */
+function applyThemeNow() {
+  resolvedTheme.value = applyTheme(themeMode.value)
+}
+
+/** 跟随系统时，系统配色一变就跟着变（不写回 settings，mode 还是 system）。 */
+function rearmSystemWatch() {
+  unwatchSystem?.()
+  unwatchSystem = null
+  if (themeMode.value === 'system') {
+    unwatchSystem = watchSystem(() => applyThemeNow())
+  }
+}
+
+async function setTheme(mode: ThemeMode, persist = true) {
+  themeMode.value = mode
+  applyThemeNow()
+  rearmSystemWatch()
+  if (!persist || !settings.value) return
+  await saveSettings({ ...settings.value, theme: mode })
+}
+
+/** 标题栏那个按钮：在深色和浅色之间翻。当前是"跟随系统"时，
+ *  翻到系统当前色的反面（用户的意图是"我要另一个样子"，不是"我要脱离系统"）。 */
+function toggleTheme() {
+  setTheme(resolvedTheme.value === 'dark' ? 'light' : 'dark')
+}
+
 async function saveSettings(s: Settings) {
   try {
     await api.settingsSet(s)
@@ -447,7 +499,11 @@ async function restartMonitor() {
 }
 
 function statusDot(t: Tab) {
-  return t.status === 'connected' ? '#a6e3a1' : t.status === 'connecting' ? '#f9e2af' : '#f38ba8'
+  return t.status === 'connected'
+    ? 'var(--ctp-green)'
+    : t.status === 'connecting'
+      ? 'var(--ctp-yellow)'
+      : 'var(--ctp-red)'
 }
 </script>
 
@@ -488,6 +544,11 @@ function statusDot(t: Tab) {
             class="reconnect-btn"
             @click="manualReconnect(activeTab)"
           >重连</button>
+          <button
+            class="icon-btn"
+            :title="`主题：${THEME_LABELS[themeMode]}（点击切到${resolvedTheme === 'dark' ? '浅色' : '深色'}）`"
+            @click="toggleTheme"
+          >{{ resolvedTheme === 'dark' ? '☾' : '☀' }}</button>
           <button class="icon-btn" title="总览（所有已连接主机）" @click="overviewOpen = true">
             总览
           </button>
@@ -584,6 +645,7 @@ function statusDot(t: Tab) {
       :known-hosts="knownHosts"
       :host-count="hosts.hosts.length"
       @save="saveSettings"
+      @theme="setTheme($event)"
       @close="settingsOpen = false"
       @remove-known-host="removeKnownHost"
       @export-hosts="exportHosts"
@@ -606,68 +668,68 @@ function statusDot(t: Tab) {
 <style>
 * { margin: 0; padding: 0; }
 html, body, #app { height: 100%; overflow: hidden; }
-body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #11111b; color: #cdd6f4; }
+body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(--ctp-crust); color: var(--ctp-text); }
 </style>
 
 <style scoped>
 .app { display: flex; height: 100vh; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .tabbar {
-  display: flex; background: #181825; border-bottom: 1px solid #313244;
+  display: flex; background: var(--ctp-mantle); border-bottom: 1px solid var(--ctp-surface0);
   align-items: center; min-height: 36px;
 }
 .tab {
   display: flex; align-items: center; gap: 6px; padding: 8px 12px;
-  font-size: 12px; color: #a6adc8; cursor: pointer; border-right: 1px solid #313244;
+  font-size: 12px; color: var(--ctp-subtext0); cursor: pointer; border-right: 1px solid var(--ctp-surface0);
   max-width: 260px;
 }
-.tab.active { background: #1e1e2e; color: #cdd6f4; border-top: 2px solid #89b4fa; }
+.tab.active { background: var(--ctp-base); color: var(--ctp-text); border-top: 2px solid var(--ctp-blue); }
 .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.retry { font-size: 10px; color: #f9e2af; }
-.tab-close { color: #6c7086; font-size: 14px; }
-.tab-close:hover { color: #f38ba8; }
+.retry { font-size: 10px; color: var(--ctp-yellow); }
+.tab-close { color: var(--ctp-overlay0); font-size: 14px; }
+.tab-close:hover { color: var(--ctp-red); }
 .tabbar-right { margin-left: auto; padding-right: 8px; display: flex; align-items: center; gap: 8px; }
-.icon-btn { background: none; border: none; color: #a6adc8; cursor: pointer; font-size: 16px; }
+.icon-btn { background: none; border: none; color: var(--ctp-subtext0); cursor: pointer; font-size: 16px; }
 .reconnect-btn {
-  background: #a6e3a1; color: #11111b; border: none; border-radius: 5px;
+  background: var(--ctp-green); color: var(--on-accent); border: none; border-radius: 5px;
   padding: 3px 10px; font-size: 11.5px; font-weight: 600; cursor: pointer;
 }
 .banner {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  padding: 7px 12px; font-size: 12px; border-bottom: 1px solid #313244;
+  padding: 7px 12px; font-size: 12px; border-bottom: 1px solid var(--ctp-surface0);
 }
-.banner.error { background: #2b1c22; color: #f38ba8; }
-.banner.info { background: #1b2b1e; color: #a6e3a1; }
+.banner.error { background: var(--banner-error-bg); color: var(--ctp-red); }
+.banner.info { background: var(--banner-info-bg); color: var(--ctp-green); }
 .banner button { background: none; border: none; color: inherit; cursor: pointer; font-size: 14px; }
 .content { flex: 1; display: flex; min-height: 0; }
-.term-area { flex: 1; min-width: 0; position: relative; background: #1e1e2e; }
-.monitor-area { width: 320px; border-left: 1px solid #313244; min-width: 240px; }
+.term-area { flex: 1; min-width: 0; position: relative; background: var(--ctp-base); }
+.monitor-area { width: 320px; border-left: 1px solid var(--ctp-surface0); min-width: 240px; }
 .empty {
   height: 100%; display: flex; flex-direction: column; gap: 12px;
-  align-items: center; justify-content: center; color: #6c7086;
+  align-items: center; justify-content: center; color: var(--ctp-overlay0);
 }
-.empty-title { font-size: 28px; font-weight: 700; color: #89b4fa; }
+.empty-title { font-size: 28px; font-weight: 700; color: var(--ctp-blue); }
 .empty-sub { font-size: 13px; }
-.empty-hint { font-size: 11px; color: #45475a; }
+.empty-hint { font-size: 11px; color: var(--ctp-surface1); }
 .connect-btn {
-  background: #89b4fa; color: #11111b; border: none; border-radius: 6px;
+  background: var(--ctp-blue); color: var(--on-accent); border: none; border-radius: 6px;
   padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
 }
-.connect-btn:hover { background: #b4befe; }
+.connect-btn:hover { background: var(--ctp-lavender); }
 .modal-mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  position: fixed; inset: 0; background: var(--mask);
   display: flex; align-items: center; justify-content: center; z-index: 120;
 }
 .confirm {
-  background: #1e1e2e; border: 1px solid #313244; border-radius: 10px;
+  background: var(--ctp-base); border: 1px solid var(--ctp-surface0); border-radius: 10px;
   padding: 18px; width: 380px; display: flex; flex-direction: column; gap: 14px;
 }
-.confirm-text { font-size: 13px; color: #cdd6f4; line-height: 1.6; }
+.confirm-text { font-size: 13px; color: var(--ctp-text); line-height: 1.6; }
 .confirm-btns { display: flex; gap: 8px; justify-content: flex-end; }
 .confirm-btns button {
-  padding: 7px 16px; border-radius: 6px; border: 1px solid #313244;
-  background: #11111b; color: #a6adc8; cursor: pointer; font-size: 13px;
+  padding: 7px 16px; border-radius: 6px; border: 1px solid var(--ctp-surface0);
+  background: var(--ctp-crust); color: var(--ctp-subtext0); cursor: pointer; font-size: 13px;
 }
-.confirm-btns .danger { background: #f38ba8; color: #11111b; border: none; font-weight: 600; }
+.confirm-btns .danger { background: var(--ctp-red); color: var(--on-accent); border: none; font-weight: 600; }
 </style>

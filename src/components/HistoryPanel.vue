@@ -10,6 +10,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 import { api, SshboxError, uiLog, type HistoryHost, type HistoryRange, type HistoryStats, type HostsFile } from '../api'
+import { chartPalette, themeVersion } from '../theme'
 
 const props = defineProps<{
   hosts: HostsFile
@@ -33,8 +34,53 @@ const PRESETS: { key: Preset; label: string; secs: number }[] = [
   { key: 'all', label: '全部', secs: 0 },
 ]
 
-const AXIS = { fontSize: 9, color: '#6c7086' }
-const LEGEND = { textStyle: { fontSize: 10 }, top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
+const AXIS = { fontSize: 9 }
+const LEGEND = { top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
+
+/** 五个图的系列配色（和历史面板的语义色一致）。 */
+function seriesColors(): Record<string, string[]> {
+  const p = chartPalette()
+  return {
+    cpu: [p.blue],
+    mem: [p.green],
+    net: [p.green, p.blue],
+    io: [p.peach, p.mauve],
+    load: [p.yellow],
+  }
+}
+
+/** 主题相关的那部分配置：切主题只重发颜色，不碰已经查出来的历史数据。
+ *  画布是像素，读不到 CSS 变量，颜色只能运行时从 chartPalette() 取。 */
+function colorOption(p: ReturnType<typeof chartPalette>, seriesColors: string[]) {
+  return {
+    textStyle: { color: p.text },
+    legend: { textStyle: { fontSize: 10, color: p.axis } },
+    tooltip: { backgroundColor: p.surface1, borderColor: p.split, textStyle: { color: p.text } },
+    xAxis: { axisLabel: { color: p.axis }, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: {
+      axisLabel: { color: p.axis },
+      splitLine: { lineStyle: { color: p.split } },
+      axisLine: { lineStyle: { color: p.split } },
+    },
+    series: seriesColors.map((c) => ({
+      itemStyle: { color: c },
+      lineStyle: { color: c },
+      areaStyle: { color: c },
+    })),
+  }
+}
+
+function repaint() {
+  const p = chartPalette()
+  const c = seriesColors()
+  cpuChart?.setOption(colorOption(p, c.cpu))
+  memChart?.setOption(colorOption(p, c.mem))
+  netChart?.setOption(colorOption(p, c.net))
+  ioChart?.setOption(colorOption(p, c.io))
+  loadChart?.setOption(colorOption(p, c.load))
+}
+
+watch(themeVersion, () => repaint())
 
 const hostStats = ref<HistoryHost[]>([])
 const dbStats = ref<HistoryStats | null>(null)
@@ -204,9 +250,10 @@ async function load() {
 // --- charts ----------------------------------------------------------------
 
 function initPct(el: HTMLDivElement, names: string[], colors: string[]): echarts.ECharts {
-  const c = echarts.init(el, 'dark')
+  const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
+    ...colorOption(chartPalette(), colors),
     grid: { left: 34, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: names },
     tooltip: {
@@ -219,7 +266,6 @@ function initPct(el: HTMLDivElement, names: string[], colors: string[]): echarts
       min: 0,
       max: 100,
       axisLabel: AXIS,
-      splitLine: { lineStyle: { color: '#313244' } },
     },
     series: names.map((n, i) => ({
       name: n,
@@ -236,9 +282,10 @@ function initPct(el: HTMLDivElement, names: string[], colors: string[]): echarts
 }
 
 function initRate(el: HTMLDivElement, names: string[], colors: string[]): echarts.ECharts {
-  const c = echarts.init(el, 'dark')
+  const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
+    ...colorOption(chartPalette(), colors),
     grid: { left: 46, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: names },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => fmtBytes(v) },
@@ -247,7 +294,6 @@ function initRate(el: HTMLDivElement, names: string[], colors: string[]): echart
       type: 'value',
       min: 0,
       axisLabel: { ...AXIS, formatter: fmtRateShort },
-      splitLine: { lineStyle: { color: '#313244' } },
     },
     series: names.map((n, i) => ({
       name: n,
@@ -265,14 +311,15 @@ function initRate(el: HTMLDivElement, names: string[], colors: string[]): echart
 
 /** Load average: 1-minute value, auto-scaled (no meaningful fixed max). */
 function initLoad(el: HTMLDivElement): echarts.ECharts {
-  const c = echarts.init(el, 'dark')
+  const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
+    ...colorOption(chartPalette(), seriesColors().load),
     grid: { left: 34, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: ['负载 (1 分钟)'] },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => (v == null ? '—' : v.toFixed(2)) },
     xAxis: { type: 'category', data: [], axisLabel: AXIS },
-    yAxis: { type: 'value', min: 0, axisLabel: AXIS, splitLine: { lineStyle: { color: '#313244' } } },
+    yAxis: { type: 'value', min: 0, axisLabel: AXIS },
     series: [
       {
         name: '负载 (1 分钟)',
@@ -280,9 +327,9 @@ function initLoad(el: HTMLDivElement): echarts.ECharts {
         data: [],
         smooth: true,
         showSymbol: false,
-        lineStyle: { width: 1.5, color: '#f9e2af' },
-        itemStyle: { color: '#f9e2af' },
-        areaStyle: { opacity: 0.12, color: '#f9e2af' },
+        lineStyle: { width: 1.5 },
+        itemStyle: {},
+        areaStyle: { opacity: 0.12 },
       },
     ],
   })
@@ -292,10 +339,11 @@ function initLoad(el: HTMLDivElement): echarts.ECharts {
 function draw() {
   const s = data.value
   if (!s) return
-  if (!cpuChart && cpuEl.value) cpuChart = initPct(cpuEl.value, ['CPU %'], ['#89b4fa'])
-  if (!memChart && memEl.value) memChart = initPct(memEl.value, ['内存 %'], ['#a6e3a1'])
-  if (!netChart && netEl.value) netChart = initRate(netEl.value, ['↓ 下行', '↑ 上行'], ['#a6e3a1', '#89b4fa'])
-  if (!ioChart && ioEl.value) ioChart = initRate(ioEl.value, ['读', '写'], ['#fab387', '#cba6f7'])
+  const cols = seriesColors()
+  if (!cpuChart && cpuEl.value) cpuChart = initPct(cpuEl.value, ['CPU %'], cols.cpu)
+  if (!memChart && memEl.value) memChart = initPct(memEl.value, ['内存 %'], cols.mem)
+  if (!netChart && netEl.value) netChart = initRate(netEl.value, ['↓ 下行', '↑ 上行'], cols.net)
+  if (!ioChart && ioEl.value) ioChart = initRate(ioEl.value, ['读', '写'], cols.io)
   if (!loadChart && loadEl.value) loadChart = initLoad(loadEl.value)
 
   // Bucket ts → local clock label. Buckets can be hours wide, so the label
@@ -461,7 +509,7 @@ onBeforeUnmount(() => {
 .mask {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: var(--mask);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -471,11 +519,11 @@ onBeforeUnmount(() => {
   width: min(1100px, 94vw);
   max-height: 92vh;
   overflow-y: auto;
-  background: #1e1e2e;
-  border: 1px solid #313244;
+  background: var(--ctp-base);
+  border: 1px solid var(--ctp-surface0);
   border-radius: 8px;
   padding: 14px 16px 16px;
-  color: #cdd6f4;
+  color: var(--ctp-text);
   font-size: 12px;
 }
 .head {
@@ -489,14 +537,14 @@ onBeforeUnmount(() => {
   font-weight: 600;
 }
 .sub {
-  color: #6c7086;
+  color: var(--ctp-overlay0);
   font-size: 11px;
 }
 .close {
   margin-left: auto;
   background: none;
   border: none;
-  color: #6c7086;
+  color: var(--ctp-overlay0);
   font-size: 18px;
   cursor: pointer;
   line-height: 1;
@@ -509,13 +557,13 @@ onBeforeUnmount(() => {
   margin-bottom: 8px;
 }
 .bar.custom {
-  color: #a6adc8;
+  color: var(--ctp-subtext0);
 }
 .sel,
 .dt {
-  background: #181825;
-  color: #cdd6f4;
-  border: 1px solid #313244;
+  background: var(--ctp-mantle);
+  color: var(--ctp-text);
+  border: 1px solid var(--ctp-surface0);
   border-radius: 4px;
   padding: 4px 6px;
   font-size: 11px;
@@ -529,23 +577,23 @@ onBeforeUnmount(() => {
   gap: 4px;
 }
 .pill {
-  background: #181825;
-  color: #a6adc8;
-  border: 1px solid #313244;
+  background: var(--ctp-mantle);
+  color: var(--ctp-subtext0);
+  border: 1px solid var(--ctp-surface0);
   border-radius: 10px;
   padding: 3px 9px;
   font-size: 11px;
   cursor: pointer;
 }
 .pill.on {
-  background: #89b4fa;
-  color: #11111b;
-  border-color: #89b4fa;
+  background: var(--ctp-blue);
+  color: var(--on-accent);
+  border-color: var(--ctp-blue);
 }
 .btn {
-  background: #313244;
-  color: #cdd6f4;
-  border: 1px solid #45475a;
+  background: var(--ctp-surface0);
+  color: var(--ctp-text);
+  border: 1px solid var(--ctp-surface1);
   border-radius: 4px;
   padding: 4px 10px;
   font-size: 11px;
@@ -562,30 +610,30 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 14px;
   flex-wrap: wrap;
-  color: #a6adc8;
+  color: var(--ctp-subtext0);
   font-size: 11px;
   padding: 6px 0;
-  border-top: 1px solid #313244;
-  border-bottom: 1px solid #313244;
+  border-top: 1px solid var(--ctp-surface0);
+  border-bottom: 1px solid var(--ctp-surface0);
   margin-bottom: 8px;
 }
 .meta b {
-  color: #cdd6f4;
+  color: var(--ctp-text);
 }
 .meta .db {
   margin-left: auto;
-  color: #6c7086;
+  color: var(--ctp-overlay0);
 }
 .err {
-  background: rgba(243, 139, 168, 0.12);
-  border: 1px solid #f38ba8;
-  color: #f38ba8;
+  background: var(--danger-soft);
+  border: 1px solid var(--ctp-red);
+  color: var(--ctp-red);
   border-radius: 4px;
   padding: 6px 8px;
   margin-bottom: 8px;
 }
 .empty-win {
-  color: #6c7086;
+  color: var(--ctp-overlay0);
   padding: 8px 0;
 }
 .charts {
@@ -605,10 +653,10 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
 }
 .ok {
-  color: #a6e3a1;
+  color: var(--ctp-green);
 }
 .path {
-  color: #6c7086;
+  color: var(--ctp-overlay0);
   font-size: 10px;
   max-width: 420px;
   overflow: hidden;

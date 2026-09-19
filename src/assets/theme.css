@@ -1,0 +1,80 @@
+/* 双主题令牌。组件一律引用这里的变量，不再写死颜色。
+   深色 = Catppuccin Mocha，浅色 = Catppuccin Latte —— 同一套色板名，两个明暗，
+   所以映射是 1:1 的，不需要为浅色另起一套命名。
+
+   唯一真源：JS 侧（xterm 主题、ECharts 配色）也通过 getComputedStyle 读这些变量，
+   不另建一份 JS 调色板，否则两处必然漂移。 */
+
+:root {
+  color-scheme: dark;
+
+  /* 底色三层：base 是主面，mantle 是次级面（标题栏/侧栏），crust 是"沉下去"的面
+     （输入框、代码块）。浅色下方向相反但语义一致。 */
+  --ctp-base: #1e1e2e;
+  --ctp-mantle: #181825;
+  --ctp-crust: #11111b;
+
+  /* 线/面 */
+  --ctp-surface0: #313244;
+  --ctp-surface1: #45475a;
+  --ctp-surface2: #585b70;
+
+  /* 字：text 主、subtext0 次、overlay0 最弱（提示、次要标签） */
+  --ctp-text: #cdd6f4;
+  --ctp-subtext0: #a6adc8;
+  --ctp-overlay0: #6c7086;
+
+  /* 强调色 */
+  --ctp-blue: #89b4fa;
+  --ctp-green: #a6e3a1;
+  --ctp-yellow: #f9e2af;
+  --ctp-red: #f38ba8;
+  --ctp-peach: #fab387;
+  --ctp-mauve: #cba6f7;
+  --ctp-lavender: #b4befe;
+  --ctp-rosewater: #f5e0dc;
+
+  /* 语义令牌（不是 Catppuccin 原始色，跨主题要单独给值） */
+  --on-accent: #11111b; /* 彩色按钮上的字：深色主题下强调色是亮色，字要压深 */
+  --mask: rgba(0, 0, 0, 0.55);
+  --danger-soft: rgba(243, 139, 168, 0.12);
+  --banner-error-bg: #2b1c22;
+  --banner-info-bg: #1b2b1e;
+  --banner-warn-bg: #2b2718;
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+
+  --ctp-base: #eff1f5;
+  --ctp-mantle: #e6e9ef;
+  --ctp-crust: #dce0e8;
+
+  --ctp-surface0: #ccd0da;
+  --ctp-surface1: #bcc0cc;
+  --ctp-surface2: #acb0be;
+
+  --ctp-text: #4c4f69;
+  /* Latte 的 subtext0/overlay0 是给"浅底上还要再淡一点"设计的，压在 #eff1f5 上
+     只有 3.5:1，11px 的提示文字会糊。这里各上移一档（subtext1/subtext0），
+     对比度变成 5.5:1 / 4.4:1，层级还在。深色主题不动——Mocha 的对比度本来就够。 */
+  --ctp-subtext0: #5c5f77;
+  --ctp-overlay0: #6c6f85;
+
+  --ctp-blue: #1e66f5;
+  --ctp-green: #40a02b;
+  --ctp-yellow: #df8e1d;
+  --ctp-red: #d20f39;
+  --ctp-peach: #fe640b;
+  --ctp-mauve: #8839ef;
+  --ctp-lavender: #7287fd;
+  --ctp-rosewater: #dc8a78;
+
+  /* 浅色主题的强调色本身是深色（#40a02b 绿、#1e66f5 蓝），字必须反白才读得清 */
+  --on-accent: #ffffff;
+  --mask: rgba(76, 79, 105, 0.35);
+  --danger-soft: rgba(210, 15, 57, 0.1);
+  --banner-error-bg: #fbe4e8;
+  --banner-info-bg: #e5f3e3;
+  --banner-warn-bg: #f9f0dc;
+}

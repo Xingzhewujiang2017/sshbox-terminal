@@ -133,49 +133,49 @@ function submit() {
 
 <style scoped>
 .mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  position: fixed; inset: 0; background: var(--mask);
   display: flex; align-items: center; justify-content: center; z-index: 100;
 }
 .dlg {
-  background: #1e1e2e; border: 1px solid #313244; border-radius: 10px;
+  background: var(--ctp-base); border: 1px solid var(--ctp-surface0); border-radius: 10px;
   padding: 18px; width: 460px; max-height: 88vh; overflow-y: auto;
   display: flex; flex-direction: column; gap: 5px;
 }
-h3 { font-size: 15px; margin-bottom: 6px; color: #cdd6f4; }
-label { font-size: 11px; color: #a6adc8; margin-top: 6px; }
-.note { color: #6c7086; }
+h3 { font-size: 15px; margin-bottom: 6px; color: var(--ctp-text); }
+label { font-size: 11px; color: var(--ctp-subtext0); margin-top: 6px; }
+.note { color: var(--ctp-overlay0); }
 input[type='text'], input[type='password'], input[type='number'], input:not([type]) {
-  background: #11111b; border: 1px solid #313244; border-radius: 6px;
-  color: #cdd6f4; padding: 7px 9px; font-size: 13px; width: 100%; box-sizing: border-box;
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); border-radius: 6px;
+  color: var(--ctp-text); padding: 7px 9px; font-size: 13px; width: 100%; box-sizing: border-box;
   font-family: inherit;
 }
-input:focus { outline: 1px solid #89b4fa; }
+input:focus { outline: 1px solid var(--ctp-blue); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .row { display: flex; gap: 8px; }
 .row .port { width: 84px; flex-shrink: 0; }
 .eye {
-  background: #11111b; border: 1px solid #313244; border-radius: 6px;
-  color: #a6adc8; cursor: pointer; padding: 0 10px; flex-shrink: 0;
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); border-radius: 6px;
+  color: var(--ctp-subtext0); cursor: pointer; padding: 0 10px; flex-shrink: 0;
 }
 .seg { display: flex; gap: 8px; }
 .seg button {
-  flex: 1; background: #11111b; border: 1px solid #313244; color: #a6adc8;
+  flex: 1; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
   border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px;
 }
-.seg button.sel { border-color: #89b4fa; color: #89b4fa; }
+.seg button.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .check { display: flex; align-items: center; gap: 7px; margin-top: 8px; cursor: pointer; }
 .check input { width: auto; }
-.check span { font-size: 12px; color: #a6adc8; }
+.check span { font-size: 12px; color: var(--ctp-subtext0); }
 .warn {
-  font-size: 11px; color: #f9e2af; background: #2b2718;
+  font-size: 11px; color: var(--ctp-yellow); background: var(--banner-warn-bg);
   border-radius: 5px; padding: 6px 8px; margin-top: 4px; line-height: 1.5;
 }
-.hintline { font-size: 11px; color: #6c7086; margin-top: 4px; }
+.hintline { font-size: 11px; color: var(--ctp-overlay0); margin-top: 4px; }
 .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
 .btns button {
-  padding: 7px 16px; border-radius: 6px; border: 1px solid #313244;
-  background: #11111b; color: #a6adc8; cursor: pointer; font-size: 13px;
+  padding: 7px 16px; border-radius: 6px; border: 1px solid var(--ctp-surface0);
+  background: var(--ctp-crust); color: var(--ctp-subtext0); cursor: pointer; font-size: 13px;
 }
-.btns .primary { background: #89b4fa; color: #11111b; border: none; font-weight: 600; }
+.btns .primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
 .btns .primary:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>
