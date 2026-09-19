@@ -227,7 +227,10 @@ fn keep_mount(device: &str, mount: &str) -> bool {
         "tmpfs" | "devtmpfs" | "none" | "rootfs" | "udev" => return false,
         _ => {}
     }
-    device.starts_with("/dev/") || device == "overlay" || device.contains("zfs") || device.contains("pool")
+    device.starts_with("/dev/")
+        || device == "overlay"
+        || device.contains("zfs")
+        || device.contains("pool")
 }
 
 fn parse_df(lines: Option<&Vec<String>>) -> Vec<DiskUsage> {
@@ -266,7 +269,10 @@ fn is_whole_disk(name: &str) -> bool {
     // `sda` = disk, `sda1`/`sda14` = partitions of it.
     let prefix_style = |prefix: &str| -> Option<bool> {
         let rest = name.strip_prefix(prefix)?;
-        let letters: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        let letters: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
         if letters.is_empty() {
             return Some(false); // "sdb" handled by other prefixes
         }
@@ -409,8 +415,8 @@ struct PrevSample {
     mono_ts: f64,
     cpu_total: u64,
     cpu_idle: u64,
-    per_core: Vec<(u64, u64)>,          // (total, idle)
-    net: HashMap<String, (u64, u64)>,   // rx, tx bytes
+    per_core: Vec<(u64, u64)>,           // (total, idle)
+    net: HashMap<String, (u64, u64)>,    // rx, tx bytes
     diskio: HashMap<String, (u64, u64)>, // read sectors, write sectors
     procs: HashMap<u32, u64>,            // pid -> utime+stime ticks
 }
@@ -470,8 +476,8 @@ fn parse_procs(
                 continue;
             };
             total += 1;
-            let ticks = f[3].trim().parse::<u64>().unwrap_or(0)
-                + f[4].trim().parse::<u64>().unwrap_or(0);
+            let ticks =
+                f[3].trim().parse::<u64>().unwrap_or(0) + f[4].trim().parse::<u64>().unwrap_or(0);
             let rss_pages = f[5].trim().parse::<u64>().unwrap_or(0);
             let cpu_pct = match prev.procs.get(&pid) {
                 Some(&before) if dt > 0.0 => {
@@ -684,7 +690,8 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
             } else {
                 (0.0, 0.0)
             };
-            prev.diskio.insert(name.clone(), (read_sectors, write_sectors));
+            prev.diskio
+                .insert(name.clone(), (read_sectors, write_sectors));
             disk_io.push(DiskIo {
                 name,
                 read_bps: rbps,
@@ -761,7 +768,10 @@ pub fn spawn(
         // One-shot static info
         match collect_static(&handle).await {
             Ok(info) => {
-                let _ = app.emit("ssh://static", serde_json::json!({ "sid": sid, "info": info }));
+                let _ = app.emit(
+                    "ssh://static",
+                    serde_json::json!({ "sid": sid, "info": info }),
+                );
             }
             Err(e) => log::warn!("静态信息采集失败: {:#}", e),
         }
@@ -814,7 +824,16 @@ pub fn spawn(
                 }
             };
             if let Some(m) = parse_metrics(&raw, &mut prev) {
-                let _ = app.emit("ssh://metrics", serde_json::json!({ "sid": sid, "metrics": m }));
+                // Evaluate alerts before moving `m` into the event payload.
+                let fired = crate::alerts::evaluate(&sid, &m, &settings);
+                let _ = app.emit(
+                    "ssh://metrics",
+                    serde_json::json!({ "sid": sid, "metrics": m }),
+                );
+                for a in fired {
+                    log::info!("告警[{}]: {}", sid, a.body);
+                    let _ = app.emit("ssh://alert", serde_json::json!({ "sid": sid, "alert": a }));
+                }
             }
         }
         registry().remove(&sid);
@@ -871,8 +890,17 @@ mod tests {
             assert!(is_whole_disk(name), "{} should be a whole disk", name);
         }
         for name in [
-            "sda1", "sda14", "sda15", "vda2", "xvdb3", "nvme0n1p1", "mmcblk0p1", "loop0", "ram3",
-            "dm-0", "sr0",
+            "sda1",
+            "sda14",
+            "sda15",
+            "vda2",
+            "xvdb3",
+            "nvme0n1p1",
+            "mmcblk0p1",
+            "loop0",
+            "ram3",
+            "dm-0",
+            "sr0",
         ] {
             assert!(!is_whole_disk(name), "{} should be filtered out", name);
         }
@@ -895,7 +923,10 @@ mod tests {
         let mounts: Vec<&str> = disks.iter().map(|d| d.mount.as_str()).collect();
         assert!(mounts.contains(&"/"), "root must survive: {:?}", mounts);
         assert!(mounts.contains(&"/data"));
-        assert!(!mounts.contains(&"/mnt/c"), "WSL host mount must be dropped");
+        assert!(
+            !mounts.contains(&"/mnt/c"),
+            "WSL host mount must be dropped"
+        );
         assert!(!mounts.contains(&"/usr/lib/wsl/drivers"));
         assert!(!mounts.contains(&"/sys/fs/cgroup"));
         assert!(!mounts.iter().any(|m| m.starts_with("/var/lib/docker")));
@@ -924,7 +955,11 @@ mod tests {
         let m2 = parse_metrics(raw2, &mut prev).unwrap();
         let names: Vec<&str> = m2.net.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["eth1", "eth0"], "down 网卡应被丢弃，忙的排前");
-        assert!((m2.net[0].rx_bps - 10000.0).abs() < 1.0, "rx={}", m2.net[0].rx_bps);
+        assert!(
+            (m2.net[0].rx_bps - 10000.0).abs() < 1.0,
+            "rx={}",
+            m2.net[0].rx_bps
+        );
         assert_eq!(m2.net[1].rx_bps, 0.0);
     }
 
@@ -993,7 +1028,11 @@ mod tests {
         assert!(prev.has_baseline, "first sample must arm the baseline");
         let m2 = parse_metrics(raw2, &mut prev).unwrap();
         assert!((m2.cpu_pct - 50.0).abs() < 1.0, "cpu={}", m2.cpu_pct);
-        assert!((m2.net[0].rx_bps - 1000.0).abs() < 1.0, "rx={}", m2.net[0].rx_bps);
+        assert!(
+            (m2.net[0].rx_bps - 1000.0).abs() < 1.0,
+            "rx={}",
+            m2.net[0].rx_bps
+        );
         assert!((m2.net[0].tx_bps - 2000.0).abs() < 1.0);
         assert_eq!(m2.ts, 102.0, "display ts stays the remote one");
     }
@@ -1006,15 +1045,25 @@ mod tests {
         let mut prev = PrevSample::default();
         let m1 = parse_metrics(raw1, &mut prev).unwrap();
         assert_eq!(m1.proc_total, 2);
-        assert!(m1.processes.iter().all(|p| p.cpu_pct == 0.0), "首样本无基线应为 0");
+        assert!(
+            m1.processes.iter().all(|p| p.cpu_pct == 0.0),
+            "首样本无基线应为 0"
+        );
         assert_eq!(m1.processes[0].rss_kb, 500 * 4096 / 1024, "RSS 页→KB 换算");
 
         prev.mono_ts = mono_secs() - 1.0;
         prev.has_baseline = true;
         let m2 = parse_metrics(raw2, &mut prev).unwrap();
-        assert!((m2.processes[0].cpu_pct - 100.0).abs() < 1.0, "top={:?}", m2.processes[0]);
+        assert!(
+            (m2.processes[0].cpu_pct - 100.0).abs() < 1.0,
+            "top={:?}",
+            m2.processes[0]
+        );
         assert_eq!(m2.processes[0].name, "bash", "应按 CPU 降序");
-        assert!((m2.processes[1].cpu_pct - 20.0).abs() < 1.0, "20 ticks → 20%");
+        assert!(
+            (m2.processes[1].cpu_pct - 20.0).abs() < 1.0,
+            "20 ticks → 20%"
+        );
         assert_eq!(m2.processes[1].pid, 1);
     }
 
@@ -1111,6 +1160,30 @@ mod live_tests {
         Ok(h)
     }
 
+    /// Temp known_hosts that deletes itself, including when an assert panics —
+    /// a leaking file per failed run is how these pile up in %TEMP%.
+    struct TempKh(std::path::PathBuf);
+    impl TempKh {
+        fn new(tag: &str, port: u16) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "sshbox-live-{}-{}-{}",
+                tag,
+                std::process::id(),
+                port
+            ));
+            let _ = std::fs::remove_file(&p);
+            TempKh(p)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.clone()
+        }
+    }
+    impl Drop for TempKh {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[tokio::test]
     async fn live_vm_static_info_and_metrics() {
         let Some((host, port, user, pw)) = test_target() else {
@@ -1118,16 +1191,11 @@ mod live_tests {
             return;
         };
 
-        let kh = std::env::temp_dir().join(format!(
-            "sshbox-live-known_hosts-{}-{}",
-            std::process::id(),
-            port
-        ));
-        let _ = std::fs::remove_file(&kh);
-        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.clone())
+        let kh = TempKh::new("known_hosts", port);
+        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.path())
             .await
             .expect("连接失败（WSL 是否在运行？sshd 是否在监听？）");
-        assert!(kh.exists(), "accept_new 应当把主机密钥写入 known_hosts");
+        assert!(kh.0.exists(), "accept_new 应当把主机密钥写入 known_hosts");
 
         // --- static info ---
         let info = collect_static(&h).await.expect("静态信息采集失败");
@@ -1138,13 +1206,19 @@ mod live_tests {
             info.kernel,
             info.cpu_cores,
             info.mem_total_kb,
-            info.disks.iter().map(|d| d.mount.clone()).collect::<Vec<_>>()
+            info.disks
+                .iter()
+                .map(|d| d.mount.clone())
+                .collect::<Vec<_>>()
         );
         assert!(!info.hostname.is_empty(), "hostname 为空");
         assert!(!info.os_pretty.is_empty(), "发行版信息为空");
         assert!(info.cpu_cores >= 1, "CPU 核数异常");
         assert!(info.mem_total_kb > 0, "内存总量为 0");
-        assert!(!info.disks.is_empty(), "没有解析出任何磁盘（根分区必须存在）");
+        assert!(
+            !info.disks.is_empty(),
+            "没有解析出任何磁盘（根分区必须存在）"
+        );
         assert!(
             info.disks.iter().any(|d| d.mount == "/"),
             "根分区缺失: {:?}",
@@ -1152,13 +1226,17 @@ mod live_tests {
         );
 
         // --- two live samples → rates ---
-        let raw1 = exec_capture(&h, COLLECT_SCRIPT).await.expect("第一次采样失败");
+        let raw1 = exec_capture(&h, COLLECT_SCRIPT)
+            .await
+            .expect("第一次采样失败");
         let mut prev = PrevSample::default();
         let m1 = parse_metrics(&raw1, &mut prev).expect("第一次采样解析失败");
         assert_eq!(m1.cpu_pct, 0.0, "首帧不该有 CPU 速率");
 
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        let raw2 = exec_capture(&h, COLLECT_SCRIPT).await.expect("第二次采样失败");
+        let raw2 = exec_capture(&h, COLLECT_SCRIPT)
+            .await
+            .expect("第二次采样失败");
         let m2 = parse_metrics(&raw2, &mut prev).expect("第二次采样解析失败");
 
         eprintln!(
@@ -1181,8 +1259,16 @@ mod live_tests {
         );
 
         assert!(m2.mem_total_kb > 0, "内存总量为 0");
-        assert!((0.0..=100.0).contains(&m2.mem_pct), "内存百分比越界: {}", m2.mem_pct);
-        assert!(m2.cpu_pct >= 0.0 && m2.cpu_pct <= 100.0, "CPU 百分比越界: {}", m2.cpu_pct);
+        assert!(
+            (0.0..=100.0).contains(&m2.mem_pct),
+            "内存百分比越界: {}",
+            m2.mem_pct
+        );
+        assert!(
+            m2.cpu_pct >= 0.0 && m2.cpu_pct <= 100.0,
+            "CPU 百分比越界: {}",
+            m2.cpu_pct
+        );
         assert!(!m2.cpu_per_core.is_empty(), "没有每核数据");
         assert!(!m2.net.is_empty());
         assert!(!m2.processes.is_empty(), "进程表不应为空");
@@ -1204,11 +1290,7 @@ mod live_tests {
         assert!(m2.ts > 0.0, "时间戳无效");
         // Whole disks only — a partition row here means the filter regressed.
         for d in &m2.disk_io {
-            assert!(
-                is_whole_disk(&d.name),
-                "磁盘 I/O 里出现了分区: {}",
-                d.name
-            );
+            assert!(is_whole_disk(&d.name), "磁盘 I/O 里出现了分区: {}", d.name);
         }
     }
 
@@ -1221,8 +1303,8 @@ mod live_tests {
             eprintln!("跳过 live 燃烧测试：未设置 SSHBOX_TEST_HOST / SSHBOX_TEST_PASSWORD");
             return;
         };
-        let kh = std::env::temp_dir().join(format!("sshbox-live-kh-burn-{}", std::process::id()));
-        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.clone())
+        let kh = TempKh::new("kh-burn", port);
+        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.path())
             .await
             .expect("连接失败（WSL 是否在运行？）");
 
@@ -1247,7 +1329,6 @@ mod live_tests {
             top.cpu_pct
         );
         let _ = burn.close().await;
-        let _ = std::fs::remove_file(&kh);
     }
 
     #[tokio::test]
@@ -1257,36 +1338,35 @@ mod live_tests {
             return;
         };
         // Never touch the user's real known_hosts.
-        let kh = std::env::temp_dir().join(format!(
-            "sshbox-test-known_hosts-{}-{}",
-            std::process::id(),
-            port
-        ));
-        let _ = std::fs::remove_file(&kh);
+        let kh = TempKh::new("known_hosts", port);
 
         // 1) strict + no record ⇒ the connect must be refused (Unknown).
-        let strict = connect_for_test(&host, port, &user, &pw, "strict", kh.clone()).await;
+        let strict = connect_for_test(&host, port, &user, &pw, "strict", kh.path()).await;
         assert!(
             strict.is_err(),
             "known_hosts 为空时严格模式必须拒绝连接，实际却成功了"
         );
-        assert!(!kh.exists(), "严格模式不该写入 known_hosts");
+        assert!(!kh.0.exists(), "严格模式不该写入 known_hosts");
 
         // 2) accept_new ⇒ records the key and connects.
-        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.clone())
+        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.path())
             .await
             .expect("接受新密钥后应当连接成功");
-        assert!(kh.exists(), "accept_new 应当写入 known_hosts 文件");
-        let recorded = std::fs::read_to_string(&kh).unwrap();
-        assert!(recorded.contains(&host), "known_hosts 未记录主机: {}", recorded);
+        assert!(kh.0.exists(), "accept_new 应当写入 known_hosts 文件");
+        let recorded = std::fs::read_to_string(&kh.0).unwrap();
+        assert!(
+            recorded.contains(&host),
+            "known_hosts 未记录主机: {}",
+            recorded
+        );
         drop(h);
 
         // 3) strict again ⇒ now trusted, connects fine.
-        connect_for_test(&host, port, &user, &pw, "strict", kh.clone())
+        connect_for_test(&host, port, &user, &pw, "strict", kh.path())
             .await
             .expect("已记录密钥后严格模式应当通过");
 
-        let entries = crate::hostkey::list(&kh);
+        let entries = crate::hostkey::list(&kh.0);
         assert_eq!(entries.len(), 1, "应恰好记录一条主机密钥: {:?}", entries);
         assert!(
             entries[0].fingerprint.starts_with("SHA256:"),
@@ -1295,13 +1375,14 @@ mod live_tests {
         );
 
         // 4) remove ⇒ the record is gone and strict refuses again.
-        let removed = crate::hostkey::remove(&kh, &host, port).expect("删除 known_hosts 记录失败");
+        let removed =
+            crate::hostkey::remove(&kh.0, &host, port).expect("删除 known_hosts 记录失败");
         assert_eq!(removed, 1);
         assert!(
-            connect_for_test(&host, port, &user, &pw, "strict", kh.clone()).await.is_err(),
+            connect_for_test(&host, port, &user, &pw, "strict", kh.path())
+                .await
+                .is_err(),
             "删除记录后严格模式应当重新拒绝"
         );
-
-        let _ = std::fs::remove_file(&kh);
     }
 }

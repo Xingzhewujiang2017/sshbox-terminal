@@ -1,3 +1,4 @@
+mod alerts;
 mod commands;
 mod hostkey;
 mod monitor;
@@ -13,6 +14,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(ssh::SessionManager::default())
         .invoke_handler(tauri::generate_handler![
             // --- sessions / terminal ---

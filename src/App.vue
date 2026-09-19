@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
 import HostList from './components/HostList.vue'
@@ -12,6 +13,7 @@ import {
   api,
   SshboxError,
   uiLog,
+  type Alert,
   type AppPaths,
   type ErrPayload,
   type Host,
@@ -62,6 +64,26 @@ const confirmState = ref<{ text: string; onOk: () => void } | null>(null)
 
 const settingsRef = ref<InstanceType<typeof SettingsDialog> | null>(null)
 
+/**
+ * Native Windows toast. Best-effort: a denied permission must not break the UI.
+ * Every outcome goes to the backend log, because a silent notification failure
+ * is otherwise indistinguishable from "nothing happened".
+ */
+async function desktopNotify(title: string, body: string) {
+  try {
+    let granted = await isPermissionGranted()
+    if (!granted) granted = (await requestPermission()) === 'granted'
+    if (!granted) {
+      void uiLog('桌面通知未授权，仅应用内提示', 'warn')
+      return
+    }
+    sendNotification({ title, body })
+    void uiLog(`桌面通知已发送: ${title} — ${body}`)
+  } catch (e) {
+    void uiLog(`桌面通知失败: ${(e as Error).message}`, 'warn')
+  }
+}
+
 function toast(kind: 'error' | 'info', text: string) {
   banner.value = { kind, text }
   if (kind === 'info') window.setTimeout(() => (banner.value = null), 4000)
@@ -84,6 +106,12 @@ onMounted(async () => {
   listen<{ sid: string; host_id?: string; label?: string }>('ssh://closed', (ev) => {
     const t = tabs.value.find((x) => x.sid === ev.payload.sid)
     if (t) markClosed(t)
+  })
+  listen<{ sid: string; alert: Alert }>('ssh://alert', (ev) => {
+    const a = ev.payload.alert
+    const tab = tabs.value.find((x) => x.sid === ev.payload.sid)
+    toast('error', `${a.title}${tab ? ' · ' + tab.label : ''}：${a.body}`)
+    void desktopNotify(a.title, `${tab ? tab.label + ' · ' : ''}${a.body}`)
   })
   window.addEventListener('keydown', onKey)
 })

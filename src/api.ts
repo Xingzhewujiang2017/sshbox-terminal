@@ -106,6 +106,14 @@ export interface Settings {
   theme: string
 }
 
+export interface Alert {
+  kind: 'cpu' | 'mem' | 'disk'
+  title: string
+  body: string
+  value: number
+  threshold: number
+}
+
 export interface SessionInfo {
   sid: string
   host_id?: string | null

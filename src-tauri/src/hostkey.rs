@@ -24,9 +24,15 @@ pub enum VerifyOutcome {
     /// Key matches the recorded one.
     Trusted,
     /// Key was unknown and has just been written to known_hosts.
-    Learned { fingerprint: String, key_type: String },
+    Learned {
+        fingerprint: String,
+        key_type: String,
+    },
     /// Key is unknown and the policy forbids learning it.
-    Unknown { fingerprint: String, key_type: String },
+    Unknown {
+        fingerprint: String,
+        key_type: String,
+    },
     /// A different key is already recorded for this host — possible MITM.
     Changed {
         fingerprint: String,
@@ -34,7 +40,10 @@ pub enum VerifyOutcome {
         key_type: String,
     },
     /// Policy `accept_any`: verification skipped (reported so the UI can warn).
-    Skipped { fingerprint: String, key_type: String },
+    Skipped {
+        fingerprint: String,
+        key_type: String,
+    },
 }
 
 impl VerifyOutcome {
@@ -64,7 +73,14 @@ pub fn host_token(host: &str, port: u16) -> String {
     }
 }
 
-fn try_learn(host: &str, port: u16, key: &PublicKey, path: &Path, fp: &str, kt: &str) -> VerifyOutcome {
+fn try_learn(
+    host: &str,
+    port: u16,
+    key: &PublicKey,
+    path: &Path,
+    fp: &str,
+    kt: &str,
+) -> VerifyOutcome {
     match learn_known_hosts_path(host, port, key, path) {
         Ok(()) => VerifyOutcome::Learned {
             fingerprint: fp.to_string(),

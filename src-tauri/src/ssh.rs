@@ -298,8 +298,7 @@ async fn do_connect(
 ) -> std::result::Result<SessionId, String> {
     let port = params.effective_port();
     let policy = params.policy();
-    let outcome_slot: Arc<StdMutex<Option<hostkey::VerifyOutcome>>> =
-        Arc::new(StdMutex::new(None));
+    let outcome_slot: Arc<StdMutex<Option<hostkey::VerifyOutcome>>> = Arc::new(StdMutex::new(None));
 
     let handler = ClientHandler {
         host: params.host.clone(),
@@ -437,9 +436,7 @@ async fn do_connect(
                 PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
             )
             .await
-            .map_err(|e| {
-                err_kind("auth_error", format!("私钥认证请求失败: {}", e))
-            })?
+            .map_err(|e| err_kind("auth_error", format!("私钥认证请求失败: {}", e)))?
     } else {
         return Err(err_kind("need_password", "需要提供密码或私钥"));
     };
@@ -456,7 +453,12 @@ async fn do_connect(
     }
 
     // --- PTY channel ---
-    log::info!("[连接 {}:{}] 认证结果 success={}", params.host, port, auth_res.success());
+    log::info!(
+        "[连接 {}:{}] 认证结果 success={}",
+        params.host,
+        port,
+        auth_res.success()
+    );
     let mut channel = handle
         .channel_open_session()
         .await
