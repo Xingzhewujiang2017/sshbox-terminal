@@ -45,6 +45,14 @@
                 {{ r.listen_host }}:{{ r.running && r.actual_port !== r.listen_port ? r.actual_port : r.listen_port }}
                 <span v-if="r.kind === 'local'" class="muted">（本机）</span>
                 <span v-else class="muted">（远端）</span>
+                <!-- sshd 的 GatewayPorts 默认是 no：请求 0.0.0.0 时它静默只绑回环。
+                     不说明的话，面板写着 0.0.0.0 会让人以为外部机器能连。 -->
+                <div
+                  v-if="r.kind === 'remote' && r.running && isWildcard(r.listen_host)"
+                  class="warn-note"
+                >
+                  远端 sshd 的 GatewayPorts 若不是 yes，实际只绑回环地址 —— 只有远端本机能连
+                </div>
               </td>
               <td class="mono">
                 {{ r.target_host }}:{{ r.target_port }}
@@ -135,6 +143,11 @@ import { api, toSshboxError, type ForwardKind, type ForwardRule, type ForwardSta
 
 const props = defineProps<{ sid: string; label: string }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
+
+/** 监听地址是不是"全网卡"（这类地址对远端 -R 会被 sshd 的 GatewayPorts 影响） */
+function isWildcard(host: string): boolean {
+  return host === '0.0.0.0' || host === '*' || host === '::' || host === '[::]'
+}
 
 const rules = ref<ForwardStatus[]>([])
 const err = ref('')
@@ -453,6 +466,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .mono {
   font-family: ui-monospace, Consolas, monospace;
   font-size: 12px;
+}
+
+.warn-note {
+  margin-top: 3px;
+  font-family: var(--font-ui, inherit);
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--ctp-yellow);
 }
 
 .muted {

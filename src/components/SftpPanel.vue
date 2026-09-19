@@ -805,7 +805,7 @@ onUnmounted(() => {
 
 .tag {
   font-size: 12px;
-  color: var(--ctp-subtext0);
+  color: var(--ctp-text);
   background: var(--ctp-surface0);
   border-radius: 4px;
   padding: 2px 6px;
@@ -842,6 +842,7 @@ onUnmounted(() => {
 }
 
 .list li {
+  color: var(--ctp-text);
   display: grid;
   grid-template-columns: 20px 1fr auto auto;
   gap: 8px;
@@ -873,7 +874,8 @@ onUnmounted(() => {
 
 .sz,
 .tm {
-  color: var(--ctp-subtext0);
+  /* 11px 的次要信息再降一档；文件名是主文字色，层级靠这行拉开 */
+  color: var(--ctp-overlay0);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
@@ -931,7 +933,7 @@ onUnmounted(() => {
   gap: 10px;
   padding: 7px 12px;
   font-size: 12px;
-  color: var(--ctp-subtext0);
+  color: var(--ctp-text);
   border-bottom: 1px solid var(--ctp-surface0);
 }
 
