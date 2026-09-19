@@ -101,8 +101,8 @@ pub struct DiskIo {
     pub write_bps: f64,
 }
 
-/// How often the slow service/port/container facts are refreshed.
-const SERVICES_EVERY: Duration = Duration::from_secs(15);
+/// How often the slow facts — services, ports, containers, sensors — refresh.
+const SLOW_EVERY: Duration = Duration::from_secs(15);
 
 /// The shell script that collects everything in one shot. Pure POSIX + /proc.
 /// `date +%s.%N` is GNU-only, so a busybox `date` must not break the sample —
@@ -138,10 +138,18 @@ done
 echo "@@END@@"
 "#;
 
-/// The slow-moving facts: failed units, listening ports, containers. Run on a
-/// separate, slower cadence — `systemctl` alone costs more than the whole fast
-/// script, and none of this changes second to second.
-const SERVICES_SCRIPT: &str = r#"
+/// Where the remote's sysfs is mounted. Overridable so a test — or a container
+/// with an unusual layout — can point the collector at a fabricated tree. The
+/// value is baked into the script text, so it must be set on the *client* side.
+fn sysfs_root() -> String {
+    std::env::var("SSHBOX_SYSFS").unwrap_or_else(|_| "/sys".to_string())
+}
+
+/// The slow-moving facts: failed units, listening ports, containers, hardware
+/// sensors. Run on a separate, slower cadence — `systemctl` alone costs more
+/// than the whole fast script, and none of this changes second to second.
+/// `__SYS__` is replaced with the sysfs root at call time.
+const SLOW_SCRIPT: &str = r#"
 echo "@@SVC@@"
 # UNIT LOAD ACTIVE SUB DESCRIPTION — --plain drops the tree glyphs. No --type
 # filter: a failed .mount or .socket is exactly as important as a failed service.
@@ -165,8 +173,57 @@ if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
     printf '%s\n' "$out" | head -20
   fi
 fi
+echo "@@HW_TEMP@@"
+# hwmon is what lm-sensors reads anyway — going through `sensors` would add a
+# package dependency and a human-formatted text parser for no extra data.
+# temp*_input is millidegrees Celsius; temp*_label exists on most chips.
+for h in __SYS__/class/hwmon/hwmon*; do
+  [ -r "$h/name" ] || continue
+  chip=$(cat "$h/name" 2>/dev/null)
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    [ -r "$h/temp${i}_input" ] || continue
+    lbl=$(cat "$h/temp${i}_label" 2>/dev/null)
+    [ -n "$lbl" ] || lbl="temp$i"
+    echo "$chip|$lbl|$(cat "$h/temp${i}_input" 2>/dev/null)"
+  done
+done | head -40
+# Thermal zones are the fallback for boxes with no hwmon (ARM boards, VMs).
+for z in __SYS__/class/thermal/thermal_zone*; do
+  [ -r "$z/temp" ] || continue
+  echo "thermal|$(cat "$z/type" 2>/dev/null)|$(cat "$z/temp" 2>/dev/null)"
+done | head -8
+echo "@@HW_FAN@@"
+for h in __SYS__/class/hwmon/hwmon*; do
+  [ -r "$h/name" ] || continue
+  chip=$(cat "$h/name" 2>/dev/null)
+  for i in 1 2 3 4 5 6 7 8; do
+    [ -r "$h/fan${i}_input" ] || continue
+    lbl=$(cat "$h/fan${i}_label" 2>/dev/null)
+    [ -n "$lbl" ] || lbl="fan$i"
+    echo "$chip|$lbl|$(cat "$h/fan${i}_input" 2>/dev/null)"
+  done
+done | head -12
+echo "@@HW_GPU@@"
+# NVIDIA has no sysfs util counter, so it needs its own tool. `nounits` keeps
+# the numbers plain; missing fields come back as [N/A], which the parser reads
+# as unknown rather than zero.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null | head -8 | sed 's/^/n|/'
+fi
+# AMD exposes utilisation and VRAM straight in sysfs; Intel does not, so it is
+# simply absent rather than guessed at.
+for c in __SYS__/class/drm/card[0-9]; do
+  [ -r "$c/device/gpu_busy_percent" ] || continue
+  d=$(basename "$(readlink -f "$c/device/driver" 2>/dev/null)" 2>/dev/null)
+  echo "a|${d:-gpu}|$(cat "$c/device/gpu_busy_percent" 2>/dev/null)|$(cat "$c/device/mem_info_vram_used" 2>/dev/null)|$(cat "$c/device/mem_info_vram_total" 2>/dev/null)"
+done | head -4
 echo "@@END@@"
 "#;
+
+/// The slow script with the sysfs root resolved.
+fn slow_script() -> String {
+    SLOW_SCRIPT.replace("__SYS__", &sysfs_root())
+}
 
 const STATIC_SCRIPT: &str = r#"
 echo "@@HOST@@ $(hostname 2>/dev/null)"
@@ -653,6 +710,193 @@ pub fn parse_services(s: &HashMap<String, Vec<String>>) -> ServiceInfo {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Hardware sensors (temperatures, fans, GPUs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TempReading {
+    pub chip: String,
+    pub label: String,
+    pub celsius: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct FanReading {
+    pub chip: String,
+    pub label: String,
+    pub rpm: u32,
+}
+
+/// A GPU as far as it can be seen from the host: NVIDIA through `nvidia-smi`,
+/// AMD through sysfs. Every measurement is optional — a card that does not
+/// report power draw must show nothing there, not a fabricated 0 W.
+#[derive(Debug, Serialize, Clone)]
+pub struct GpuInfo {
+    pub name: String,
+    pub vendor: String,
+    pub util_pct: Option<f64>,
+    pub mem_used_mb: Option<u64>,
+    pub mem_total_mb: Option<u64>,
+    pub temp_c: Option<f64>,
+    pub power_w: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct HardwareInfo {
+    /// Hottest first — the one number worth seeing is the top of the list.
+    pub temps: Vec<TempReading>,
+    pub fans: Vec<FanReading>,
+    pub gpus: Vec<GpuInfo>,
+}
+
+/// Plausible die/board temperature. Drivers report junk for unconnected
+/// sensors — a flat 0, or 100000000 after a millidegree mix-up — and a wrong
+/// number in a monitoring panel is worse than a missing one.
+fn plausible_temp(c: f64) -> bool {
+    c.is_finite() && (5.0..=125.0).contains(&c)
+}
+
+/// `nvidia-smi` prints `[N/A]` / `[Not Supported]` for a field the card does
+/// not expose. That is "unknown", never zero.
+fn opt_num(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() || t.starts_with('[') || t.eq_ignore_ascii_case("n/a") {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+fn opt_int(s: &str) -> Option<u64> {
+    opt_num(s).map(|v| v.max(0.0) as u64)
+}
+
+/// Parse the HW_TEMP / HW_FAN / HW_GPU sections of the slow script. Absent
+/// sections are normal — plenty of machines (containers, VMs, WSL) expose no
+/// sensors at all, and that must stay silent rather than look like an error.
+pub fn parse_hardware(s: &HashMap<String, Vec<String>>) -> HardwareInfo {
+    let mut out = HardwareInfo::default();
+
+    let mut raw: Vec<(String, String, f64)> = Vec::new();
+    if let Some(lines) = s.get("HW_TEMP") {
+        for line in lines {
+            let f: Vec<&str> = line.split('|').collect();
+            if f.len() < 3 {
+                continue;
+            }
+            let Some(milli) = f[2].trim().parse::<f64>().ok() else {
+                continue;
+            };
+            // sysfs is millidegrees for hwmon and thermal zones alike.
+            let c = milli / 1000.0;
+            if !plausible_temp(c) {
+                continue;
+            }
+            raw.push((f[0].trim().to_string(), f[1].trim().to_string(), c));
+        }
+    }
+
+    // Two NVMe drives both call themselves "nvme", and the UI would show two
+    // identical rows. Suffix the chip only when the name really repeats, so
+    // the ordinary single-chip machine stays clean.
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for (chip, _, _) in &raw {
+        *counts.entry(chip.clone()).or_default() += 1;
+    }
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for (chip, label, celsius) in raw {
+        let name = if counts.get(chip.as_str()).copied().unwrap_or(0) > 1 {
+            let n = seen.entry(chip.clone()).or_insert(0);
+            *n += 1;
+            format!("{chip}#{n}")
+        } else {
+            chip
+        };
+        out.temps.push(TempReading {
+            chip: name,
+            label,
+            celsius,
+        });
+    }
+    out.temps.sort_by(|a, b| {
+        b.celsius
+            .partial_cmp(&a.celsius)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if let Some(lines) = s.get("HW_FAN") {
+        for line in lines {
+            let f: Vec<&str> = line.split('|').collect();
+            if f.len() < 3 {
+                continue;
+            }
+            let Some(rpm) = f[2].trim().parse::<u32>().ok() else {
+                continue;
+            };
+            if rpm == 0 {
+                // A stopped fan is a real state, but reporting "0 RPM" for a
+                // header that is simply not wired up would be noise.
+                continue;
+            }
+            out.fans.push(FanReading {
+                chip: f[0].trim().to_string(),
+                label: f[1].trim().to_string(),
+                rpm,
+            });
+        }
+    }
+
+    if let Some(lines) = s.get("HW_GPU") {
+        for line in lines {
+            let f: Vec<&str> = line.split('|').collect();
+            if f.len() < 2 {
+                continue;
+            }
+            match f[0].trim() {
+                // name, util%, mem.used MB, mem.total MB, temp C, power W
+                "n" if f.len() >= 7 => {
+                    let name = f[1].trim().to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    out.gpus.push(GpuInfo {
+                        name,
+                        vendor: "nvidia".to_string(),
+                        util_pct: opt_num(f[2]),
+                        mem_used_mb: opt_int(f[3]),
+                        mem_total_mb: opt_int(f[4]),
+                        temp_c: opt_num(f[5]).filter(|c| plausible_temp(*c)),
+                        power_w: opt_num(f[6]),
+                    });
+                }
+                // driver, busy%, vram used bytes, vram total bytes
+                "a" if f.len() >= 5 => {
+                    let driver = f[1].trim();
+                    let name = match driver {
+                        "amdgpu" => "AMD GPU (amdgpu)".to_string(),
+                        "radeon" => "AMD GPU (radeon)".to_string(),
+                        "" => "GPU".to_string(),
+                        other => format!("GPU ({other})"),
+                    };
+                    out.gpus.push(GpuInfo {
+                        name,
+                        vendor: "amd".to_string(),
+                        util_pct: opt_num(f[2]),
+                        // sysfs reports VRAM in bytes; nvidia-smi already gave MB.
+                        mem_used_mb: opt_int(f[3]).map(|b| b / 1_048_576),
+                        mem_total_mb: opt_int(f[4]).map(|b| b / 1_048_576),
+                        temp_c: None,
+                        power_w: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    out
+}
+
 fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     let s = sections(raw);
 
@@ -977,15 +1221,27 @@ pub fn spawn(
             // Slow facts get their own channel and cadence: `systemctl` costs
             // more than the entire fast script and nothing here changes
             // second to second. A failure is logged, never fatal.
-            let slow_due = last_slow.map_or(true, |t| t.elapsed() >= SERVICES_EVERY);
+            let slow_due = last_slow.map_or(true, |t| t.elapsed() >= SLOW_EVERY);
             if slow_due {
                 last_slow = Some(Instant::now());
-                match exec_capture(&handle, SERVICES_SCRIPT).await {
+                match exec_capture(&handle, &slow_script()).await {
                     Ok(sraw) => {
-                        let svc = parse_services(&sections(&sraw));
+                        // One round trip carries both: the sensor reads are a
+                        // few file cats, the GPU query is the only real cost.
+                        let sec = sections(&sraw);
+                        let svc = parse_services(&sec);
                         let _ = app.emit(
                             "ssh://services",
                             serde_json::json!({ "sid": sid, "services": svc }),
+                        );
+                        // Temps and GPU load move faster than systemd units,
+                        // but this shares the slow cadence deliberately: an
+                        // extra SSH exec per second costs more than the
+                        // resolution it would buy.
+                        let hw = parse_hardware(&sec);
+                        let _ = app.emit(
+                            "ssh://hardware",
+                            serde_json::json!({ "sid": sid, "hardware": hw }),
                         );
                     }
                     Err(e) => log::warn!("服务信息采集失败: {:#}", e),
@@ -1344,6 +1600,118 @@ mod tests {
         let m2 = parse_metrics(raw2, &mut prev).expect("second sample must survive");
         assert!((m2.cpu_pct - 50.0).abs() < 1.0, "cpu={}", m2.cpu_pct);
     }
+    // --- 硬件传感器解析 ---------------------------------------------------
+
+    fn hw(pairs: &[(&str, &[&str])]) -> HardwareInfo {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), lines(v));
+        }
+        parse_hardware(&m)
+    }
+
+    #[test]
+    fn parse_hardware_reads_millidegrees_and_puts_the_hottest_first() {
+        let h = hw(&[(
+            "HW_TEMP",
+            &[
+                "coretemp|Package id 0|45000",
+                "coretemp|Core 0|39000",
+                "nvme|Composite|32850",
+            ],
+        )]);
+        assert_eq!(h.temps.len(), 3);
+        assert_eq!(h.temps[0].label, "Package id 0");
+        assert!((h.temps[0].celsius - 45.0).abs() < 0.001);
+        assert!((h.temps[2].celsius - 32.85).abs() < 0.001);
+        assert_eq!(h.temps[2].chip, "nvme");
+        assert!(h.fans.is_empty() && h.gpus.is_empty());
+    }
+
+    #[test]
+    fn parse_hardware_drops_implausible_readings() {
+        // 0 = 传感器没接, 100000000 = 毫度/度搞混, 1000 = 1°C
+        let h = hw(&[(
+            "HW_TEMP",
+            &[
+                "coretemp|Package id 0|0",
+                "coretemp|Core 0|100000000",
+                "acpitz|temp1|1000",
+                "coretemp|Core 1|51000",
+            ],
+        )]);
+        assert_eq!(h.temps.len(), 1, "只剩一条可信读数: {:?}", h.temps);
+        assert_eq!(h.temps[0].label, "Core 1");
+    }
+
+    #[test]
+    fn parse_hardware_suffixes_only_repeated_chip_names() {
+        let h = hw(&[(
+            "HW_TEMP",
+            &[
+                "nvme|Composite|40000",
+                "nvme|Composite|41000",
+                "coretemp|Package id 0|50000",
+            ],
+        )]);
+        let chips: Vec<&str> = h.temps.iter().map(|t| t.chip.as_str()).collect();
+        assert!(chips.contains(&"nvme#1") && chips.contains(&"nvme#2"), "{:?}", chips);
+        assert!(chips.contains(&"coretemp"), "唯一的名字不该加后缀: {:?}", chips);
+    }
+
+    #[test]
+    fn parse_hardware_reads_nvidia_csv_and_treats_n_a_as_unknown() {
+        let h = hw(&[(
+            "HW_GPU",
+            &[
+                "n|NVIDIA GeForce RTX 3060|37|1234|12288|52|115.4",
+                "n|Tesla T4|[N/A]|0|15360|41|[Not Supported]",
+            ],
+        )]);
+        assert_eq!(h.gpus.len(), 2);
+        let g = &h.gpus[0];
+        assert_eq!(g.vendor, "nvidia");
+        assert_eq!(g.util_pct, Some(37.0));
+        assert_eq!(g.mem_used_mb, Some(1234));
+        assert_eq!(g.mem_total_mb, Some(12288));
+        assert_eq!(g.temp_c, Some(52.0));
+        assert_eq!(g.power_w, Some(115.4));
+        // [N/A] 是"未知"，不是 0
+        assert_eq!(h.gpus[1].util_pct, None);
+        assert_eq!(h.gpus[1].power_w, None);
+        assert_eq!(h.gpus[1].mem_used_mb, Some(0));
+    }
+
+    #[test]
+    fn parse_hardware_converts_amd_vram_bytes_to_mb() {
+        let h = hw(&[("HW_GPU", &["a|amdgpu|12|1610612736|8589934592"])]);
+        let g = &h.gpus[0];
+        assert_eq!(g.name, "AMD GPU (amdgpu)");
+        assert_eq!(g.vendor, "amd");
+        assert_eq!(g.mem_used_mb, Some(1536));
+        assert_eq!(g.mem_total_mb, Some(8192));
+        assert_eq!(g.temp_c, None, "这条没有温度，必须是 None 而不是 0");
+    }
+
+    #[test]
+    fn parse_hardware_keeps_fans_and_skips_unwired_zeros() {
+        let h = hw(&[(
+            "HW_FAN",
+            &["nct6775|fan1|1200", "nct6775|fan2|0", "nct6775|fan3|junk"],
+        )]);
+        assert_eq!(h.fans.len(), 1);
+        assert_eq!(h.fans[0].rpm, 1200);
+    }
+
+    #[test]
+    fn parse_hardware_is_silent_when_a_machine_has_no_sensors() {
+        // WSL / 容器：三个 section 一个都没有 —— 不报错，也不造数据
+        let h = hw(&[]);
+        assert!(h.temps.is_empty() && h.fans.is_empty() && h.gpus.is_empty());
+        // 有 section 但全是垃圾行，同样要安静
+        let h2 = hw(&[("HW_TEMP", &["", "garbage", "a|b"]), ("HW_GPU", &["n|"])]);
+        assert!(h2.temps.is_empty() && h2.gpus.is_empty());
+    }
 }
 
 /// End-to-end tests against a real SSH server.
@@ -1549,7 +1917,7 @@ mod live_tests {
             .await
             .expect("连接失败（WSL 是否在运行？）");
 
-        let raw = exec_capture(&h, SERVICES_SCRIPT)
+        let raw = exec_capture(&h, &slow_script())
             .await
             .expect("服务信息采集失败");
         let svc = parse_services(&sections(&raw));
@@ -1583,6 +1951,94 @@ mod live_tests {
     /// Regression guard for the whole process pipeline: a shell loop must show
     /// up as a hot process. This is what catches shell-level field-index bugs
     /// (`$12` vs `${12}`) that synthetic unit tests cannot see.
+    /// 一棵假的 sysfs 树：coretemp（含一个 0°C 的假传感器）+ nvme +
+    /// thermal zone + 一个 AMD GPU。测试机（WSL）本身没有任何传感器，
+    /// "有传感器"这条路只能靠它覆盖。
+    const FAKE_SYS_SETUP: &str = r#"
+root=/tmp/sshbox-fake-sys
+rm -rf "$root"
+mkdir -p "$root/class/hwmon/hwmon0" "$root/class/hwmon/hwmon1" \
+         "$root/class/thermal/thermal_zone0" "$root/class/drm/card0/device" \
+         "$root/drivers/amdgpu"
+printf 'coretemp\n' > "$root/class/hwmon/hwmon0/name"
+printf '45000\n' > "$root/class/hwmon/hwmon0/temp1_input"
+printf 'Package id 0\n' > "$root/class/hwmon/hwmon0/temp1_label"
+printf '0\n' > "$root/class/hwmon/hwmon0/temp2_input"
+printf '1200\n' > "$root/class/hwmon/hwmon0/fan1_input"
+printf 'nvme\n' > "$root/class/hwmon/hwmon1/name"
+printf '32850\n' > "$root/class/hwmon/hwmon1/temp1_input"
+printf 'x86_pkg_temp\n' > "$root/class/thermal/thermal_zone0/type"
+printf '48000\n' > "$root/class/thermal/thermal_zone0/temp"
+ln -s "$root/drivers/amdgpu" "$root/class/drm/card0/device/driver"
+printf '7\n' > "$root/class/drm/card0/device/gpu_busy_percent"
+printf '1610612736\n' > "$root/class/drm/card0/device/mem_info_vram_used"
+printf '8589934592\n' > "$root/class/drm/card0/device/mem_info_vram_total"
+echo ok
+"#;
+
+    /// 真机跑一遍采集脚本：sysfs 指向假树，验证脚本→解析→数值全对；再用真
+    /// /sys 验一遍"这机器没有传感器"的安静路径。
+    #[tokio::test]
+    async fn live_hardware_snapshot_reads_a_fake_sysfs_tree() {
+        let Some((host, port, user, pw)) = test_target() else {
+            eprintln!("跳过 live 硬件测试：未设置 SSHBOX_TEST_HOST / SSHBOX_TEST_PASSWORD");
+            return;
+        };
+        let kh = TempKh::new("kh-hw", port);
+        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.path())
+            .await
+            .expect("连接失败（WSL 是否在运行？）");
+
+        exec_capture(&h, FAKE_SYS_SETUP)
+            .await
+            .expect("造假 sysfs 树失败");
+
+        // SSHBOX_SYSFS 是本进程的环境变量，所以这个测试别和别的动
+        // slow_script() 的测试并行跑（live 测试一律 --test-threads=1）。
+        std::env::set_var("SSHBOX_SYSFS", "/tmp/sshbox-fake-sys");
+        let raw = exec_capture(&h, &slow_script()).await.expect("慢脚本失败");
+        std::env::remove_var("SSHBOX_SYSFS");
+        let hw = parse_hardware(&sections(&raw));
+        eprintln!("假树读数: {:?}", hw);
+
+        assert_eq!(hw.temps.len(), 3, "0°C 的假传感器必须被丢掉: {:?}", hw.temps);
+        assert!(
+            (hw.temps[0].celsius - 48.0).abs() < 0.01,
+            "最热的排第一: {:?}",
+            hw.temps
+        );
+        assert!(hw
+            .temps
+            .iter()
+            .any(|t| t.label == "Package id 0" && (t.celsius - 45.0).abs() < 0.01));
+        assert!(hw
+            .temps
+            .iter()
+            .any(|t| t.chip == "nvme" && (t.celsius - 32.85).abs() < 0.01));
+        assert!(hw
+            .temps
+            .iter()
+            .any(|t| t.chip == "thermal" && t.label == "x86_pkg_temp"));
+        assert_eq!(hw.fans.len(), 1);
+        assert_eq!(hw.fans[0].rpm, 1200);
+        assert_eq!(hw.gpus.len(), 1);
+        assert_eq!(hw.gpus[0].name, "AMD GPU (amdgpu)");
+        assert_eq!(hw.gpus[0].util_pct, Some(7.0));
+        assert_eq!(hw.gpus[0].mem_total_mb, Some(8192));
+
+        // 同一台机器、真 /sys：没有任何传感器 —— 安静，而不是造数据
+        let real = exec_capture(&h, &slow_script()).await.expect("慢脚本失败");
+        let hwr = parse_hardware(&sections(&real));
+        eprintln!("真 /sys 读数: {:?}", hwr);
+        assert!(
+            hwr.temps.is_empty() && hwr.gpus.is_empty() && hwr.fans.is_empty(),
+            "WSL 不该有传感器，却读到: {:?}",
+            hwr
+        );
+
+        let _ = exec_capture(&h, "rm -rf /tmp/sshbox-fake-sys").await;
+    }
+
     #[tokio::test]
     async fn live_busy_process_reports_cpu() {
         let Some((host, port, user, pw)) = test_target() else {

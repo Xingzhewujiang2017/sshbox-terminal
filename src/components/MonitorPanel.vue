@@ -25,6 +25,24 @@ interface ServiceInfo {
   containers: ContainerInfo[]
   docker_available: boolean
 }
+interface TempReading { chip: string; label: string; celsius: number }
+interface FanReading { chip: string; label: string; rpm: number }
+/** 每项都可能缺：AMD 不报温度，老卡不报功耗，缺就是 null，不是 0。 */
+interface GpuInfo {
+  name: string
+  vendor: string
+  util_pct: number | null
+  mem_used_mb: number | null
+  mem_total_mb: number | null
+  temp_c: number | null
+  power_w: number | null
+}
+interface HardwareInfo {
+  temps: TempReading[]
+  fans: FanReading[]
+  gpus: GpuInfo[]
+}
+
 const props = defineProps<{ sid: string; active: boolean; interval: number }>()
 const emit = defineEmits<{ (e: 'setInterval', secs: number): void }>()
 
@@ -32,6 +50,18 @@ const info = ref<StaticInfo | null>(null)
 const metrics = ref<Metrics | null>(null)
 const paused = ref(false)
 const services = ref<ServiceInfo | null>(null)
+const hardware = ref<HardwareInfo | null>(null)
+/** 传感器多起来（8 核 + 2 个 NVMe）会淹掉面板，默认只露最热的几个。 */
+const TEMP_SHOWN = 5
+const tempsExpanded = ref(false)
+const hasHardware = computed(
+  () => !!hardware.value &&
+    (hardware.value.temps.length > 0 || hardware.value.gpus.length > 0 || hardware.value.fans.length > 0),
+)
+const shownTemps = computed(() => {
+  const t = hardware.value?.temps ?? []
+  return tempsExpanded.value ? t : t.slice(0, TEMP_SHOWN)
+})
 const INTERVALS = [1, 2, 5, 10]
 /** Ports shown as chips; the count still reflects every listener. */
 const PORT_SHOWN = 14
@@ -69,6 +99,7 @@ const history = ref<{
 let unlistenStatic: (() => void) | null = null
 let unlistenMetrics: (() => void) | null = null
 let unlistenServices: (() => void) | null = null
+let unlistenHardware: (() => void) | null = null
 
 const rootEl = ref<HTMLDivElement>()
 const cpuEl = ref<HTMLDivElement>()
@@ -81,6 +112,31 @@ let ro: ResizeObserver | null = null
 
 const AXIS = { fontSize: 9, color: '#6c7086' }
 const LEGEND = { textStyle: { fontSize: 10 }, top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
+
+/** 温度分档：<60 正常，60-79 偏热，>=80 该看一眼了。 */
+function heat(c: number): string {
+  return c >= 80 ? 'hot' : c >= 60 ? 'warm' : 'ok'
+}
+function utilHeat(p: number): string {
+  return p >= 85 ? 'hot' : p >= 50 ? 'warm' : 'ok'
+}
+/** VRAM 上百 GB 的卡按 MB 显示读不出来，超过 1 GB 换成 GB。 */
+function fmtMB(mb: number | null): string {
+  if (mb === null) return '—'
+  return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB'
+}
+/** 标签出现两次以上（两块 NVMe 都叫 Composite）就得靠芯片名区分。 */
+const tempLabelCount = computed(() => {
+  const n = new Map<string, number>()
+  for (const t of hardware.value?.temps ?? []) n.set(t.label, (n.get(t.label) ?? 0) + 1)
+  return n
+})
+/** "temp1" 这种标签本身没有信息量，得靠芯片名区分；thermal zone 的 type
+ *  已经是人话（x86_pkg_temp），再拼上 "thermal" 只是噪音。 */
+function tempLabel(t: TempReading): string {
+  const dup = (tempLabelCount.value.get(t.label) ?? 0) > 1
+  return t.label.startsWith('temp') || dup ? `${t.chip} ${t.label}` : t.label
+}
 
 function fmtBytes(b: number): string {
   if (b < 1024) return b.toFixed(0) + ' B/s'
@@ -187,6 +243,9 @@ onMounted(async () => {
   unlistenServices = await listen<{ sid: string; services: ServiceInfo }>('ssh://services', (e) => {
     if (e.payload.sid === props.sid) services.value = e.payload.services
   })
+  unlistenHardware = await listen<{ sid: string; hardware: HardwareInfo }>('ssh://hardware', (e) => {
+    if (e.payload.sid === props.sid) hardware.value = e.payload.hardware
+  })
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
     const m = e.payload.metrics
@@ -221,6 +280,7 @@ onBeforeUnmount(() => {
   unlistenStatic?.()
   unlistenMetrics?.()
   unlistenServices?.()
+  unlistenHardware?.()
   ro?.disconnect()
   cpuChart?.dispose()
   netChart?.dispose()
@@ -351,6 +411,45 @@ onBeforeUnmount(() => {
         <div v-else class="svc-sub muted">未检测到 docker（无守护进程或无权限）</div>
       </div>
 
+      <div v-if="hasHardware" class="svc-box">
+        <div class="section-title">温度与 GPU <span class="unit">每 15 秒刷新</span></div>
+
+        <div v-for="g in hardware!.gpus" :key="g.vendor + g.name" class="gpu-row">
+          <span class="gpu-name" :title="g.name">{{ g.name }}</span>
+          <template v-if="g.util_pct !== null">
+            <span class="gpu-bar">
+              <i :class="utilHeat(g.util_pct)" :style="{ width: Math.min(100, g.util_pct) + '%' }"></i>
+            </span>
+            <span class="gpu-pct">{{ g.util_pct.toFixed(0) }}%</span>
+          </template>
+          <span v-if="g.mem_total_mb" class="gpu-vram">VRAM {{ fmtMB(g.mem_used_mb) }} / {{ fmtMB(g.mem_total_mb) }}</span>
+          <span v-if="g.temp_c !== null" class="temp-chip" :class="heat(g.temp_c)">{{ g.temp_c.toFixed(0) }}°C</span>
+          <span v-if="g.power_w !== null" class="gpu-w">{{ g.power_w.toFixed(0) }} W</span>
+        </div>
+
+        <div class="port-wrap">
+          <span
+            v-for="t in shownTemps"
+            :key="t.chip + t.label"
+            class="temp-chip"
+            :class="heat(t.celsius)"
+            :title="`${t.chip} · ${t.label}`"
+          >{{ tempLabel(t) }} {{ t.celsius.toFixed(0) }}°C</span>
+          <button
+            v-if="hardware!.temps.length > TEMP_SHOWN"
+            class="temp-more"
+            @click="tempsExpanded = !tempsExpanded"
+          >{{ tempsExpanded ? '收起' : `+${hardware!.temps.length - TEMP_SHOWN} 个传感器` }}</button>
+        </div>
+
+        <div v-if="hardware!.fans.length" class="svc-sub">
+          风扇
+          <span v-for="f in hardware!.fans" :key="f.chip + f.label" class="fan-chip">
+            {{ f.label }} {{ f.rpm }} RPM
+          </span>
+        </div>
+      </div>
+
       <div class="proc-box">
         <div class="section-title">
           进程<span class="proc-count">共 {{ metrics.proc_total }} 个 · 按瞬时 CPU 排序</span>
@@ -448,6 +547,29 @@ onBeforeUnmount(() => {
 .ctr-row { display: flex; gap: 8px; padding: 1px 0; font-size: 11px; }
 .ctr-name { color: #89b4fa; min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctr-status { color: #a6e3a1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; flex-wrap: wrap; }
+.gpu-name { color: #89b4fa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+.gpu-bar { display: inline-block; width: 46px; height: 6px; background: #313244; border-radius: 3px; overflow: hidden; }
+.gpu-bar i { display: block; height: 100%; border-radius: 3px; }
+.gpu-bar i.ok { background: #a6e3a1; }
+.gpu-bar i.warm { background: #f9e2af; }
+.gpu-bar i.hot { background: #f38ba8; }
+.gpu-pct { color: #cdd6f4; font-family: ui-monospace, monospace; }
+.gpu-vram { color: #6c7086; }
+.gpu-w { color: #6c7086; font-family: ui-monospace, monospace; }
+.temp-chip {
+  background: #313244; border-radius: 4px; padding: 1px 5px;
+  font-size: 10px; font-family: ui-monospace, monospace;
+}
+.temp-chip.ok { color: #a6e3a1; }
+.temp-chip.warm { color: #f9e2af; }
+.temp-chip.hot { color: #f38ba8; }
+.temp-more {
+  background: transparent; border: 1px solid #45475a; color: #6c7086;
+  border-radius: 4px; padding: 0 5px; font-size: 10px; cursor: pointer;
+}
+.temp-more:hover { color: #cdd6f4; border-color: #6c7086; }
+.fan-chip { color: #a6adc8; font-family: ui-monospace, monospace; margin-left: 6px; }
 .proc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
 .proc-count { color: #6c7086; font-weight: 400; font-size: 10px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
 .proc-head, .proc-row { display: grid; grid-template-columns: 50px 1fr 52px 66px; gap: 6px; align-items: center; }
