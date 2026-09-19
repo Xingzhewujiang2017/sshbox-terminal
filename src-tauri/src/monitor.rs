@@ -101,6 +101,9 @@ pub struct DiskIo {
     pub write_bps: f64,
 }
 
+/// How often the slow service/port/container facts are refreshed.
+const SERVICES_EVERY: Duration = Duration::from_secs(15);
+
 /// The shell script that collects everything in one shot. Pure POSIX + /proc.
 /// `date +%s.%N` is GNU-only, so a busybox `date` must not break the sample —
 /// the timestamp is display-only and the Rust side falls back to its own clock.
@@ -132,6 +135,36 @@ for d in /proc/[0-9]*; do
   # ${12} braces are mandatory: "$12" is $1 followed by a literal 2 in POSIX sh.
   echo "${d#/proc/}|$comm|$1|${12}|${13}|${22}"
 done
+echo "@@END@@"
+"#;
+
+/// The slow-moving facts: failed units, listening ports, containers. Run on a
+/// separate, slower cadence — `systemctl` alone costs more than the whole fast
+/// script, and none of this changes second to second.
+const SERVICES_SCRIPT: &str = r#"
+echo "@@SVC@@"
+# UNIT LOAD ACTIVE SUB DESCRIPTION — --plain drops the tree glyphs. No --type
+# filter: a failed .mount or .socket is exactly as important as a failed service.
+systemctl --failed --no-legend --plain --no-pager 2>/dev/null | head -20
+echo "@@PORTS@@"
+# Normalised to proto|local|port|state so the Rust parser does not care whether
+# this box ships iproute2 (ss) or only net-tools (netstat).
+if command -v ss >/dev/null 2>&1; then
+  ss -tulnH 2>/dev/null | awk '{n=split($5,a,":"); if (n>1) print $1"|"$5"|"a[n]"|"$2}' | head -80
+elif command -v netstat >/dev/null 2>&1; then
+  netstat -tuln 2>/dev/null | awk '/^(tcp|udp)/ {n=split($4,a,":"); if (n>1) print $1"|"$4"|"a[n]"|"$6}' | head -80
+fi
+echo "@@DOCKER@@"
+# Socket check first: a missing daemon would otherwise make docker hang.
+# The @@DOCKER_YES@@ sentinel is emitted only when `docker ps` really succeeded,
+# so "no containers" and "no docker / no permission" stay distinguishable.
+if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
+  out=$(docker ps --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    echo "@@DOCKER_YES@@"
+    printf '%s\n' "$out" | head -20
+  fi
+fi
 echo "@@END@@"
 "#;
 
@@ -507,6 +540,119 @@ fn parse_procs(
     (rows, total)
 }
 
+/// A systemd unit that is not running and should be.
+#[derive(Debug, Serialize, Clone)]
+pub struct FailedUnit {
+    pub name: String,
+    pub desc: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PortInfo {
+    pub proto: String,
+    pub port: u16,
+    /// Every local address listening on this port — v4 and v6 are the same
+    /// service to a human, so they collapse into one row.
+    pub addrs: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ContainerInfo {
+    pub name: String,
+    pub image: String,
+    pub status: String,
+}
+
+/// Slow-moving service facts, refreshed on their own cadence.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ServiceInfo {
+    pub failed: Vec<FailedUnit>,
+    /// Sorted by port; capped for display, `port_total` keeps the real count.
+    pub ports: Vec<PortInfo>,
+    pub port_total: usize,
+    pub containers: Vec<ContainerInfo>,
+    /// Whether a docker daemon was reachable at all — "no containers" and
+    /// "docker is not installed" must not look the same in the UI.
+    pub docker_available: bool,
+}
+
+/// `nginx.service` yes, `listed.` or a bare `0` no.
+fn looks_like_unit(t: &str) -> bool {
+    match t.rsplit_once('.') {
+        Some((name, ext)) => {
+            !name.is_empty() && ext.len() >= 2 && ext.chars().all(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
+    }
+}
+
+/// Parse the SERVICES_SCRIPT output. Missing sections are not an error: a
+/// container without systemd simply has no failed units to report.
+pub fn parse_services(s: &HashMap<String, Vec<String>>) -> ServiceInfo {
+    let mut out = ServiceInfo::default();
+
+    if let Some(units) = s.get("SVC") {
+        for line in units {
+            let mut it = line.split_whitespace();
+            let Some(name) = it.next() else { continue };
+            if !looks_like_unit(name) {
+                // "0 loaded units listed." and header leftovers are not units.
+                continue;
+            }
+            // Skip UNIT LOAD ACTIVE SUB, keep the human description.
+            let desc = it.skip(3).collect::<Vec<_>>().join(" ");
+            out.failed.push(FailedUnit {
+                name: name.to_string(),
+                desc,
+            });
+        }
+    }
+
+    if let Some(ports) = s.get("PORTS") {
+        let mut merged: HashMap<(String, u16), Vec<String>> = HashMap::new();
+        for line in ports {
+            let f: Vec<&str> = line.split('|').collect();
+            if f.len() < 4 {
+                continue;
+            }
+            let Some(port) = f[2].trim().parse::<u16>().ok() else {
+                // "*" from a wildcard listener, or junk.
+                continue;
+            };
+            let proto = f[0].trim().to_string();
+            let addr = f[1].trim().to_string();
+            let entry = merged.entry((proto, port)).or_default();
+            if !addr.is_empty() && !entry.contains(&addr) {
+                entry.push(addr);
+            }
+        }
+        out.ports = merged
+            .into_iter()
+            .map(|((proto, port), addrs)| PortInfo { proto, port, addrs })
+            .collect();
+        out.ports.sort_by_key(|p| (p.port, p.proto.clone()));
+        out.port_total = out.ports.len();
+    }
+
+    // Only the sentinel section means the daemon answered.
+    if let Some(containers) = s.get("DOCKER_YES") {
+        out.docker_available = true;
+        for line in containers {
+            let f: Vec<&str> = line.split('|').collect();
+            if f.len() < 3 || f[0].trim().is_empty() {
+                continue;
+            }
+            out.containers.push(ContainerInfo {
+                name: f[0].trim().to_string(),
+                image: f[1].trim().to_string(),
+                status: f[2].trim().to_string(),
+            });
+        }
+    }
+
+    out
+}
+
 fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     let s = sections(raw);
 
@@ -777,6 +923,8 @@ pub fn spawn(
         }
 
         let mut prev = PrevSample::default();
+        // None = never sampled yet, so the first pass fills the card immediately.
+        let mut last_slow: Option<Instant> = None;
         loop {
             let settings = store::load_settings();
             let interval = settings.sample_interval_secs.clamp(1, 60);
@@ -823,6 +971,24 @@ pub fn spawn(
                     break;
                 }
             };
+
+            // Slow facts get their own channel and cadence: `systemctl` costs
+            // more than the entire fast script and nothing here changes
+            // second to second. A failure is logged, never fatal.
+            let slow_due = last_slow.map_or(true, |t| t.elapsed() >= SERVICES_EVERY);
+            if slow_due {
+                last_slow = Some(Instant::now());
+                match exec_capture(&handle, SERVICES_SCRIPT).await {
+                    Ok(sraw) => {
+                        let svc = parse_services(&sections(&sraw));
+                        let _ = app.emit(
+                            "ssh://services",
+                            serde_json::json!({ "sid": sid, "services": svc }),
+                        );
+                    }
+                    Err(e) => log::warn!("服务信息采集失败: {:#}", e),
+                }
+            }
             if let Some(m) = parse_metrics(&raw, &mut prev) {
                 // Evaluate alerts before moving `m` into the event payload.
                 let fired = crate::alerts::evaluate(&sid, &m, &settings);
@@ -882,6 +1048,66 @@ mod tests {
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_services_reads_units_ports_and_containers() {
+        let raw = "@@SVC@@\nnginx.service loaded failed failed A high performance web server\nbackup.mount loaded failed failed /backup\n0 loaded units listed.\n@@PORTS@@\ntcp|0.0.0.0:22|22|LISTEN\ntcp|0.0.0.0:22|22|LISTEN\ntcp|[::]:22|22|LISTEN\nudp|127.0.0.53:53|53|UNCONN\ntcp|0.0.0.0:*|*|LISTEN\n@@DOCKER@@\n@@DOCKER_YES@@\nweb|nginx:latest|Up 3 hours\n@@END@@\n";
+        let svc = parse_services(&sections(raw));
+
+        // Two real units (service + mount); the "0 loaded units listed."
+        // summary line must not be mistaken for one.
+        assert_eq!(svc.failed.len(), 2, "失败单元: {:?}", svc.failed);
+        assert_eq!(svc.failed[0].name, "nginx.service");
+        assert!(
+            svc.failed[0].desc.contains("web server"),
+            "描述应保留: {}",
+            svc.failed[0].desc
+        );
+        assert_eq!(svc.failed[1].name, "backup.mount", "失败的 mount 同样要报");
+        assert!(
+            svc.failed.iter().all(|f| f.name.contains('.')),
+            "垃圾行混进了失败单元: {:?}",
+            svc.failed
+        );
+
+        // v4+v6 collapse into one row, the exact-duplicate row is dropped, the
+        // wildcard port is dropped, and the list is sorted.
+        // 22/tcp (v4+v6 merged) and 53/udp. The exact duplicate row and the
+        // wildcard "*" port are both gone.
+        assert_eq!(svc.port_total, 2, "端口: {:?}", svc.ports);
+        assert_eq!(
+            (svc.ports[0].port, svc.ports[0].proto.as_str()),
+            (22, "tcp")
+        );
+        assert_eq!(
+            svc.ports[0].addrs,
+            vec!["0.0.0.0:22".to_string(), "[::]:22".to_string()],
+            "同一端口的 v4/v6 地址应合并到一条"
+        );
+        assert_eq!(
+            (svc.ports[1].port, svc.ports[1].proto.as_str()),
+            (53, "udp")
+        );
+        assert!(svc.ports.iter().all(|p| p.port > 0));
+
+        assert!(svc.docker_available);
+        assert_eq!(svc.containers.len(), 1);
+        assert_eq!(svc.containers[0].name, "web");
+        assert_eq!(svc.containers[0].status, "Up 3 hours");
+    }
+
+    #[test]
+    fn parse_services_tolerates_missing_sections() {
+        // A container with no systemd, no ss, no docker: empty, not an error.
+        let svc = parse_services(&sections("@@PORTS@@\n@@DOCKER@@\n@@END@@\n"));
+        assert!(svc.failed.is_empty());
+        assert!(svc.ports.is_empty());
+        assert_eq!(svc.port_total, 0);
+        assert!(
+            !svc.docker_available,
+            "没有 docker 输出时不能声称 docker 可用"
+        );
     }
 
     #[test]
@@ -1292,6 +1518,51 @@ mod live_tests {
         for d in &m2.disk_io {
             assert!(is_whole_disk(&d.name), "磁盘 I/O 里出现了分区: {}", d.name);
         }
+    }
+
+    /// The services script must survive on a real box, not just in unit tests:
+    /// a distro without `ss`, an empty failed list, no docker — all fine, but a
+    /// machine reachable over SSH always has a listening port.
+    #[tokio::test]
+    async fn live_services_snapshot_is_parseable() {
+        let Some((host, port, user, pw)) = test_target() else {
+            eprintln!("跳过 live 服务测试：未设置 SSHBOX_TEST_HOST / SSHBOX_TEST_PASSWORD");
+            return;
+        };
+        let kh = TempKh::new("kh-svc", port);
+        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.path())
+            .await
+            .expect("连接失败（WSL 是否在运行？）");
+
+        let raw = exec_capture(&h, SERVICES_SCRIPT)
+            .await
+            .expect("服务信息采集失败");
+        let svc = parse_services(&sections(&raw));
+        eprintln!(
+            "服务快照: 失败单元={} 监听端口={} docker={} 容器={}",
+            svc.failed.len(),
+            svc.port_total,
+            svc.docker_available,
+            svc.containers.len()
+        );
+        eprintln!("端口: {:?}", svc.ports.iter().take(6).collect::<Vec<_>>());
+
+        assert!(
+            svc.port_total > 0,
+            "能 SSH 的机器必然有监听端口（至少 sshd）"
+        );
+        assert!(
+            svc.ports.iter().any(|p| p.port == port),
+            "没看到 SSH 自己的端口 {}: {:?}",
+            port,
+            svc.ports
+        );
+        assert!(svc.ports.iter().all(|p| p.port > 0));
+        assert!(
+            svc.failed.iter().all(|f| looks_like_unit(&f.name)),
+            "垃圾行混进了失败单元: {:?}",
+            svc.failed
+        );
     }
 
     /// Regression guard for the whole process pipeline: a shell loop must show

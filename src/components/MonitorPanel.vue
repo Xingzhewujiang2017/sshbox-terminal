@@ -18,6 +18,16 @@ interface StaticInfo {
 interface NetIf { name: string; rx_bps: number; tx_bps: number }
 interface DiskIo { name: string; read_bps: number; write_bps: number }
 interface ProcInfo { pid: number; name: string; state: string; cpu_pct: number; rss_kb: number }
+interface FailedUnit { name: string; desc: string }
+interface PortInfo { proto: string; port: number; addrs: string[] }
+interface ContainerInfo { name: string; image: string; status: string }
+interface ServiceInfo {
+  failed: FailedUnit[]
+  ports: PortInfo[]
+  port_total: number
+  containers: ContainerInfo[]
+  docker_available: boolean
+}
 interface Metrics {
   ts: number
   cpu_pct: number
@@ -41,7 +51,10 @@ const emit = defineEmits<{ (e: 'setInterval', secs: number): void }>()
 const info = ref<StaticInfo | null>(null)
 const metrics = ref<Metrics | null>(null)
 const paused = ref(false)
+const services = ref<ServiceInfo | null>(null)
 const INTERVALS = [1, 2, 5, 10]
+/** Ports shown as chips; the count still reflects every listener. */
+const PORT_SHOWN = 14
 
 /** The chart window depends on the interval: 150 points is not always 5 min. */
 const windowLabel = computed(() => {
@@ -75,6 +88,7 @@ const history = ref<{
 
 let unlistenStatic: (() => void) | null = null
 let unlistenMetrics: (() => void) | null = null
+let unlistenServices: (() => void) | null = null
 
 const rootEl = ref<HTMLDivElement>()
 const cpuEl = ref<HTMLDivElement>()
@@ -190,6 +204,9 @@ onMounted(async () => {
   unlistenStatic = await listen<{ sid: string; info: StaticInfo }>('ssh://static', (e) => {
     if (e.payload.sid === props.sid) info.value = e.payload.info
   })
+  unlistenServices = await listen<{ sid: string; services: ServiceInfo }>('ssh://services', (e) => {
+    if (e.payload.sid === props.sid) services.value = e.payload.services
+  })
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
     const m = e.payload.metrics
@@ -223,6 +240,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   unlistenStatic?.()
   unlistenMetrics?.()
+  unlistenServices?.()
   ro?.disconnect()
   cpuChart?.dispose()
   netChart?.dispose()
@@ -316,6 +334,43 @@ onBeforeUnmount(() => {
         </template>
       </div>
 
+      <div v-if="services" class="svc-box">
+        <div class="section-title">服务与端口 <span class="unit">每 15 秒刷新</span></div>
+
+        <template v-if="services.failed.length">
+          <div class="fail-head">⚠ {{ services.failed.length }} 个单元处于失败状态</div>
+          <div v-for="u in services.failed" :key="u.name" class="fail-row">
+            <span class="fail-name">{{ u.name }}</span>
+            <span class="fail-desc" :title="u.desc">{{ u.desc }}</span>
+          </div>
+        </template>
+        <div v-else class="svc-ok">✓ systemd 没有失败单元</div>
+
+        <div class="svc-sub">监听端口 {{ services.port_total }} 个</div>
+        <div class="port-wrap">
+          <span
+            v-for="p in services.ports.slice(0, PORT_SHOWN)"
+            :key="p.proto + p.port"
+            class="port-chip"
+            :title="p.addrs.join('\n')"
+          >{{ p.port }}/{{ p.proto }}</span>
+          <span v-if="services.port_total > PORT_SHOWN" class="port-more">
+            +{{ services.port_total - PORT_SHOWN }}
+          </span>
+          <span v-if="!services.port_total" class="svc-sub muted">（没读到监听端口）</span>
+        </div>
+
+        <template v-if="services.docker_available">
+          <div class="svc-sub">容器 {{ services.containers.length }} 个</div>
+          <div v-for="c in services.containers" :key="c.name" class="ctr-row">
+            <span class="ctr-name">{{ c.name }}</span>
+            <span class="ctr-status" :title="c.image">{{ c.status }}</span>
+          </div>
+          <div v-if="!services.containers.length" class="svc-sub muted">（docker 在跑，没有容器）</div>
+        </template>
+        <div v-else class="svc-sub muted">未检测到 docker（无守护进程或无权限）</div>
+      </div>
+
       <div class="proc-box">
         <div class="section-title">
           进程<span class="proc-count">共 {{ metrics.proc_total }} 个 · 按瞬时 CPU 排序</span>
@@ -396,6 +451,23 @@ onBeforeUnmount(() => {
 .bar-fill.warn { background: #f38ba8; }
 .chart-box { height: 116px; width: 100%; }
 .load-box { color: #6c7086; text-align: center; padding: 4px 0; }
+.svc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.svc-ok { color: #a6e3a1; font-size: 11px; padding: 2px 0 4px; }
+.svc-sub { color: #a6adc8; font-size: 11px; margin: 6px 0 3px; }
+.svc-sub.muted { color: #585b70; }
+.fail-head { color: #f38ba8; font-size: 11px; font-weight: 600; margin-bottom: 3px; }
+.fail-row { display: flex; gap: 8px; padding: 1px 0; font-size: 11px; }
+.fail-name { color: #f38ba8; min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fail-desc { color: #6c7086; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.port-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
+.port-chip {
+  background: #313244; color: #cdd6f4; border-radius: 4px;
+  padding: 1px 5px; font-size: 10px; font-family: ui-monospace, monospace;
+}
+.port-more { color: #6c7086; font-size: 10px; padding: 1px 3px; }
+.ctr-row { display: flex; gap: 8px; padding: 1px 0; font-size: 11px; }
+.ctr-name { color: #89b4fa; min-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctr-status { color: #a6e3a1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .proc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
 .proc-count { color: #6c7086; font-weight: 400; font-size: 10px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
 .proc-head, .proc-row { display: grid; grid-template-columns: 50px 1fr 52px 66px; gap: 6px; align-items: center; }
