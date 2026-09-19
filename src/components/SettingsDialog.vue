@@ -42,7 +42,7 @@ function pickTheme(m: ThemeMode) {
   emit('theme', m)
 }
 
-const tab = ref<'general' | 'hostkeys' | 'io' | 'about'>('general')
+const tab = ref<'general' | 'quick' | 'hostkeys' | 'io' | 'about'>('general')
 const form = ref<Settings>({ ...props.settings })
 const exportPath = ref('D:\\sshbox-hosts.json')
 const importPath = ref('D:\\sshbox-hosts.json')
@@ -51,6 +51,29 @@ const ioMsg = ref('')
 
 function save() {
   emit('save', { ...form.value })
+}
+
+// --- 快捷命令编辑 ---------------------------------------------------------
+
+function addQuick() {
+  form.value.quick_commands = [
+    ...(form.value.quick_commands ?? []),
+    { id: `qc-${Date.now().toString(36)}`, label: '', command: '', enter: true },
+  ]
+}
+
+function removeQuick(id: string) {
+  form.value.quick_commands = (form.value.quick_commands ?? []).filter((q) => q.id !== id)
+}
+
+/** 上移/下移：面板里按钮的顺序就是显示顺序，值得能调。 */
+function moveQuick(i: number, delta: number) {
+  const list = form.value.quick_commands ?? []
+  const j = i + delta
+  if (j < 0 || j >= list.length) return
+  const next = [...list]
+  ;[next[i], next[j]] = [next[j], next[i]]
+  form.value.quick_commands = next
 }
 function parseHostToken(token: string): { host: string; port: number } {
   const m = token.match(/^\[(.+)\]:(\d+)$/)
@@ -65,11 +88,48 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
     <div class="dlg">
       <div class="tabs">
         <button :class="{ on: tab === 'general' }" @click="tab = 'general'">常规</button>
+        <button :class="{ on: tab === 'quick' }" @click="tab = 'quick'">
+          快捷命令 <span class="badge">{{ (form.quick_commands ?? []).length }}</span>
+        </button>
         <button :class="{ on: tab === 'hostkeys' }" @click="tab = 'hostkeys'">
           已知主机密钥 <span class="badge">{{ knownHosts.length }}</span>
         </button>
         <button :class="{ on: tab === 'io' }" @click="tab = 'io'">导入导出</button>
         <button :class="{ on: tab === 'about' }" @click="tab = 'about'">关于</button>
+      </div>
+
+      <!-- 快捷命令 -->
+      <div v-if="tab === 'quick'" class="pane">
+        <p class="hintline">
+          显示在终端上方的命令条，点一下直接发到当前会话。命令里可以用
+          <code>{host}</code>、<code>{user}</code>、<code>{port}</code> 占位，
+          发送时会替换成当前主机的值。开着广播输入时，快捷命令也会发给所有选中会话。
+        </p>
+        <div v-for="(q, i) in form.quick_commands ?? []" :key="q.id" class="quick-row">
+          <input v-model="q.label" class="q-label" placeholder="按钮名（如：看磁盘）" spellcheck="false" />
+          <input
+            v-model="q.command"
+            class="q-cmd"
+            placeholder="命令（如：df -h）"
+            spellcheck="false"
+          />
+          <label class="q-enter" title="取消勾选则只填入终端、不自动回车">
+            <input v-model="q.enter" type="checkbox" />
+            回车
+          </label>
+          <button class="q-btn" title="上移" :disabled="i === 0" @click="moveQuick(i, -1)">↑</button>
+          <button
+            class="q-btn"
+            title="下移"
+            :disabled="i === (form.quick_commands ?? []).length - 1"
+            @click="moveQuick(i, 1)"
+          >
+            ↓
+          </button>
+          <button class="q-btn danger" title="删除" @click="removeQuick(q.id)">×</button>
+        </div>
+        <p v-if="!(form.quick_commands ?? []).length" class="hintline">还没有快捷命令。</p>
+        <button class="add-quick" @click="addQuick">+ 添加一条</button>
       </div>
 
       <!-- 常规 -->
@@ -235,6 +295,47 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
 .dlg {
   background: var(--ctp-base); border: 1px solid var(--ctp-surface0); border-radius: 10px;
   padding: 16px; width: 520px; max-height: 86vh; display: flex; flex-direction: column; gap: 10px;
+}
+.quick-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.quick-row input[type='text'],
+.quick-row input:not([type]) {
+  background: var(--ctp-crust);
+  color: var(--ctp-text);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.q-label { width: 130px; }
+.q-cmd { flex: 1; min-width: 200px; font-family: ui-monospace, Consolas, monospace; }
+.q-enter { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--ctp-subtext0); }
+.q-btn {
+  background: var(--ctp-surface0);
+  color: var(--ctp-text);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 5px;
+  width: 26px;
+  height: 24px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.q-btn:disabled { opacity: 0.4; cursor: default; }
+.q-btn.danger { color: var(--ctp-red); }
+.add-quick {
+  margin-top: 8px;
+  background: var(--ctp-blue);
+  color: var(--on-accent);
+  border: none;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+code {
+  background: var(--ctp-surface0);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11.5px;
 }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--ctp-surface0); padding-bottom: 8px; }
 .tabs button {

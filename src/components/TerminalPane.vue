@@ -8,6 +8,12 @@ import { terminalTheme, themeVersion } from '../theme'
 
 const props = defineProps<{ sid: string; active: boolean }>()
 
+/**
+ * 键盘输入一律往上抛：广播模式下 App 要把它同时发给多个会话，
+ * 组件自己直接写 term_write 就没法做广播了。
+ */
+const emit = defineEmits<{ (e: 'data', data: string): void }>()
+
 const termEl = ref<HTMLDivElement>()
 let term: Terminal | null = null
 let fit: FitAddon | null = null
@@ -56,7 +62,7 @@ onMounted(async () => {
 
   term.onData((data) => {
     if (!currentSid) return
-    api.termWrite(currentSid, data).catch(() => {})
+    emit('data', data)
   })
 
   ro = new ResizeObserver(doResize)

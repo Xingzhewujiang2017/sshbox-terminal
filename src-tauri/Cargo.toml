@@ -1,6 +1,6 @@
 [package]
 name = "sshbox"
-version = "0.3.1"
+version = "0.4.0"
 description = "SSH terminal with real-time VM monitoring"
 authors = ["sshbox contributors"]
 edition = "2021"
@@ -30,6 +30,11 @@ chrono = "0.4.45"
 tauri-plugin-log = "2.9.1"
 tauri-plugin-notification = "2.4.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# 只为了 GetLogicalDrives 一个调用：一次位图拿到盘符列表，
+# 比逐个 `A:\` 试 metadata 安全（不碰盘、不会被空光驱卡住）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 codegen-units = 1

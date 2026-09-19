@@ -1,8 +1,11 @@
 mod alerts;
 mod commands;
+mod forward;
 mod history;
 mod hostkey;
+mod localfs;
 mod monitor;
+mod sftp;
 mod ssh;
 mod store;
 
@@ -17,6 +20,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(ssh::SessionManager::default())
+        .manage(sftp::SftpManager::default())
+        .manage(forward::ForwardManager::default())
         .invoke_handler(tauri::generate_handler![
             // --- sessions / terminal ---
             ssh::connect,
@@ -59,6 +64,31 @@ pub fn run() {
             history::history_hosts,
             history::history_stats,
             history::history_export,
+            // --- sftp / 本地文件 ---
+            sftp::sftp_list,
+            sftp::sftp_stat,
+            sftp::sftp_mkdir,
+            sftp::sftp_rename,
+            sftp::sftp_remove,
+            sftp::sftp_upload,
+            sftp::sftp_download,
+            sftp::sftp_cancel,
+            sftp::sftp_forget,
+            sftp::sftp_upload_dir,
+            sftp::sftp_download_dir,
+            sftp::sftp_upload_drop,
+            localfs::local_list,
+            localfs::local_kinds,
+            // --- 端口转发 ---
+            forward::forward_list,
+            forward::forward_save,
+            forward::forward_delete,
+            forward::forward_start,
+            forward::forward_stop,
+            forward::forward_stop_all,
+            localfs::local_mkdir,
+            localfs::local_rename,
+            localfs::local_remove,
         ])
         .setup(|_app| {
             // Writer thread first: samples may start arriving as soon as a

@@ -87,6 +87,9 @@ pub struct Host {
     /// "strict" (default) or "accept_any" (skip host key verification).
     #[serde(default)]
     pub host_key_policy: Option<String>,
+    /// 端口转发规则（v0.4）：跟着主机走，导入导出时一起搬
+    #[serde(default)]
+    pub forwards: Vec<crate::forward::ForwardRule>,
     #[serde(default)]
     pub color: Option<String>,
     #[serde(default)]
@@ -119,6 +122,40 @@ impl Default for HostsFile {
             hosts: Vec::new(),
         }
     }
+}
+
+// --- 端口转发规则（挂在 host 上，跟主机一起导入导出）----------------------
+
+pub fn forwards_of(host_id: &str) -> Vec<crate::forward::ForwardRule> {
+    load_hosts()
+        .hosts
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .map(|h| h.forwards)
+        .unwrap_or_default()
+}
+
+/// 新增或按 id 更新一条规则。
+pub fn save_forward(host_id: &str, rule: crate::forward::ForwardRule) -> Result<()> {
+    let mut file = load_hosts();
+    let host = file
+        .hosts
+        .iter_mut()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| anyhow::anyhow!("主机不存在: {host_id}"))?;
+    match host.forwards.iter_mut().find(|r| r.id == rule.id) {
+        Some(slot) => *slot = rule,
+        None => host.forwards.push(rule),
+    }
+    save_hosts(&file)
+}
+
+pub fn delete_forward(host_id: &str, id: &str) -> Result<()> {
+    let mut file = load_hosts();
+    if let Some(host) = file.hosts.iter_mut().find(|h| h.id == host_id) {
+        host.forwards.retain(|r| r.id != id);
+    }
+    save_hosts(&file)
 }
 
 pub fn load_hosts() -> HostsFile {
@@ -249,6 +286,41 @@ fn default_disk_alert() -> f64 {
     90.0
 }
 
+/// 一条快捷命令（存 settings.json，跟其他设置一起走）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuickCommand {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    /// 发送后是否自动回车（想"先填进终端再改"就关掉）
+    #[serde(default = "default_true")]
+    pub enter: bool,
+}
+
+/// 默认三条：装好就能用，覆盖最常见的三件事。
+fn default_quick_commands() -> Vec<QuickCommand> {
+    vec![
+        QuickCommand {
+            id: "qc-disk".into(),
+            label: "磁盘".into(),
+            command: "df -h".into(),
+            enter: true,
+        },
+        QuickCommand {
+            id: "qc-mem".into(),
+            label: "内存".into(),
+            command: "free -h".into(),
+            enter: true,
+        },
+        QuickCommand {
+            id: "qc-top".into(),
+            label: "CPU Top".into(),
+            command: "ps aux --sort=-%cpu | head -15".into(),
+            enter: true,
+        },
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_interval")]
@@ -273,6 +345,9 @@ pub struct Settings {
     pub confirm_on_close_tab: bool,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 快捷命令面板（v0.4）
+    #[serde(default = "default_quick_commands")]
+    pub quick_commands: Vec<QuickCommand>,
     /// Persist samples to the SQLite history file.
     #[serde(default = "default_true")]
     pub history_enabled: bool,
@@ -310,6 +385,7 @@ impl Default for Settings {
             disk_alert_pct: default_disk_alert(),
             confirm_on_close_tab: true,
             theme: default_theme(),
+            quick_commands: default_quick_commands(),
             history_enabled: true,
             history_interval_secs: default_history_interval(),
             history_retention_days: default_retention(),
@@ -350,6 +426,7 @@ mod tests {
             save_password: false,
             auto_reconnect: false,
             host_key_policy: None,
+            forwards: Vec::new(),
             color: None,
             note: None,
             last_used: None,
@@ -371,6 +448,15 @@ mod tests {
         assert_eq!(f.hosts[0].auth, "password");
         assert_eq!(f.hosts[0].group, "默认");
         assert!(!f.hosts[0].save_password);
+    }
+
+    #[test]
+    fn quick_commands_default_when_missing() {
+        // 老版本写的 settings.json 里没有这个字段
+        let json = r#"{"sample_interval_secs":2,"theme":"light"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.quick_commands.len(), 3, "缺字段时要给默认三条");
+        assert!(s.quick_commands.iter().all(|q| q.enter && !q.command.is_empty()));
     }
 
     #[test]

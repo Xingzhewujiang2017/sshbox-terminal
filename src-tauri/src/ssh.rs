@@ -84,6 +84,9 @@ pub struct ClientHandler {
     /// Which known_hosts file to trust against (injected so tests stay hermetic).
     pub known_hosts_path: std::path::PathBuf,
     pub outcome: Arc<StdMutex<Option<hostkey::VerifyOutcome>>>,
+    /// 远程转发的路由表：远端有人连进来时，靠它找到本机目标。
+    /// 和 `Session.forwards` 是同一个 Arc（每个 SSH 连接一张表）。
+    pub forwards: crate::forward::ForwardTable,
 }
 
 impl client::Handler for ClientHandler {
@@ -118,6 +121,53 @@ impl client::Handler for ClientHandler {
         }
         Ok(accept)
     }
+
+    /// 远程转发：远端接受了连接，把通道交给我们 → 连本机目标并双向桥接。
+    ///
+    /// 路由表里没有对应项就直接丢 `reply`（russh 会自动发拒绝），
+    /// 免得别人拿这个当跳板。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        let target =
+            crate::forward::forward_target(&self.forwards, connected_address, connected_port);
+        let Some(target) = target else {
+            log::warn!(
+                "远端转发请求 {}:{}（来自 {}:{}）不在路由表里，拒绝",
+                connected_address,
+                connected_port,
+                originator_address,
+                originator_port
+            );
+            return Ok(());
+        };
+        reply.accept().await;
+        log::info!(
+            "远程转发 {}:{}（来自 {}:{}）→ 本机 {}",
+            connected_address,
+            connected_port,
+            originator_address,
+            originator_port,
+            target
+        );
+        tokio::spawn(async move {
+            match tokio::net::TcpStream::connect(&target).await {
+                Ok(mut tcp) => {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+                }
+                Err(err) => log::warn!("远程转发连本机 {target} 失败：{err}"),
+            }
+        });
+        Ok(())
+    }
 }
 
 /// Commands sent to the PTY pump task (owns the interactive channel).
@@ -131,6 +181,8 @@ pub struct Session {
     pub cmd_tx: mpsc::UnboundedSender<PtyCmd>,
     pub info: SessionInfo,
     pub closed: Arc<AtomicBool>,
+    /// 远程转发路由表（和 ClientHandler 共享，见 forward.rs）
+    pub forwards: crate::forward::ForwardTable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,12 +352,15 @@ async fn do_connect(
     let policy = params.policy();
     let outcome_slot: Arc<StdMutex<Option<hostkey::VerifyOutcome>>> = Arc::new(StdMutex::new(None));
 
+    // 每个连接一张转发表，提前建好：ClientHandler 要用它处理远程转发回调
+    let forwards: crate::forward::ForwardTable = Default::default();
     let handler = ClientHandler {
         host: params.host.clone(),
         port,
         policy: policy.clone(),
         known_hosts_path: store::known_hosts_path(),
         outcome: outcome_slot.clone(),
+        forwards: forwards.clone(),
     };
 
     let config = Arc::new(client::Config {
@@ -544,6 +599,7 @@ async fn do_connect(
         cmd_tx,
         info: info.clone(),
         closed: closed.clone(),
+        forwards,
     };
     // Bind before the monitor task starts: otherwise the very first sample can
     // be filed under a temporary key while a frontend round-trip is still in

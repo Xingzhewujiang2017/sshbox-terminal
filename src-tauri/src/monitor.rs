@@ -1723,8 +1723,16 @@ mod tests {
             ],
         )]);
         let chips: Vec<&str> = h.temps.iter().map(|t| t.chip.as_str()).collect();
-        assert!(chips.contains(&"nvme#1") && chips.contains(&"nvme#2"), "{:?}", chips);
-        assert!(chips.contains(&"coretemp"), "唯一的名字不该加后缀: {:?}", chips);
+        assert!(
+            chips.contains(&"nvme#1") && chips.contains(&"nvme#2"),
+            "{:?}",
+            chips
+        );
+        assert!(
+            chips.contains(&"coretemp"),
+            "唯一的名字不该加后缀: {:?}",
+            chips
+        );
     }
 
     /// 回归：一颗芯片多个读数不能被当成多颗芯片。coretemp 每个核一个温度，
@@ -1771,7 +1779,11 @@ mod tests {
         ]);
         let chips: Vec<&str> = h.temps.iter().map(|t| t.chip.as_str()).collect();
         assert!(chips.contains(&"coretemp"), "单颗芯片保持原名: {:?}", chips);
-        assert!(chips.contains(&"nvme#1") && chips.contains(&"nvme#2"), "{:?}", chips);
+        assert!(
+            chips.contains(&"nvme#1") && chips.contains(&"nvme#2"),
+            "{:?}",
+            chips
+        );
         let fans: Vec<(&str, u32)> = h.fans.iter().map(|f| (f.chip.as_str(), f.rpm)).collect();
         assert_eq!(
             fans,
@@ -1834,7 +1846,10 @@ mod tests {
         let h = hw(&[]);
         assert!(h.temps.is_empty() && h.fans.is_empty() && h.gpus.is_empty());
         // 有 section 但全是垃圾行，同样要安静
-        let h2 = hw(&[("HW_TEMP", &["", "garbage", "a|b", "d|c|e"]), ("HW_GPU", &["n|"])]);
+        let h2 = hw(&[
+            ("HW_TEMP", &["", "garbage", "a|b", "d|c|e"]),
+            ("HW_GPU", &["n|"]),
+        ]);
         assert!(h2.temps.is_empty() && h2.gpus.is_empty());
     }
 }
@@ -1879,6 +1894,7 @@ mod live_tests {
             policy: policy.to_string(),
             known_hosts_path,
             outcome: Default::default(),
+            forwards: Default::default(),
         };
         let config = Arc::new(client::Config::default());
         let mut h = client::connect(config, (host, port), handler)
@@ -2135,7 +2151,12 @@ echo ok
         eprintln!("假树读数: {:?}", hw);
 
         // 假树：8 条可信读数 + 1 条 0°C 的假传感器（必须被丢掉）
-        assert_eq!(hw.temps.len(), 8, "0°C 的假传感器必须被丢掉: {:?}", hw.temps);
+        assert_eq!(
+            hw.temps.len(),
+            8,
+            "0°C 的假传感器必须被丢掉: {:?}",
+            hw.temps
+        );
         assert!(
             hw.temps.iter().all(|t| (5.0..=125.0).contains(&t.celsius)),
             "不该有越界读数: {:?}",

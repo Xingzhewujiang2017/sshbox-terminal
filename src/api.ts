@@ -92,6 +92,14 @@ export interface HostsFile {
   hosts: Host[]
 }
 
+export interface QuickCommand {
+  id: string
+  label: string
+  command: string
+  /** 发送后是否自动回车（关掉 = 只填进终端，自己改完再执行） */
+  enter: boolean
+}
+
 export interface Settings {
   sample_interval_secs: number
   monitor_enabled: boolean
@@ -104,9 +112,97 @@ export interface Settings {
   disk_alert_pct: number
   confirm_on_close_tab: boolean
   theme: string
+  quick_commands: QuickCommand[]
   history_enabled: boolean
   history_interval_secs: number
   history_retention_days: number
+}
+
+// --- SFTP / 本地文件（v0.4）------------------------------------------------
+
+export interface LocalEntry {
+  name: string
+  path: string
+  is_dir: boolean
+  is_symlink: boolean
+  size: number
+  modified: number
+  /** POSIX 权限位；Windows 上为空串 */
+  permissions: string
+  hidden: boolean
+}
+
+export interface LocalListing {
+  path: string
+  parent?: string | null
+  entries: LocalEntry[]
+  /** Windows 盘符（"C:\\"） */
+  drives: string[]
+  home: string
+}
+
+export interface RemoteEntry {
+  name: string
+  path: string
+  is_dir: boolean
+  is_symlink: boolean
+  size: number
+  modified: number
+  /** "rwxr-xr-x"（不含类型位） */
+  permissions: string
+}
+
+export interface RemoteListing {
+  path: string
+  parent?: string | null
+  entries: RemoteEntry[]
+  home: string
+}
+
+export interface RemoteStat {
+  size: number
+  modified: number
+  is_dir: boolean
+}
+
+// --- 端口转发（v0.4）------------------------------------------------------
+
+export type ForwardKind = 'local' | 'remote'
+
+export interface ForwardRule {
+  id: string
+  /** local = 本机监听 → 远端目标；remote = 远端监听 → 本机目标 */
+  kind: ForwardKind
+  listen_host: string
+  listen_port: number
+  target_host: string
+  target_port: number
+  auto_start: boolean
+  label?: string | null
+}
+
+export interface ForwardStatus extends ForwardRule {
+  running: boolean
+  /** 实际监听端口（远程转发可能被服务端改写） */
+  actual_port: number
+  error?: string | null
+}
+
+export type TransferState = 'running' | 'done' | 'cancelled' | 'error'
+
+export interface TransferProgress {
+  task_id: string
+  sid: string
+  direction: 'up' | 'down'
+  name: string
+  local: string
+  remote: string
+  done: number
+  total: number
+  /** bytes/s，按上次上报间隔算 */
+  rate: number
+  state: TransferState
+  message?: string | null
 }
 
 // --- live metrics (shared by the monitor panel and the fleet overview) ---
@@ -317,6 +413,43 @@ export const api = {
       to,
       destDir: destDir ?? null,
     }),
+
+  // sftp / 本地文件
+  localList: (path?: string | null) => call<LocalListing>('local_list', { path: path ?? null }),
+  localKinds: (paths: string[]) => call<string[]>('local_kinds', { paths }),
+  localMkdir: (path: string) => call<void>('local_mkdir', { path }),
+  localRename: (from: string, to: string) => call<void>('local_rename', { from, to }),
+  localRemove: (path: string, isDir: boolean, recursive: boolean) =>
+    call<void>('local_remove', { path, isDir, recursive }),
+  sftpList: (sid: string, path?: string | null) =>
+    call<RemoteListing>('sftp_list', { sid, path: path ?? null }),
+  sftpStat: (sid: string, path: string) => call<RemoteStat | null>('sftp_stat', { sid, path }),
+  sftpMkdir: (sid: string, path: string) => call<void>('sftp_mkdir', { sid, path }),
+  sftpRename: (sid: string, from: string, to: string) =>
+    call<void>('sftp_rename', { sid, from, to }),
+  sftpRemove: (sid: string, path: string, isDir: boolean, recursive: boolean) =>
+    call<void>('sftp_remove', { sid, path, isDir, recursive }),
+  sftpUpload: (sid: string, local: string, remote: string, resume: boolean) =>
+    call<string>('sftp_upload', { sid, local, remote, resume }),
+  sftpDownload: (sid: string, remote: string, local: string, resume: boolean) =>
+    call<string>('sftp_download', { sid, remote, local, resume }),
+  sftpUploadDir: (sid: string, local: string, remote: string) =>
+    call<number>('sftp_upload_dir', { sid, local, remote }),
+  sftpDownloadDir: (sid: string, remote: string, local: string) =>
+    call<number>('sftp_download_dir', { sid, remote, local }),
+  sftpCancel: (taskId: string) => call<boolean>('sftp_cancel', { taskId }),
+  sftpForget: (sid: string) => call<void>('sftp_forget', { sid }),
+  /** 拖文件到终端：上传到 `<家目录>/sshbox-uploads/`，返回远端路径 */
+  sftpUploadDrop: (sid: string, paths: string[]) =>
+    call<string[]>('sftp_upload_drop', { sid, paths }),
+
+  // 端口转发
+  forwardList: (sid: string) => call<ForwardStatus[]>('forward_list', { sid }),
+  forwardSave: (sid: string, rule: ForwardRule) => call<void>('forward_save', { sid, rule }),
+  forwardDelete: (sid: string, id: string) => call<void>('forward_delete', { sid, id }),
+  forwardStart: (sid: string, rule: ForwardRule) => call<number>('forward_start', { sid, rule }),
+  forwardStop: (sid: string, id: string) => call<void>('forward_stop', { sid, id }),
+  forwardStopAll: (sid: string) => call<number>('forward_stop_all', { sid }),
 
   // settings
   settingsGet: () => call<Settings>('settings_get'),

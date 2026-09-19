@@ -4,10 +4,14 @@ import { listen } from '@tauri-apps/api/event'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { disposeFleet, forgetSession, initFleet } from './fleet'
+import { initTransfers, pendingDrop, transfers } from './transfers'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 import OverviewPanel from './components/OverviewPanel.vue'
+import SftpPanel from './components/SftpPanel.vue'
+import ForwardPanel from './components/ForwardPanel.vue'
+import QuickCommands from './components/QuickCommands.vue'
 import HostList from './components/HostList.vue'
 import HostDialog from './components/HostDialog.vue'
 import HostKeyDialog from './components/HostKeyDialog.vue'
@@ -64,6 +68,17 @@ const hostDialog = ref<{ open: boolean; host: Host | null }>({ open: false, host
 const settingsOpen = ref(false)
 const historyOpen = ref(false)
 const overviewOpen = ref(false)
+const sftpOpen = ref(false)
+const forwardOpen = ref(false)
+/** 标签拖拽排序：拖到哪儿，标签就插到哪儿 */
+const dragTab = ref<{ id: string; from: number; x: number } | null>(null)
+const dragOverIdx = ref(-1)
+
+/** 广播输入：把键盘输入同时发到选中的多个会话（生产机上要小心，所以有红色横幅） */
+const broadcastOn = ref(false)
+const broadcastSel = ref<string[]>([])
+/** 进行中的传输数，显示在"文件"按钮上的小角标 */
+const activeTransferCount = computed(() => transfers.value.filter((t) => t.state === 'running').length)
 const hostKeyPrompt = ref<{ payload: ErrPayload; retry: () => void } | null>(null)
 const passwordPrompt = ref<{
   payload: ErrPayload
@@ -117,6 +132,9 @@ onMounted(async () => {
   // Subscribe to every session's metrics once, for the whole app: the monitor
   // panel only hears its own tab, which is why an overview needs this.
   await initFleet()
+  // 传输进度是全局的：面板关掉再打开还要能看到进度条
+  await initTransfers()
+  void initDrop()
   try {
     await loadAll()
   } catch (e) {
@@ -140,10 +158,71 @@ onBeforeUnmount(() => unwatchSystem?.())
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKey)
   disposeFleet()
+  unlistenDrop?.()
 })
 
+/**
+ * 外部文件拖入（从资源管理器拖进来）。
+ *
+ * Tauri v2 默认开着原生拖放，这会吞掉 webview 内部的 HTML5 拖拽事件——所以
+ * 面板内部拖拽是自绘的（见 SftpPanel），外部拖入走这条原生事件：
+ * - SFTP 面板开着 → 交给面板，上传到远端当前目录
+ * - 否则 → 上传到远端 `~/sshbox-uploads/` 并把远端路径粘到终端里（MobaXterm 的顺手细节）
+ */
+let unlistenDrop: (() => void) | null = null
+
+async function initDrop() {
+  const { getCurrentWebview } = await import('@tauri-apps/api/webview')
+  unlistenDrop = await getCurrentWebview().onDragDropEvent(async (ev) => {
+    if (ev.payload.type !== 'drop') return
+    const paths = ev.payload.paths ?? []
+    if (!paths.length) return
+    const tab = activeTab.value
+    if (!tab) return
+    if (sftpOpen.value) {
+      pendingDrop.value = [...pendingDrop.value, ...paths]
+      return
+    }
+    try {
+      const remotes = await api.sftpUploadDrop(tab.sid, paths)
+      if (remotes.length) {
+        // 引号包住路径：远端 shell 里带空格/中文的路径才不会断成两个参数
+        await api.termWrite(tab.sid, remotes.map((r) => `'${r}'`).join(' ') + ' ')
+      }
+      toast('info', `已上传 ${remotes.length} 个文件到远端 ~/sshbox-uploads/`)
+    } catch (e) {
+      toast('error', `上传失败: ${(e as Error).message}`)
+    }
+  })
+}
+
 function onKey(e: KeyboardEvent) {
+  // Esc 优先退广播：这是最容易误操作的模式，先给它
+  if (e.key === 'Escape' && broadcastOn.value) {
+    toggleBroadcast()
+    return
+  }
   if (!e.ctrlKey) return
+  if (e.shiftKey && (e.key === 'B' || e.key === 'b')) {
+    e.preventDefault()
+    toggleBroadcast()
+    return
+  }
+  if (e.shiftKey && (e.key === 'P' || e.key === 'p')) {
+    e.preventDefault()
+    window.dispatchEvent(new Event('sshbox-quickcmd-toggle'))
+    return
+  }
+  if (e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+    e.preventDefault()
+    if (activeTab.value) sftpOpen.value = !sftpOpen.value
+    return
+  }
+  if (e.shiftKey && (e.key === 'T' || e.key === 't')) {
+    e.preventDefault()
+    if (activeTab.value) forwardOpen.value = !forwardOpen.value
+    return
+  }
   if (e.key === 't' || e.key === 'T') {
     e.preventDefault()
     hostDialog.value = { open: true, host: null }
@@ -179,8 +258,124 @@ async function revealExport(path: string) {
   }
 }
 
+// --- 标签拖拽排序 ---------------------------------------------------------
+
+/**
+ * 自绘拖拽：Tauri v2 默认开着原生拖放，Windows 上它会吞掉 webview 内的
+ * HTML5 拖拽事件（draggable/dragstart 收不到），所以这里用指针事件自己算。
+ * 按下超过 4px 才算拖，避免和"点一下切换标签"打架。
+ */
+function onTabDown(i: number, ev: MouseEvent) {
+  if (ev.button !== 0) return
+  const id = tabs.value[i]?.id
+  if (!id) return
+  const startX = ev.clientX
+  let dragging = false
+
+  const move = (e: MouseEvent) => {
+    if (!dragging && Math.abs(e.clientX - startX) < 4) return
+    dragging = true
+    dragTab.value = { id, from: i, x: e.clientX }
+    dragOverIdx.value = tabIndexAt(e.clientX)
+  }
+  const up = () => {
+    window.removeEventListener('mousemove', move)
+    window.removeEventListener('mouseup', up)
+    const target = dragOverIdx.value
+    if (dragging && target >= 0 && target !== i) {
+      const list = [...tabs.value]
+      const [moved] = list.splice(i, 1)
+      list.splice(target, 0, moved)
+      tabs.value = list
+      activeIdx.value = target
+      uiLog(`标签「${moved.label}」从 ${i} 移到 ${target}`)
+    }
+    dragTab.value = null
+    dragOverIdx.value = -1
+  }
+  window.addEventListener('mousemove', move)
+  window.addEventListener('mouseup', up)
+}
+
+/** 按 X 坐标找插入位置：拿每个标签的中点做分界。 */
+function tabIndexAt(x: number): number {
+  const els = [...document.querySelectorAll('.tab')] as HTMLElement[]
+  for (let i = 0; i < els.length; i++) {
+    const r = els[i].getBoundingClientRect()
+    if (x < r.left + r.width / 2) return i
+  }
+  return els.length - 1
+}
+
+// --- 广播输入 -------------------------------------------------------------
+
+function toggleBroadcast() {
+  broadcastOn.value = !broadcastOn.value
+  if (broadcastOn.value && !broadcastSel.value.length && activeTab.value) {
+    // 默认选中当前标签，避免"开了广播但一个都没选"的哑状态
+    broadcastSel.value = [activeTab.value.id]
+  }
+  if (!broadcastOn.value) broadcastSel.value = []
+  uiLog(`广播输入${broadcastOn.value ? '开启' : '关闭'}，选中 ${broadcastSel.value.length} 个会话`)
+}
+
+function toggleBroadcastTab(id: string) {
+  const i = broadcastSel.value.indexOf(id)
+  if (i >= 0) broadcastSel.value.splice(i, 1)
+  else broadcastSel.value.push(id)
+}
+
+/** 终端输入：广播模式下发给所有选中会话，否则只发给当前会话。 */
+function onTermData(tab: Tab, data: string) {
+  if (broadcastOn.value && broadcastSel.value.includes(tab.id)) {
+    for (const id of broadcastSel.value) {
+      const t = tabs.value.find((x) => x.id === id)
+      if (t && t.status === 'connected') void api.termWrite(t.sid, data).catch(() => {})
+    }
+    return
+  }
+  void api.termWrite(tab.sid, data).catch(() => {})
+}
+
+/** 快捷命令：广播开着就跟着广播走（批量运维时很自然）。 */
+function onQuickSend(text: string) {
+  const tab = activeTab.value
+  if (!tab) return
+  if (broadcastOn.value && broadcastSel.value.includes(tab.id)) {
+    for (const id of broadcastSel.value) {
+      const t = tabs.value.find((x) => x.id === id)
+      if (t && t.status === 'connected') void api.termWrite(t.sid, text).catch(() => {})
+    }
+    return
+  }
+  void api.termWrite(tab.sid, text).catch(() => {})
+}
+
+/**
+ * 启动主机上标记了 auto_start 的转发规则。
+ *
+ * 失败只提示不阻断：某条规则端口被占不该影响连接本身。
+ */
+async function autoStartForwards(sid: string) {
+  try {
+    const rules = await api.forwardList(sid)
+    for (const r of rules.filter((x) => x.auto_start && !x.running)) {
+      try {
+        await api.forwardStart(sid, r)
+        uiLog(`自动启动转发 ${r.listen_host}:${r.listen_port} → ${r.target_host}:${r.target_port}`)
+      } catch (e) {
+        toast('error', `转发自动启动失败: ${(e as Error).message}`)
+      }
+    }
+  } catch {
+    /* 手输的临时会话没有 host_id，读不到规则很正常 */
+  }
+}
+
 // --- connecting ------------------------------------------------------------
 function addTab(sid: string, host?: Host, label?: string, id?: string) {
+  // 连上就把这台机器上标记"自动启动"的转发拉起来（重连也走这条路）
+  void autoStartForwards(sid)
   // History ownership is bound backend-side at connect time, so there is no
   // frontend round-trip to race with the first sample.
   const tab: Tab = {
@@ -347,6 +542,9 @@ function closeTab(i: number) {
     }
     tabs.value.splice(i, 1)
     forgetSession(t.sid)
+    // 会话没了：SFTP 通道缓存和本地转发监听都一起收掉
+    void api.sftpForget(t.sid).catch(() => {})
+    void api.forwardStopAll(t.sid).catch(() => {})
     if (activeIdx.value >= tabs.value.length) activeIdx.value = Math.max(0, tabs.value.length - 1)
   }
   if (settings.value?.confirm_on_close_tab && t.status === 'connected') {
@@ -527,9 +725,24 @@ function statusDot(t: Tab) {
           v-for="(t, i) in tabs"
           :key="t.id"
           class="tab"
-          :class="{ active: i === activeIdx }"
+          :class="{
+            active: i === activeIdx,
+            bc: broadcastOn && broadcastSel.includes(t.id),
+            dragging: dragTab?.id === t.id,
+            'drop-target': dragTab && dragOverIdx === i && dragTab.id !== t.id,
+          }"
+          :title="'按住拖动可调整标签顺序'"
           @click="activeIdx = i"
+          @mousedown="onTabDown(i, $event)"
         >
+          <input
+            v-if="broadcastOn"
+            class="bc-check"
+            type="checkbox"
+            :checked="broadcastSel.includes(t.id)"
+            title="勾选后这条会话接收广播输入"
+            @click.stop="toggleBroadcastTab(t.id)"
+          />
           <span class="dot" :style="{ background: statusDot(t) }"></span>
           <span class="tab-label">{{ t.label }}</span>
           <span v-if="t.status === 'connecting'" class="retry">
@@ -549,6 +762,32 @@ function statusDot(t: Tab) {
             :title="`主题：${THEME_LABELS[themeMode]}（点击切到${resolvedTheme === 'dark' ? '浅色' : '深色'}）`"
             @click="toggleTheme"
           >{{ resolvedTheme === 'dark' ? '☾' : '☀' }}</button>
+          <button
+            class="icon-btn"
+            title="文件传输（SFTP 双栏，Ctrl+Shift+F）"
+            @click="sftpOpen = !sftpOpen"
+          >
+            文件<span v-if="activeTransferCount" class="badge">{{ activeTransferCount }}</span>
+          </button>
+          <button
+            class="icon-btn"
+            :class="{ 'bc-on': broadcastOn }"
+            :title="
+              broadcastOn
+                ? '关闭广播输入（Esc）'
+                : '多会话广播输入：一次输入发给多个会话（Ctrl+Shift+B）'
+            "
+            @click="toggleBroadcast"
+          >
+            广播
+          </button>
+          <button
+            class="icon-btn"
+            title="端口转发（Ctrl+Shift+T）"
+            @click="forwardOpen = !forwardOpen"
+          >
+            转发
+          </button>
           <button class="icon-btn" title="总览（所有已连接主机）" @click="overviewOpen = true">
             总览
           </button>
@@ -568,6 +807,19 @@ function statusDot(t: Tab) {
 
       <div class="content">
         <div class="term-area">
+          <QuickCommands
+            v-if="activeTab"
+            :commands="settings?.quick_commands ?? []"
+            :host="activeTab.host?.host"
+            :user="activeTab.host?.username"
+            :port="activeTab.host?.port"
+            @send="onQuickSend"
+          />
+          <div v-if="broadcastOn" class="bc-bar">
+            <b>广播输入已开启</b> —— 键盘输入会同时发给 {{ broadcastSel.length }} 个会话
+            <span class="bc-hint">在标签上勾选目标；Esc 退出</span>
+          </div>
+          <div class="term-stack">
           <div v-if="!tabs.length" class="empty">
             <div class="empty-title">SSHBox</div>
             <div class="empty-sub">SSH 终端 + 虚拟机实时监控</div>
@@ -579,7 +831,9 @@ function statusDot(t: Tab) {
             :key="t.id"
             :sid="t.sid"
             :active="i === activeIdx"
+            @data="(d) => onTermData(t, d)"
           />
+          </div>
         </div>
         <div v-if="monitorVisible && activeTab" class="monitor-area">
           <MonitorPanel
@@ -591,6 +845,20 @@ function statusDot(t: Tab) {
         </div>
       </div>
     </main>
+
+    <SftpPanel
+      v-if="sftpOpen && activeTab"
+      :sid="activeTab.sid"
+      :label="`${activeTab.label} · ${activeTab.host ? activeTab.host.username + '@' + activeTab.host.host : ''}`"
+      @close="sftpOpen = false"
+    />
+
+    <ForwardPanel
+      v-if="forwardOpen && activeTab"
+      :sid="activeTab.sid"
+      :label="`${activeTab.label} · ${activeTab.host ? activeTab.host.username + '@' + activeTab.host.host : ''}`"
+      @close="forwardOpen = false"
+    />
 
     <OverviewPanel
       v-if="overviewOpen"
@@ -672,6 +940,19 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(-
 </style>
 
 <style scoped>
+.badge {
+  display: inline-block;
+  min-width: 15px;
+  margin-left: 4px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--ctp-blue);
+  color: var(--on-accent);
+  font-size: 10px;
+  line-height: 15px;
+  text-align: center;
+}
+
 .app { display: flex; height: 100vh; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .tabbar {
@@ -703,7 +984,41 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(-
 .banner.info { background: var(--banner-info-bg); color: var(--ctp-green); }
 .banner button { background: none; border: none; color: inherit; cursor: pointer; font-size: 14px; }
 .content { flex: 1; display: flex; min-height: 0; }
-.term-area { flex: 1; min-width: 0; position: relative; background: var(--ctp-base); }
+.term-area {
+  flex: 1;
+  min-width: 0;
+  background: var(--ctp-base);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.term-stack { flex: 1; min-height: 0; position: relative; }
+.bc-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px;
+  background: var(--ctp-red);
+  color: var(--on-accent);
+  font-size: 12px;
+}
+.bc-hint { opacity: 0.85; }
+.icon-btn.bc-on {
+  background: var(--ctp-red);
+  color: var(--on-accent);
+  border-color: var(--ctp-red);
+}
+.tab.bc {
+  box-shadow: inset 0 -2px 0 var(--ctp-red);
+}
+.tab.dragging {
+  opacity: 0.55;
+}
+.tab.drop-target {
+  outline: 2px solid var(--ctp-blue);
+  outline-offset: -2px;
+}
+.bc-check { margin-right: 4px; }
 .monitor-area { width: 320px; border-left: 1px solid var(--ctp-surface0); min-width: 240px; }
 .empty {
   height: 100%; display: flex; flex-direction: column; gap: 12px;
