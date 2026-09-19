@@ -273,6 +273,23 @@ pub struct Settings {
     pub confirm_on_close_tab: bool,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Persist samples to the SQLite history file.
+    #[serde(default = "default_true")]
+    pub history_enabled: bool,
+    /// History cadence, independent of the live sample interval: the live
+    /// monitor can run at 2s while history records every 10s.
+    #[serde(default = "default_history_interval")]
+    pub history_interval_secs: u64,
+    #[serde(default = "default_retention")]
+    pub history_retention_days: u64,
+}
+
+fn default_history_interval() -> u64 {
+    2
+}
+
+fn default_retention() -> u64 {
+    30
 }
 
 fn default_theme() -> String {
@@ -293,6 +310,9 @@ impl Default for Settings {
             disk_alert_pct: default_disk_alert(),
             confirm_on_close_tab: true,
             theme: default_theme(),
+            history_enabled: true,
+            history_interval_secs: default_history_interval(),
+            history_retention_days: default_retention(),
         }
     }
 }

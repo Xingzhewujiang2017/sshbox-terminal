@@ -104,6 +104,55 @@ export interface Settings {
   disk_alert_pct: number
   confirm_on_close_tab: boolean
   theme: string
+  history_enabled: boolean
+  history_interval_secs: number
+  history_retention_days: number
+}
+
+// --- history ---
+
+export interface HistoryBucket {
+  ts: number
+  cpu_pct: number
+  mem_pct: number
+  net_rx: number
+  net_tx: number
+  disk_r: number
+  disk_w: number
+  load1: number
+}
+
+export interface HistoryRange {
+  buckets: HistoryBucket[]
+  raw_points: number
+  bucket_secs: number
+  oldest: number
+  newest: number
+}
+
+export interface HistoryHost {
+  host_id: string
+  rows: number
+  oldest: number
+  newest: number
+  last_cpu: number
+  last_mem: number
+}
+
+export interface HistoryStats {
+  path: string
+  bytes: number
+  rows: number
+  hosts: number
+  oldest: number
+  newest: number
+  retention_days: number
+}
+
+export interface HistoryExport {
+  path: string
+  rows: number
+  bytes: number
 }
 
 export interface Alert {
@@ -206,6 +255,26 @@ export const api = {
   monitorSetPaused: (sid: string, paused: boolean) => call<void>('monitor_set_paused', { sid, paused }),
   monitorPaused: (sid: string) => call<boolean>('monitor_paused', { sid }),
   monitorSampleNow: (sid: string) => call<void>('monitor_sample_now', { sid }),
+
+  // history
+  historyBind: (sid: string, hostId: string | null) =>
+    call<void>('history_bind', { sid, hostId }),
+  historyRange: (hostId: string, from: number, to: number, maxPoints?: number) =>
+    call<HistoryRange>('history_range', {
+      hostId,
+      from,
+      to,
+      maxPoints: maxPoints ?? null,
+    }),
+  historyHosts: () => call<HistoryHost[]>('history_hosts'),
+  historyStats: () => call<HistoryStats>('history_stats'),
+  historyExport: (hostId: string, from: number, to: number, destDir?: string | null) =>
+    call<HistoryExport>('history_export', {
+      hostId,
+      from,
+      to,
+      destDir: destDir ?? null,
+    }),
 
   // settings
   settingsGet: () => call<Settings>('settings_get'),

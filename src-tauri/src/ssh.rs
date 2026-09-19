@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::{hostkey, monitor, store};
+use crate::{history, hostkey, monitor, store};
 
 pub type SessionId = String;
 
@@ -601,6 +601,8 @@ pub async fn disconnect(
             .handle
             .disconnect(Disconnect::ByApplication, "user closed", "en");
     }
+    drop(sessions);
+    history::unbind(&sid);
     Ok(())
 }
 
@@ -653,6 +655,20 @@ pub fn monitor_paused(sid: SessionId) -> bool {
 #[tauri::command]
 pub fn monitor_sample_now(sid: SessionId) -> std::result::Result<(), String> {
     monitor::sample_now(&sid);
+    Ok(())
+}
+
+/// Tell the history store which saved host a session belongs to.
+///
+/// Session ids are per-connection uuids, so without this every reconnect would
+/// start a fresh history series for the same machine. Called by the frontend
+/// right after connecting; sessions without a saved host keep a temporary key.
+#[tauri::command]
+pub fn history_bind(sid: SessionId, host_id: Option<String>) -> std::result::Result<(), String> {
+    match host_id {
+        Some(h) if !h.is_empty() => history::bind(&sid, &h),
+        _ => history::unbind(&sid),
+    }
     Ok(())
 }
 

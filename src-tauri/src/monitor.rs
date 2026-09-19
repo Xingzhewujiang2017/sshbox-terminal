@@ -925,6 +925,8 @@ pub fn spawn(
         let mut prev = PrevSample::default();
         // None = never sampled yet, so the first pass fills the card immediately.
         let mut last_slow: Option<Instant> = None;
+        // ts of the last sample written to history (0.0 = none yet).
+        let mut last_history: f64 = 0.0;
         loop {
             let settings = store::load_settings();
             let interval = settings.sample_interval_secs.clamp(1, 60);
@@ -992,6 +994,19 @@ pub fn spawn(
             if let Some(m) = parse_metrics(&raw, &mut prev) {
                 // Evaluate alerts before moving `m` into the event payload.
                 let fired = crate::alerts::evaluate(&sid, &m, &settings);
+                // History is fire-and-forget: `record` hands the row to a
+                // dedicated thread and returns immediately, so a slow disk can
+                // never delay the next sample.
+                if settings.history_enabled
+                    && crate::history::due(m.ts, last_history, settings.history_interval_secs)
+                {
+                    last_history = m.ts;
+                    crate::history::record(crate::history::Row::from_metrics(
+                        &crate::history::host_key(&sid),
+                        &m,
+                        m.ts,
+                    ));
+                }
                 let _ = app.emit(
                     "ssh://metrics",
                     serde_json::json!({ "sid": sid, "metrics": m }),
@@ -1580,7 +1595,7 @@ mod live_tests {
             .expect("连接失败（WSL 是否在运行？）");
 
         // Fire-and-forget burner; want_reply=false so this does not block.
-        let mut burn = h.channel_open_session().await.expect("打开燃烧通道失败");
+        let burn = h.channel_open_session().await.expect("打开燃烧通道失败");
         burn.exec(false, "timeout 15 sh -c 'while :; do :; done'")
             .await
             .expect("启动燃烧进程失败");

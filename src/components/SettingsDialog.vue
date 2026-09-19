@@ -91,6 +91,34 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
           </div>
         </div>
 
+        <label class="check">
+          <input v-model="form.history_enabled" type="checkbox" />
+          <span>历史落盘（SQLite，断线后仍可回看）</span>
+        </label>
+        <div class="rowline">
+          <span>历史采样间隔（秒）</span>
+          <input
+            v-model.number="form.history_interval_secs"
+            type="number"
+            min="1"
+            max="3600"
+            class="num"
+          />
+        </div>
+        <div class="rowline">
+          <span>历史保留天数（过期自动清理）</span>
+          <input
+            v-model.number="form.history_retention_days"
+            type="number"
+            min="1"
+            max="3650"
+            class="num"
+          />
+        </div>
+        <div class="hintline">
+          默认每次采样都落盘（2 秒）。调大间隔可省磁盘：10 秒约省 5 倍空间。数据在本机，导出走「历史」面板。
+        </div>
+
         <div class="btns">
           <button class="ghost" @click="emit('restartMonitor')">重启监控任务</button>
           <button class="primary" @click="save">保存设置</button>

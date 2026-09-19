@@ -1,5 +1,6 @@
 mod alerts;
 mod commands;
+mod history;
 mod hostkey;
 mod monitor;
 mod ssh;
@@ -52,8 +53,17 @@ pub fn run() {
             commands::hosts_import,
             commands::app_paths,
             commands::ui_log,
+            // --- history ---
+            history::history_range,
+            history::history_hosts,
+            history::history_stats,
+            history::history_export,
+            ssh::history_bind,
         ])
         .setup(|_app| {
+            // Writer thread first: samples may start arriving as soon as a
+            // session connects.
+            history::init();
             log::info!(
                 "SSHBox {} 启动，配置目录 {}",
                 env!("CARGO_PKG_VERSION"),

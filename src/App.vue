@@ -2,8 +2,10 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
+import HistoryPanel from './components/HistoryPanel.vue'
 import HostList from './components/HostList.vue'
 import HostDialog from './components/HostDialog.vue'
 import HostKeyDialog from './components/HostKeyDialog.vue'
@@ -52,6 +54,7 @@ const activeTab = computed(() => tabs.value[activeIdx.value])
 // --- dialogs ---------------------------------------------------------------
 const hostDialog = ref<{ open: boolean; host: Host | null }>({ open: false, host: null })
 const settingsOpen = ref(false)
+const historyOpen = ref(false)
 const hostKeyPrompt = ref<{ payload: ErrPayload; retry: () => void } | null>(null)
 const passwordPrompt = ref<{
   payload: ErrPayload
@@ -129,8 +132,21 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
+/** Show an exported file in Explorer. */
+async function revealExport(path: string) {
+  try {
+    await revealItemInDir(path)
+  } catch (e) {
+    uiLog(`打开目录失败: ${String(e)}`, 'warn')
+  }
+}
+
 // --- connecting ------------------------------------------------------------
 function addTab(sid: string, host?: Host, label?: string, id?: string) {
+  // Tell the history store which saved host this session belongs to. Session
+  // ids are per-connection uuids, so without this every reconnect would look
+  // like a brand new machine in the history.
+  void api.historyBind(sid, host?.id ?? null)
   const tab: Tab = {
     id: id ?? sid,
     sid,
@@ -447,6 +463,9 @@ function statusDot(t: Tab) {
             class="reconnect-btn"
             @click="manualReconnect(activeTab)"
           >重连</button>
+          <button class="icon-btn" title="历史回看（落盘数据）" @click="historyOpen = true">
+            历史
+          </button>
           <button class="icon-btn" title="切换监控面板" @click="monitorVisible = !monitorVisible">
             {{ monitorVisible ? '◧' : '◨' }}
           </button>
@@ -483,6 +502,14 @@ function statusDot(t: Tab) {
         </div>
       </div>
     </main>
+
+    <HistoryPanel
+      v-if="historyOpen"
+      :hosts="hosts"
+      :initial-host-id="activeTab?.hostId"
+      @close="historyOpen = false"
+      @open-path="revealExport"
+    />
 
     <HostDialog
       v-if="hostDialog.open"
