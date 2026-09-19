@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
+import { onMounted, onBeforeUnmount, ref, computed, nextTick } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
 
@@ -39,16 +39,27 @@ const props = defineProps<{ sid: string; active: boolean }>()
 const info = ref<StaticInfo | null>(null)
 const metrics = ref<Metrics | null>(null)
 
-// Rolling history (5 min @ 2s = 150 points)
+// Rolling history: 5 min @ 2s = 150 points
 const MAX_POINTS = 150
-const history = ref<{ t: string[]; cpu: number[]; mem: number[]; rx: number[]; tx: number[] }>({
-  t: [], cpu: [], mem: [], rx: [], tx: [],
-})
+const history = ref<{
+  t: string[]; cpu: number[]; mem: number[]
+  rx: number[]; tx: number[]; dread: number[]; dwrite: number[]
+}>({ t: [], cpu: [], mem: [], rx: [], tx: [], dread: [], dwrite: [] })
 
 let unlistenStatic: (() => void) | null = null
 let unlistenMetrics: (() => void) | null = null
-let chart: echarts.ECharts | null = null
-const chartEl = ref<HTMLDivElement>()
+
+const rootEl = ref<HTMLDivElement>()
+const cpuEl = ref<HTMLDivElement>()
+const netEl = ref<HTMLDivElement>()
+const ioEl = ref<HTMLDivElement>()
+let cpuChart: echarts.ECharts | null = null
+let netChart: echarts.ECharts | null = null
+let ioChart: echarts.ECharts | null = null
+let ro: ResizeObserver | null = null
+
+const AXIS = { fontSize: 9, color: '#6c7086' }
+const LEGEND = { textStyle: { fontSize: 10 }, top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
 
 function fmtBytes(b: number): string {
   if (b < 1024) return b.toFixed(0) + ' B/s'
@@ -65,6 +76,13 @@ function fmtUptime(s: number): string {
   const m = Math.floor((s % 3600) / 60)
   return d > 0 ? `${d}天 ${h}小时 ${m}分` : h > 0 ? `${h}小时 ${m}分` : `${m}分钟`
 }
+/** Compact axis label for a rate (bytes/s). */
+function fmtRateShort(b: number): string {
+  if (b <= 0) return '0'
+  if (b < 1024) return b.toFixed(0) + 'B'
+  if (b < 1024 * 1024) return (b / 1024).toFixed(0) + 'K'
+  return (b / 1024 / 1024).toFixed(1) + 'M'
+}
 
 const netTotals = computed(() => {
   if (!metrics.value) return { rx: 0, tx: 0 }
@@ -74,16 +92,66 @@ const netTotals = computed(() => {
   )
 })
 
-function updateChart() {
-  if (!chart || !metrics.value) return
-  const h = history.value
-  chart.setOption({
-    xAxis: { data: h.t },
+/** Percent chart (fixed 0-100 axis). */
+function initPct(el: HTMLDivElement): echarts.ECharts {
+  const c = echarts.init(el, 'dark')
+  c.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 34, right: 10, top: 24, bottom: 20 },
+    legend: { ...LEGEND, data: ['CPU %', '内存 %'] },
+    tooltip: { trigger: 'axis', valueFormatter: (v: number) => v.toFixed(1) + '%' },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS },
+    yAxis: { type: 'value', min: 0, max: 100, axisLabel: AXIS, splitLine: { lineStyle: { color: '#313244' } } },
     series: [
-      { data: h.cpu },
-      { data: h.mem },
+      { name: 'CPU %', type: 'line', data: [], smooth: true, showSymbol: false, lineStyle: { width: 1.5 }, areaStyle: { opacity: 0.15 } },
+      { name: '内存 %', type: 'line', data: [], smooth: true, showSymbol: false, lineStyle: { width: 1.5 }, areaStyle: { opacity: 0.15 } },
     ],
   })
+  return c
+}
+
+/** Rate chart (bytes/s, auto-scaled axis with human labels). */
+function initRate(el: HTMLDivElement, names: string[], colors: string[]): echarts.ECharts {
+  const c = echarts.init(el, 'dark')
+  c.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 46, right: 10, top: 24, bottom: 20 },
+    legend: { ...LEGEND, data: names },
+    tooltip: { trigger: 'axis', valueFormatter: (v: number) => fmtBytes(v) },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS },
+    yAxis: { type: 'value', min: 0, axisLabel: { ...AXIS, formatter: fmtRateShort }, splitLine: { lineStyle: { color: '#313244' } } },
+    series: names.map((n, i) => ({
+      name: n, type: 'line', data: [], smooth: true, showSymbol: false,
+      lineStyle: { width: 1.5, color: colors[i] },
+      itemStyle: { color: colors[i] },
+      areaStyle: { opacity: 0.12, color: colors[i] },
+    })),
+  })
+  return c
+}
+
+/**
+ * Charts live inside `v-if="metrics"`, so the container elements do not exist
+ * until the first sample arrives — init must happen after that render, never
+ * in onMounted.
+ */
+function ensureCharts() {
+  if (!cpuChart && cpuEl.value) cpuChart = initPct(cpuEl.value)
+  if (!netChart && netEl.value) netChart = initRate(netEl.value, ['↓ 下行', '↑ 上行'], ['#a6e3a1', '#89b4fa'])
+  if (!ioChart && ioEl.value) ioChart = initRate(ioEl.value, ['读', '写'], ['#fab387', '#cba6f7'])
+}
+
+function updateCharts() {
+  const h = history.value
+  cpuChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.cpu }, { data: h.mem }] })
+  netChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.rx }, { data: h.tx }] })
+  ioChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.dread }, { data: h.dwrite }] })
+}
+
+async function refresh() {
+  await nextTick()
+  ensureCharts()
+  updateCharts()
 }
 
 onMounted(async () => {
@@ -102,38 +170,36 @@ onMounted(async () => {
     const nt = m.net.reduce((a, n) => ({ rx: a.rx + n.rx_bps, tx: a.tx + n.tx_bps }), { rx: 0, tx: 0 })
     h.rx.push(nt.rx)
     h.tx.push(nt.tx)
+    const io = m.disk_io.reduce((a, d) => ({ r: a.r + d.read_bps, w: a.w + d.write_bps }), { r: 0, w: 0 })
+    h.dread.push(io.r)
+    h.dwrite.push(io.w)
     while (h.t.length > MAX_POINTS) {
-      h.t.shift(); h.cpu.shift(); h.mem.shift(); h.rx.shift(); h.tx.shift()
+      h.t.shift(); h.cpu.shift(); h.mem.shift()
+      h.rx.shift(); h.tx.shift(); h.dread.shift(); h.dwrite.shift()
     }
-    updateChart()
+    void refresh()
   })
 
-  if (chartEl.value) {
-    chart = echarts.init(chartEl.value, 'dark')
-    chart.setOption({
-      backgroundColor: 'transparent',
-      grid: { left: 36, right: 12, top: 30, bottom: 24 },
-      legend: { data: ['CPU %', '内存 %'], textStyle: { fontSize: 10 }, top: 0 },
-      tooltip: { trigger: 'axis' },
-      xAxis: { type: 'category', data: [], axisLabel: { fontSize: 9 } },
-      yAxis: { type: 'value', min: 0, max: 100, axisLabel: { fontSize: 9 } },
-      series: [
-        { name: 'CPU %', type: 'line', data: [], smooth: true, showSymbol: false, lineStyle: { width: 1.5 }, areaStyle: { opacity: 0.15 } },
-        { name: '内存 %', type: 'line', data: [], smooth: true, showSymbol: false, lineStyle: { width: 1.5 }, areaStyle: { opacity: 0.15 } },
-      ],
-    })
-  }
+  ro = new ResizeObserver(() => {
+    cpuChart?.resize()
+    netChart?.resize()
+    ioChart?.resize()
+  })
+  if (rootEl.value) ro.observe(rootEl.value)
 })
 
 onBeforeUnmount(() => {
   unlistenStatic?.()
   unlistenMetrics?.()
-  chart?.dispose()
+  ro?.disconnect()
+  cpuChart?.dispose()
+  netChart?.dispose()
+  ioChart?.dispose()
 })
 </script>
 
 <template>
-  <div class="monitor">
+  <div class="monitor" ref="rootEl">
     <template v-if="info">
       <div class="static-box">
         <div class="host">{{ info.hostname }}</div>
@@ -162,12 +228,18 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <div class="card">
+        <div class="section-title">CPU / 内存 <span class="unit">近 5 分钟</span></div>
+        <div class="chart-box" ref="cpuEl"></div>
+      </div>
+
       <div class="net-box">
-        <div class="section-title">网络</div>
+        <div class="section-title">网络 <span class="unit">近 5 分钟</span></div>
         <div class="net-total">
           <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
           <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
         </div>
+        <div class="chart-box" ref="netEl"></div>
         <div v-for="n in metrics.net" :key="n.name" class="net-if">
           <span class="ifname">{{ n.name }}</span>
           <span>↓{{ fmtBytes(n.rx_bps) }}</span>
@@ -184,11 +256,15 @@ onBeforeUnmount(() => {
           </div>
           <div class="bar"><div class="bar-fill" :class="{ warn: d.use_pct > 85 }" :style="{ width: d.use_pct + '%' }"></div></div>
         </div>
-        <div v-for="io in metrics.disk_io" :key="io.name" class="io-row">
-          <span class="ifname">{{ io.name }}</span>
-          <span>R {{ fmtBytes(io.read_bps) }}</span>
-          <span>W {{ fmtBytes(io.write_bps) }}</span>
-        </div>
+        <template v-if="metrics.disk_io.length">
+          <div class="section-title">磁盘 IO <span class="unit">近 5 分钟</span></div>
+          <div class="chart-box" ref="ioEl"></div>
+          <div v-for="io in metrics.disk_io" :key="io.name" class="io-row">
+            <span class="ifname">{{ io.name }}</span>
+            <span>R {{ fmtBytes(io.read_bps) }}</span>
+            <span>W {{ fmtBytes(io.write_bps) }}</span>
+          </div>
+        </template>
       </div>
 
       <div class="proc-box">
@@ -203,8 +279,6 @@ onBeforeUnmount(() => {
           <span class="pmem">{{ fmtKB(p.rss_kb) }}</span>
         </div>
       </div>
-
-      <div class="chart-box" ref="chartEl"></div>
 
       <div v-if="metrics.load.length" class="load-box">
         负载: {{ metrics.load.map(l => l.toFixed(2)).join(' / ') }}
@@ -246,7 +320,8 @@ onBeforeUnmount(() => {
 }
 .gauge-label { margin-top: 4px; color: #a6adc8; font-size: 11px; }
 .section-title { font-weight: 600; color: #a6adc8; margin: 8px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.net-box, .disk-box { background: #1e1e2e; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+.section-title .unit { color: #585b70; font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }
+.card, .net-box, .disk-box { background: #1e1e2e; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
 .net-total { display: flex; gap: 16px; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .down { color: #a6e3a1; } .up { color: #89b4fa; }
 .net-if, .io-row { display: flex; gap: 10px; color: #a6adc8; padding: 1px 0; }
@@ -256,10 +331,10 @@ onBeforeUnmount(() => {
 .bar { height: 6px; background: #313244; border-radius: 3px; overflow: hidden; }
 .bar-fill { height: 100%; background: #89b4fa; border-radius: 3px; transition: width 0.5s; }
 .bar-fill.warn { background: #f38ba8; }
-.chart-box { height: 160px; margin-bottom: 8px; }
+.chart-box { height: 116px; width: 100%; }
 .load-box { color: #6c7086; text-align: center; padding: 4px 0; }
 .proc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-.proc-count { color: #6c7086; font-weight: 400; font-size: 10px; margin-left: 6px; }
+.proc-count { color: #6c7086; font-weight: 400; font-size: 10px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
 .proc-head, .proc-row { display: grid; grid-template-columns: 50px 1fr 52px 66px; gap: 6px; align-items: center; }
 .proc-head { color: #6c7086; font-size: 10px; padding-bottom: 4px; border-bottom: 1px solid #313244; margin-bottom: 4px; }
 .proc-row { padding: 2px 0; font-size: 11px; }

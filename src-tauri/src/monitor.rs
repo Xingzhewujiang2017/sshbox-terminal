@@ -104,6 +104,13 @@ echo "@@TS@@ $(date +%s.%N 2>/dev/null || date +%s)"
 echo "@@STAT@@"; cat /proc/stat 2>/dev/null
 echo "@@MEM@@"; cat /proc/meminfo 2>/dev/null
 echo "@@NET@@"; cat /proc/net/dev 2>/dev/null
+echo "@@NETSTATE@@"
+for f in /sys/class/net/*/operstate; do
+  [ -r "$f" ] || continue
+  n=${f#/sys/class/net/}; n=${n%/operstate}
+  IFS= read -r st < "$f" 2>/dev/null
+  echo "$n $st"
+done
 echo "@@DISKIO@@"; cat /proc/diskstats 2>/dev/null
 echo "@@DF@@"; df -P -k 2>/dev/null
 echo "@@LOAD@@"; cat /proc/loadavg 2>/dev/null
@@ -589,6 +596,18 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     let swap_used = swap_total.saturating_sub(swap_free);
 
     // --- Network from /proc/net/dev ---
+    // Interfaces the kernel reports as down are pure noise (WSL ships idle
+    // eth2, docker leaves br-* around); /proc/net/dev itself has no state.
+    let mut down: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ns) = s.get("NETSTATE") {
+        for line in ns {
+            if let Some((n, st)) = line.split_once(' ') {
+                if st.trim().eq_ignore_ascii_case("down") {
+                    down.insert(n.trim().to_string());
+                }
+            }
+        }
+    }
     let mut net = Vec::new();
     if let Some(nd) = s.get("NET") {
         for line in nd {
@@ -597,7 +616,7 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
             }
             let (name, rest) = line.split_once(':').unwrap();
             let name = name.trim().to_string();
-            if name == "lo" {
+            if name == "lo" || down.contains(&name) {
                 continue;
             }
             let f: Vec<&str> = rest.split_whitespace().collect();
@@ -625,6 +644,13 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
                 tx_bps,
             });
         }
+        // Busiest first: on a real host the active NIC must not sit below
+        // half a dozen idle bridges/tunnels.
+        net.sort_by(|a, b| {
+            (b.rx_bps + b.tx_bps)
+                .partial_cmp(&(a.rx_bps + a.tx_bps))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     // --- Disk I/O from /proc/diskstats (whole disks only) ---
@@ -826,6 +852,21 @@ mod tests {
         assert!(parse_remote_ts(&s).is_none());
         s.insert("TS".into(), lines(&["0"]));
         assert!(parse_remote_ts(&s).is_none());
+    }
+
+    #[test]
+    fn net_drops_down_interfaces_and_sorts_busiest_first() {
+        // eth0 idle, eth1 carrying traffic, eth2 down (kernel says so).
+        let raw1 = "@@TS@@ 100.0\n@@STAT@@\ncpu  100 0 100 800 0 0 0 0 0 0\n@@NET@@\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  eth1: 5000 0 0 0 0 0 0 0 6000 0 0 0 0 0 0 0\n  eth2: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up\neth1 up\neth2 down\n@@END@@\n";
+        let raw2 = "@@TS@@ 102.0\n@@STAT@@\ncpu  600 0 600 1800 0 0 0 0 0 0\n@@NET@@\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  eth1: 25000 0 0 0 0 0 0 0 6000 0 0 0 0 0 0 0\n  eth2: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up\neth1 up\neth2 down\n@@END@@\n";
+        let mut prev = PrevSample::default();
+        let _ = parse_metrics(raw1, &mut prev).unwrap();
+        prev.mono_ts = mono_secs() - 2.0;
+        let m2 = parse_metrics(raw2, &mut prev).unwrap();
+        let names: Vec<&str> = m2.net.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["eth1", "eth0"], "down 网卡应被丢弃，忙的排前");
+        assert!((m2.net[0].rx_bps - 10000.0).abs() < 1.0, "rx={}", m2.net[0].rx_bps);
+        assert_eq!(m2.net[1].rx_bps, 0.0);
     }
 
     #[test]
