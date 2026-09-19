@@ -195,6 +195,9 @@ export const api = {
   monitorSetVisible: (sid: string, visible: boolean) =>
     call<void>('monitor_set_visible', { sid, visible }),
   monitorRestart: (sid: string) => call<void>('monitor_restart', { sid }),
+  monitorSetPaused: (sid: string, paused: boolean) => call<void>('monitor_set_paused', { sid, paused }),
+  monitorPaused: (sid: string) => call<boolean>('monitor_paused', { sid }),
+  monitorSampleNow: (sid: string) => call<void>('monitor_sample_now', { sid }),
 
   // settings
   settingsGet: () => call<Settings>('settings_get'),

@@ -2,6 +2,7 @@
 import { onMounted, onBeforeUnmount, ref, computed, nextTick } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
+import { api } from '../api'
 
 interface StaticInfo {
   hostname: string
@@ -34,10 +35,36 @@ interface Metrics {
   proc_total: number
 }
 
-const props = defineProps<{ sid: string; active: boolean }>()
+const props = defineProps<{ sid: string; active: boolean; interval: number }>()
+const emit = defineEmits<{ (e: 'setInterval', secs: number): void }>()
 
 const info = ref<StaticInfo | null>(null)
 const metrics = ref<Metrics | null>(null)
+const paused = ref(false)
+const INTERVALS = [1, 2, 5, 10]
+
+/** The chart window depends on the interval: 150 points is not always 5 min. */
+const windowLabel = computed(() => {
+  const secs = MAX_POINTS * (props.interval || 2)
+  return secs >= 60 ? `近 ${Math.round(secs / 60)} 分钟` : `近 ${secs} 秒`
+})
+
+async function togglePause() {
+  paused.value = !paused.value
+  try {
+    await api.monitorSetPaused(props.sid, paused.value)
+  } catch {
+    paused.value = !paused.value
+  }
+}
+
+async function sampleNow() {
+  try {
+    await api.monitorSampleNow(props.sid)
+  } catch {
+    /* session already gone */
+  }
+}
 
 // Rolling history: 5 min @ 2s = 150 points
 const MAX_POINTS = 150
@@ -155,6 +182,11 @@ async function refresh() {
 }
 
 onMounted(async () => {
+  try {
+    paused.value = await api.monitorPaused(props.sid)
+  } catch {
+    /* new session: never paused */
+  }
   unlistenStatic = await listen<{ sid: string; info: StaticInfo }>('ssh://static', (e) => {
     if (e.payload.sid === props.sid) info.value = e.payload.info
   })
@@ -200,6 +232,23 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="monitor" ref="rootEl">
+    <div class="bar">
+      <span class="bar-label">采样</span>
+      <button
+        v-for="s in INTERVALS"
+        :key="s"
+        class="chip"
+        :class="{ on: props.interval === s }"
+        @click="emit('setInterval', s)"
+      >{{ s }}s</button>
+      <span class="bar-spacer"></span>
+      <button class="chip" :class="{ warn: paused }" :title="paused ? '继续采集' : '暂停采集'" @click="togglePause">
+        {{ paused ? '▶ 继续' : '❙❙ 暂停' }}
+      </button>
+      <button class="chip" title="立即采集一次" @click="sampleNow">⟳</button>
+    </div>
+    <div v-if="paused" class="paused-banner">监控已暂停 · 数据不再更新，点「继续」恢复</div>
+
     <template v-if="info">
       <div class="static-box">
         <div class="host">{{ info.hostname }}</div>
@@ -229,12 +278,12 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="card">
-        <div class="section-title">CPU / 内存 <span class="unit">近 5 分钟</span></div>
+        <div class="section-title">CPU / 内存 <span class="unit">{{ windowLabel }}</span></div>
         <div class="chart-box" ref="cpuEl"></div>
       </div>
 
       <div class="net-box">
-        <div class="section-title">网络 <span class="unit">近 5 分钟</span></div>
+        <div class="section-title">网络 <span class="unit">{{ windowLabel }}</span></div>
         <div class="net-total">
           <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
           <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
@@ -257,7 +306,7 @@ onBeforeUnmount(() => {
           <div class="bar"><div class="bar-fill" :class="{ warn: d.use_pct > 85 }" :style="{ width: d.use_pct + '%' }"></div></div>
         </div>
         <template v-if="metrics.disk_io.length">
-          <div class="section-title">磁盘 IO <span class="unit">近 5 分钟</span></div>
+          <div class="section-title">磁盘 IO <span class="unit">{{ windowLabel }}</span></div>
           <div class="chart-box" ref="ioEl"></div>
           <div v-for="io in metrics.disk_io" :key="io.name" class="io-row">
             <span class="ifname">{{ io.name }}</span>
@@ -298,6 +347,20 @@ onBeforeUnmount(() => {
   font-size: 12px;
   padding: 10px;
   box-sizing: border-box;
+}
+.bar { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }
+.bar-label { color: #6c7086; font-size: 11px; margin-right: 2px; }
+.bar-spacer { flex: 1; }
+.chip {
+  background: #1e1e2e; color: #a6adc8; border: 1px solid #313244; border-radius: 5px;
+  font-size: 11px; padding: 2px 7px; cursor: pointer; font-family: inherit;
+}
+.chip:hover { border-color: #585b70; color: #cdd6f4; }
+.chip.on { background: #89b4fa; border-color: #89b4fa; color: #11111b; font-weight: 600; }
+.chip.warn { background: #f9e2af; border-color: #f9e2af; color: #11111b; font-weight: 600; }
+.paused-banner {
+  background: #313244; color: #f9e2af; border-radius: 6px; padding: 5px 8px;
+  margin-bottom: 8px; font-size: 11px; text-align: center;
 }
 .placeholder { color: #6c7086; padding: 20px 0; text-align: center; }
 .static-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }

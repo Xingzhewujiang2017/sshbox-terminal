@@ -23,6 +23,11 @@ use crate::store;
 struct TaskHandle {
     visible: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// User pressed pause: stop collecting but keep the task (and its SSH
+    /// connection) alive so resuming is instant.
+    paused: Arc<AtomicBool>,
+    /// Wakes the sleep early so "sample now" is not stuck behind the interval.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 static REGISTRY: LazyLock<StdMutex<HashMap<SessionId, TaskHandle>>> =
@@ -740,11 +745,15 @@ pub fn spawn(
 
     let visible = Arc::new(AtomicBool::new(true));
     let stop_flag = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(tokio::sync::Notify::new());
     registry().insert(
         sid.clone(),
         TaskHandle {
             visible: visible.clone(),
             stop: stop_flag.clone(),
+            paused: paused.clone(),
+            wake: wake.clone(),
         },
     );
 
@@ -759,7 +768,29 @@ pub fn spawn(
 
         let mut prev = PrevSample::default();
         loop {
-            let interval = store::load_settings().sample_interval_secs.clamp(1, 60);
+            let settings = store::load_settings();
+            let interval = settings.sample_interval_secs.clamp(1, 60);
+            // Idle states (paused / monitor off) poll this often: cheap, no SSH
+            // traffic, and it keeps "resume" feeling instant.
+            const IDLE_POLL_MS: u64 = 400;
+
+            if !settings.monitor_enabled || paused.load(Ordering::SeqCst) {
+                // A stale baseline would turn the first sample after resuming
+                // into a bogus spike (delta over an arbitrarily long window).
+                prev.has_baseline = false;
+                prev.net.clear();
+                prev.diskio.clear();
+                prev.procs.clear();
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(IDLE_POLL_MS)) => {}
+                    _ = wake.notified() => {}
+                }
+                if stop_flag.load(Ordering::SeqCst) || closed.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+
             // Recompute the wait each pass so hidden sessions slow down without
             // accumulating drift the way `interval.tick()` + extra sleep does.
             let wait = if visible.load(Ordering::SeqCst) {
@@ -767,7 +798,11 @@ pub fn spawn(
             } else {
                 interval * 5
             };
-            tokio::time::sleep(Duration::from_secs(wait)).await;
+            // `select!` lets "sample now" cut the wait short.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                _ = wake.notified() => {}
+            }
             if stop_flag.load(Ordering::SeqCst) || closed.load(Ordering::SeqCst) {
                 break;
             }
@@ -795,6 +830,30 @@ pub fn stop(sid: &SessionId) {
 pub fn set_visible(sid: &SessionId, visible: bool) {
     if let Some(t) = registry().get(sid) {
         t.visible.store(visible, Ordering::SeqCst);
+    }
+}
+
+/// Pause/resume collecting for one session. Resuming samples immediately.
+pub fn set_paused(sid: &SessionId, paused: bool) {
+    if let Some(t) = registry().get(sid) {
+        t.paused.store(paused, Ordering::SeqCst);
+        if !paused {
+            t.wake.notify_one();
+        }
+    }
+}
+
+pub fn is_paused(sid: &SessionId) -> bool {
+    registry()
+        .get(sid)
+        .map(|t| t.paused.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+/// Ask the loop to collect right now instead of waiting out the interval.
+pub fn sample_now(sid: &SessionId) {
+    if let Some(t) = registry().get(sid) {
+        t.wake.notify_one();
     }
 }
 
@@ -867,6 +926,57 @@ mod tests {
         assert_eq!(names, vec!["eth1", "eth0"], "down 网卡应被丢弃，忙的排前");
         assert!((m2.net[0].rx_bps - 10000.0).abs() < 1.0, "rx={}", m2.net[0].rx_bps);
         assert_eq!(m2.net[1].rx_bps, 0.0);
+    }
+
+    fn dummy_handle() -> TaskHandle {
+        TaskHandle {
+            visible: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[test]
+    fn pause_state_roundtrips_through_the_registry() {
+        let sid = "unit-test-pause".to_string();
+        registry().insert(sid.clone(), dummy_handle());
+        assert!(!is_paused(&sid));
+        set_paused(&sid, true);
+        assert!(is_paused(&sid), "暂停状态应写入注册表");
+        set_paused(&sid, false);
+        assert!(!is_paused(&sid));
+        registry().remove(&sid);
+        // An unknown session must read as "not paused", not panic.
+        assert!(!is_paused(&sid));
+        set_paused(&sid, true);
+        sample_now(&sid);
+    }
+
+    /// "Sample now" must cut a long sleep short — that is the whole mechanism.
+    #[tokio::test]
+    async fn wake_interrupts_a_long_sleep() {
+        let sid = "unit-test-wake".to_string();
+        registry().insert(sid.clone(), dummy_handle());
+        let wake = registry().get(&sid).unwrap().wake.clone();
+
+        let started = Instant::now();
+        let waiter = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => "slept",
+                _ = wake.notified() => "woken",
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sample_now(&sid);
+
+        let out = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("sample_now 未能在 2s 内唤醒循环")
+            .unwrap();
+        assert_eq!(out, "woken");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        registry().remove(&sid);
     }
 
     #[test]

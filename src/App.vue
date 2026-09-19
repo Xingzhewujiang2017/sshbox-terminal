@@ -323,6 +323,20 @@ async function saveSettings(s: Settings) {
   }
 }
 
+/** Quick interval switch from the monitor panel. The collect loop re-reads
+ * settings every pass, so this needs no monitor restart. */
+async function setSampleInterval(secs: number) {
+  if (!settings.value) return
+  const next = { ...settings.value, sample_interval_secs: secs }
+  try {
+    await api.settingsSet(next)
+    settings.value = next
+    toast('info', `采样间隔已改为 ${secs}s`)
+  } catch (e) {
+    toast('error', `改采样间隔失败: ${(e as Error).message}`)
+  }
+}
+
 async function removeKnownHost(host: string, port: number) {
   try {
     const n = await api.knownHostsRemove(host, port)
@@ -432,7 +446,12 @@ function statusDot(t: Tab) {
           />
         </div>
         <div v-if="monitorVisible && activeTab" class="monitor-area">
-          <MonitorPanel :sid="activeTab.sid" :active="true" />
+          <MonitorPanel
+            :sid="activeTab.sid"
+            :active="true"
+            :interval="settings?.sample_interval_secs ?? 2"
+            @set-interval="setSampleInterval"
+          />
         </div>
       </div>
     </main>

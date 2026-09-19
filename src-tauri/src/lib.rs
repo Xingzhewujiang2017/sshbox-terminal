@@ -25,6 +25,9 @@ pub fn run() {
             ssh::session_alive,
             ssh::monitor_set_visible,
             ssh::monitor_restart,
+            ssh::monitor_set_paused,
+            ssh::monitor_paused,
+            ssh::monitor_sample_now,
             // --- hosts ---
             commands::hosts_list,
             commands::host_save,

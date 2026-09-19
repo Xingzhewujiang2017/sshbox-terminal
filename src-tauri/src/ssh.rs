@@ -635,6 +635,25 @@ pub fn monitor_set_visible(sid: SessionId, visible: bool) -> std::result::Result
     Ok(())
 }
 
+/// Pause/resume the monitor task. Resuming triggers an immediate sample.
+#[tauri::command]
+pub fn monitor_set_paused(sid: SessionId, paused: bool) -> std::result::Result<(), String> {
+    monitor::set_paused(&sid, paused);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn monitor_paused(sid: SessionId) -> bool {
+    monitor::is_paused(&sid)
+}
+
+/// Collect one sample right now instead of waiting out the interval.
+#[tauri::command]
+pub fn monitor_sample_now(sid: SessionId) -> std::result::Result<(), String> {
+    monitor::sample_now(&sid);
+    Ok(())
+}
+
 /// Restart the monitor task of an existing session (used after a settings change).
 #[tauri::command]
 pub async fn monitor_restart(
