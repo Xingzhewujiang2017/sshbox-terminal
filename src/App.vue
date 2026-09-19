@@ -1,157 +1,475 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
+import HostList from './components/HostList.vue'
+import HostDialog from './components/HostDialog.vue'
+import HostKeyDialog from './components/HostKeyDialog.vue'
+import PasswordDialog from './components/PasswordDialog.vue'
+import SettingsDialog from './components/SettingsDialog.vue'
+import {
+  api,
+  SshboxError,
+  type AppPaths,
+  type ErrPayload,
+  type Host,
+  type HostsFile,
+  type KnownHostEntry,
+  type Settings,
+} from './api'
+
+type TabStatus = 'connected' | 'closed' | 'connecting'
 
 interface Tab {
+  /** Stable across reconnects so the xterm scrollback survives. */
+  id: string
   sid: string
   label: string
+  hostId?: string | null
+  host?: Host
+  status: TabStatus
+  attempts: number
+  nextRetryIn?: number
 }
+
+const hosts = ref<HostsFile>({ version: 1, groups: ['默认'], hosts: [] })
+const settings = ref<Settings | null>(null)
+const paths = ref<AppPaths | null>(null)
+const knownHosts = ref<KnownHostEntry[]>([])
 
 const tabs = ref<Tab[]>([])
 const activeIdx = ref(0)
-const showConnect = ref(false)
 const monitorVisible = ref(true)
+const busyHostId = ref<string | null>(null)
+const banner = ref<{ kind: 'error' | 'info'; text: string } | null>(null)
 
-const form = ref({
-  host: '',
-  port: 22,
-  username: 'root',
-  authMode: 'password' as 'password' | 'key',
-  password: '',
-  privateKey: '',
-})
-const connecting = ref(false)
-const connectError = ref('')
+const activeTab = computed(() => tabs.value[activeIdx.value])
 
-async function doConnect() {
-  connecting.value = true
-  connectError.value = ''
+// --- dialogs ---------------------------------------------------------------
+const hostDialog = ref<{ open: boolean; host: Host | null }>({ open: false, host: null })
+const settingsOpen = ref(false)
+const hostKeyPrompt = ref<{ payload: ErrPayload; retry: () => void } | null>(null)
+const passwordPrompt = ref<{
+  payload: ErrPayload
+  hostLabel: string
+  defaultSave: boolean
+  attemptError?: string
+  submit: (password: string, save: boolean) => void
+} | null>(null)
+const confirmState = ref<{ text: string; onOk: () => void } | null>(null)
+
+const settingsRef = ref<InstanceType<typeof SettingsDialog> | null>(null)
+
+function toast(kind: 'error' | 'info', text: string) {
+  banner.value = { kind, text }
+  if (kind === 'info') window.setTimeout(() => (banner.value = null), 4000)
+}
+
+// --- data loading ----------------------------------------------------------
+async function loadAll() {
+  hosts.value = await api.hostsList()
+  settings.value = await api.settingsGet()
+  paths.value = await api.appPaths()
+  knownHosts.value = await api.knownHostsList()
+}
+
+onMounted(async () => {
   try {
-    const sid = await invoke<string>('connect', {
-      params: {
-        host: form.value.host,
-        port: form.value.port,
-        username: form.value.username,
-        password: form.value.authMode === 'password' ? form.value.password : null,
-        private_key: form.value.authMode === 'key' ? form.value.privateKey : null,
-        key_passphrase: null,
-      },
-    })
-    tabs.value.push({ sid, label: `${form.value.username}@${form.value.host}` })
-    activeIdx.value = tabs.value.length - 1
-    showConnect.value = false
-    form.value.password = ''
+    await loadAll()
   } catch (e) {
-    connectError.value = String(e)
-  } finally {
-    connecting.value = false
+    toast('error', `初始化失败: ${(e as Error).message}`)
+  }
+  listen<{ sid: string; host_id?: string; label?: string }>('ssh://closed', (ev) => {
+    const t = tabs.value.find((x) => x.sid === ev.payload.sid)
+    if (t) markClosed(t)
+  })
+  window.addEventListener('keydown', onKey)
+})
+
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
+
+function onKey(e: KeyboardEvent) {
+  if (!e.ctrlKey) return
+  if (e.key === 't' || e.key === 'T') {
+    e.preventDefault()
+    hostDialog.value = { open: true, host: null }
+  } else if (e.key === 'w' || e.key === 'W') {
+    e.preventDefault()
+    if (activeTab.value) closeTab(activeIdx.value)
   }
 }
 
-async function closeTab(i: number) {
-  const t = tabs.value[i]
-  try { await invoke('disconnect', { sid: t.sid }) } catch {}
-  tabs.value.splice(i, 1)
-  if (activeIdx.value >= tabs.value.length) activeIdx.value = Math.max(0, tabs.value.length - 1)
+// --- connecting ------------------------------------------------------------
+function addTab(sid: string, host?: Host, label?: string, id?: string) {
+  const tab: Tab = {
+    id: id ?? sid,
+    sid,
+    label: label ?? (host ? host.name || host.host : 'session'),
+    hostId: host?.id ?? null,
+    host,
+    status: 'connected',
+    attempts: 0,
+  }
+  if (id) {
+    const i = tabs.value.findIndex((t) => t.id === id)
+    if (i >= 0) {
+      tabs.value[i] = { ...tabs.value[i], ...tab }
+      activeIdx.value = i
+      return
+    }
+  }
+  tabs.value.push(tab)
+  activeIdx.value = tabs.value.length - 1
 }
 
-// Handle session closed events (server dropped connection)
-listen<{ sid: string }>('ssh://closed', (e) => {
-  const i = tabs.value.findIndex(t => t.sid === e.payload.sid)
-  if (i >= 0) tabs.value[i].label += ' [已断开]'
+async function connectHost(host: Host, opts: {
+  password?: string
+  keyPassphrase?: string
+  acceptHostKey?: boolean
+  savePassword?: boolean
+  tabId?: string
+} = {}) {
+  busyHostId.value = host.id
+  try {
+    const sid = await api.connectHost({
+      hostId: host.id,
+      password: opts.password,
+      keyPassphrase: opts.keyPassphrase,
+      acceptHostKey: opts.acceptHostKey,
+      savePassword: opts.savePassword,
+    })
+    addTab(sid, host, undefined, opts.tabId)
+    banner.value = null
+  } catch (e) {
+    handleConnectError(e as SshboxError, host, opts)
+  } finally {
+    busyHostId.value = null
+  }
+}
+
+function handleConnectError(err: SshboxError, host: Host, opts: Record<string, unknown>) {
+  const p = err.payload ?? ({ kind: 'unknown', message: err.message } as ErrPayload)
+  switch (p.kind) {
+    case 'host_key_unknown':
+    case 'host_key_changed':
+      hostKeyPrompt.value = {
+        payload: p,
+        retry: () => {
+          hostKeyPrompt.value = null
+          connectHost(host, { ...opts, acceptHostKey: true })
+        },
+      }
+      break
+    case 'need_password':
+    case 'auth_failed':
+    case 'need_passphrase':
+    case 'key_passphrase_wrong':
+      passwordPrompt.value = {
+        payload: p,
+        hostLabel: `${host.username}@${host.host}${host.port !== 22 ? ':' + host.port : ''}`,
+        defaultSave: host.save_password,
+        attemptError: p.kind === 'auth_failed' || p.kind === 'key_passphrase_wrong' ? p.message : undefined,
+        submit: (password, save) => {
+          passwordPrompt.value = null
+          const isPass = p.kind === 'need_passphrase' || p.kind === 'key_passphrase_wrong'
+          connectHost(host, {
+            ...opts,
+            ...(isPass ? { keyPassphrase: password } : { password, savePassword: save }),
+          })
+        },
+      }
+      break
+    default:
+      toast('error', p.message || '连接失败')
+  }
+}
+
+async function trustHostKey() {
+  const prompt = hostKeyPrompt.value
+  if (!prompt) return
+  const p = prompt.payload
+  try {
+    if (p.kind === 'host_key_changed' && p.host) {
+      // Forget the stale entry first, otherwise verification keeps failing.
+      await api.knownHostsRemove(p.host, p.port ?? 22)
+      knownHosts.value = await api.knownHostsList()
+    }
+  } catch (e) {
+    toast('error', `删除旧记录失败: ${(e as Error).message}`)
+    return
+  }
+  prompt.retry()
+}
+
+// --- reconnect -------------------------------------------------------------
+const RETRY_DELAYS = [2, 5, 10, 20]
+
+function markClosed(t: Tab) {
+  t.status = 'closed'
+  const wantAuto = (settings.value?.auto_reconnect ?? true) && (t.host?.auto_reconnect ?? true) && !!t.host
+  if (!wantAuto) return
+  scheduleReconnect(t)
+}
+
+function scheduleReconnect(t: Tab) {
+  const max = settings.value?.reconnect_max_attempts ?? 3
+  if (!t.host || t.attempts >= max) {
+    if (t.attempts > 0) toast('error', `${t.label} 自动重连失败（已尝试 ${t.attempts} 次）`)
+    return
+  }
+  const delay = RETRY_DELAYS[Math.min(t.attempts, RETRY_DELAYS.length - 1)]
+  t.attempts += 1
+  t.status = 'connecting'
+  t.nextRetryIn = delay
+  const tick = window.setInterval(() => {
+    if (t.nextRetryIn !== undefined && t.nextRetryIn > 0) t.nextRetryIn -= 1
+  }, 1000)
+  window.setTimeout(async () => {
+    window.clearInterval(tick)
+    t.nextRetryIn = undefined
+    if (t.status !== 'connecting') return
+    await connectHost(t.host!, { tabId: t.id })
+  }, delay * 1000)
+}
+
+function manualReconnect(t: Tab) {
+  t.attempts = 0
+  t.status = 'connecting'
+  connectHost(t.host!, { tabId: t.id })
+}
+
+// --- tabs ------------------------------------------------------------------
+function closeTab(i: number) {
+  const t = tabs.value[i]
+  if (!t) return
+  const doClose = async () => {
+    if (t.status !== 'closed') {
+      try {
+        await api.disconnect(t.sid)
+      } catch {
+        /* session may already be gone */
+      }
+    }
+    tabs.value.splice(i, 1)
+    if (activeIdx.value >= tabs.value.length) activeIdx.value = Math.max(0, tabs.value.length - 1)
+  }
+  if (settings.value?.confirm_on_close_tab && t.status === 'connected') {
+    confirmState.value = { text: `关闭标签「${t.label}」？该 SSH 会话将断开。`, onOk: () => { confirmState.value = null; doClose() } }
+  } else {
+    doClose()
+  }
+}
+
+watch(activeIdx, (idx, old) => {
+  const now = tabs.value[idx]
+  const prev = old !== undefined ? tabs.value[old] : undefined
+  if (now?.sid) api.monitorSetVisible(now.sid, true).catch(() => {})
+  if (prev?.sid) api.monitorSetVisible(prev.sid, false).catch(() => {})
 })
 
-// Tell backend which session's monitor is visible (throttle hidden ones)
-watch(activeIdx, (idx, old) => {
-  if (tabs.value[idx]) invoke('monitor_set_visible', { sid: tabs.value[idx].sid, visible: true })
-  if (old !== undefined && tabs.value[old]) invoke('monitor_set_visible', { sid: tabs.value[old].sid, visible: false })
-})
+// --- host CRUD -------------------------------------------------------------
+async function saveHost(host: Host, password: string | null) {
+  try {
+    await api.hostSave(host, password ?? undefined)
+    hosts.value = await api.hostsList()
+    hostDialog.value = { open: false, host: null }
+    toast('info', `已保存「${host.name || host.host}」`)
+  } catch (e) {
+    toast('error', `保存失败: ${(e as Error).message}`)
+  }
+}
+
+async function deleteHost(host: Host) {
+  confirmState.value = {
+    text: `删除主机「${host.name || host.host}」？同时会删除已保存的密码。`,
+    onOk: async () => {
+      confirmState.value = null
+      try {
+        await api.hostDelete(host.id)
+        hosts.value = await api.hostsList()
+      } catch (e) {
+        toast('error', `删除失败: ${(e as Error).message}`)
+      }
+    },
+  }
+}
+
+function duplicateHost(host: Host) {
+  hostDialog.value = { open: true, host: { ...host, id: '', name: `${host.name} 副本` } }
+}
+
+async function saveSettings(s: Settings) {
+  try {
+    await api.settingsSet(s)
+    settings.value = s
+    toast('info', '设置已保存')
+  } catch (e) {
+    toast('error', `保存设置失败: ${(e as Error).message}`)
+  }
+}
+
+async function removeKnownHost(host: string, port: number) {
+  try {
+    const n = await api.knownHostsRemove(host, port)
+    knownHosts.value = await api.knownHostsList()
+    toast('info', `已删除 ${n} 条记录`)
+  } catch (e) {
+    toast('error', `删除失败: ${(e as Error).message}`)
+  }
+}
+
+async function exportHosts(path: string, includeSecrets: boolean) {
+  try {
+    const n = await api.hostsExport(path, includeSecrets)
+    settingsRef.value?.setIoMsg(`已导出 ${n} 台主机到 ${path}`)
+  } catch (e) {
+    settingsRef.value?.setIoMsg(`导出失败: ${(e as Error).message}`)
+  }
+}
+
+async function importHosts(path: string) {
+  try {
+    const n = await api.hostsImport(path)
+    hosts.value = await api.hostsList()
+    settingsRef.value?.setIoMsg(`已导入 ${n} 台主机`)
+  } catch (e) {
+    settingsRef.value?.setIoMsg(`导入失败: ${(e as Error).message}`)
+  }
+}
+
+async function restartMonitor() {
+  const t = activeTab.value
+  if (!t) return toast('error', '没有活动会话')
+  try {
+    await api.monitorRestart(t.sid)
+    toast('info', '监控任务已重启')
+  } catch (e) {
+    toast('error', (e as Error).message)
+  }
+}
+
+function statusDot(t: Tab) {
+  return t.status === 'connected' ? '#a6e3a1' : t.status === 'connecting' ? '#f9e2af' : '#f38ba8'
+}
 </script>
 
 <template>
   <div class="app">
-    <!-- Sidebar -->
-    <aside class="sidebar">
-      <div class="logo">SSH<span>Box</span></div>
-      <button class="connect-btn" @click="showConnect = true">＋ 新建连接</button>
-      <div class="hint">M3: 主机列表将出现在这里</div>
-    </aside>
+    <HostList
+      :data="hosts"
+      :active-host-id="activeTab?.hostId"
+      :busy-id="busyHostId"
+      @new="hostDialog = { open: true, host: null }"
+      @connect="connectHost($event)"
+      @edit="hostDialog = { open: true, host: $event }"
+      @duplicate="duplicateHost"
+      @delete="deleteHost"
+      @settings="settingsOpen = true"
+    />
 
-    <!-- Main -->
     <main class="main">
-      <!-- Tab bar -->
       <div class="tabbar">
         <div
           v-for="(t, i) in tabs"
-          :key="t.sid"
+          :key="t.id"
           class="tab"
           :class="{ active: i === activeIdx }"
           @click="activeIdx = i"
         >
+          <span class="dot" :style="{ background: statusDot(t) }"></span>
           <span class="tab-label">{{ t.label }}</span>
+          <span v-if="t.status === 'connecting'" class="retry">
+            {{ t.nextRetryIn ? `重连 ${t.nextRetryIn}s` : '重连中…' }}
+          </span>
+          <span v-else-if="t.status === 'closed'" class="retry">已断开</span>
           <span class="tab-close" @click.stop="closeTab(i)">×</span>
         </div>
         <div class="tabbar-right">
-          <button class="icon-btn" @click="monitorVisible = !monitorVisible" title="切换监控面板">
+          <button
+            v-if="activeTab?.status === 'closed'"
+            class="reconnect-btn"
+            @click="manualReconnect(activeTab)"
+          >重连</button>
+          <button class="icon-btn" title="切换监控面板" @click="monitorVisible = !monitorVisible">
             {{ monitorVisible ? '◧' : '◨' }}
           </button>
         </div>
       </div>
 
-      <!-- Content -->
+      <div v-if="banner" class="banner" :class="banner.kind">
+        <span>{{ banner.text }}</span>
+        <button @click="banner = null">×</button>
+      </div>
+
       <div class="content">
         <div class="term-area">
-          <div v-if="tabs.length === 0" class="empty">
+          <div v-if="!tabs.length" class="empty">
             <div class="empty-title">SSHBox</div>
-            <div>SSH 终端 + 虚拟机实时监控</div>
-            <button class="connect-btn" @click="showConnect = true">连接一台主机</button>
+            <div class="empty-sub">SSH 终端 + 虚拟机实时监控</div>
+            <button class="connect-btn" @click="hostDialog = { open: true, host: null }">新建连接</button>
+            <div class="empty-hint">左侧主机列表双击即可连接 · Ctrl+T 新建 · Ctrl+W 关闭</div>
           </div>
           <TerminalPane
             v-for="(t, i) in tabs"
-            :key="t.sid"
+            :key="t.id"
             :sid="t.sid"
             :active="i === activeIdx"
           />
         </div>
-        <div v-if="monitorVisible && tabs.length" class="monitor-area">
-          <MonitorPanel :sid="tabs[activeIdx].sid" :active="true" />
+        <div v-if="monitorVisible && activeTab" class="monitor-area">
+          <MonitorPanel :sid="activeTab.sid" :active="true" />
         </div>
       </div>
     </main>
 
-    <!-- Connect dialog -->
-    <div v-if="showConnect" class="modal-mask" @click.self="showConnect = false">
-      <div class="modal">
-        <h3>新建 SSH 连接</h3>
-        <label>主机地址</label>
-        <div class="host-row">
-          <input v-model="form.host" placeholder="192.168.x.x 或域名" autofocus />
-          <input v-model.number="form.port" type="number" class="port" />
-        </div>
-        <label>用户名</label>
-        <input v-model="form.username" />
-        <label>认证方式</label>
-        <div class="auth-row">
-          <button :class="{ sel: form.authMode === 'password' }" @click="form.authMode = 'password'">密码</button>
-          <button :class="{ sel: form.authMode === 'key' }" @click="form.authMode = 'key'">私钥</button>
-        </div>
-        <template v-if="form.authMode === 'password'">
-          <label>密码</label>
-          <input v-model="form.password" type="password" @keyup.enter="doConnect" />
-        </template>
-        <template v-else>
-          <label>私钥内容 (OpenSSH 格式)</label>
-          <textarea v-model="form.privateKey" rows="5" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
-        </template>
-        <div v-if="connectError" class="error">{{ connectError }}</div>
-        <div class="modal-btns">
-          <button @click="showConnect = false">取消</button>
-          <button class="primary" :disabled="connecting || !form.host" @click="doConnect">
-            {{ connecting ? '连接中…' : '连接' }}
-          </button>
+    <HostDialog
+      v-if="hostDialog.open"
+      :host="hostDialog.host"
+      :groups="hosts.groups"
+      :existing-groups="hosts.groups"
+      @save="saveHost"
+      @close="hostDialog = { open: false, host: null }"
+    />
+
+    <HostKeyDialog
+      v-if="hostKeyPrompt"
+      :payload="hostKeyPrompt.payload"
+      @trust="trustHostKey"
+      @cancel="hostKeyPrompt = null"
+    />
+
+    <PasswordDialog
+      v-if="passwordPrompt"
+      :payload="passwordPrompt.payload"
+      :host-label="passwordPrompt.hostLabel"
+      :default-save="passwordPrompt.defaultSave"
+      :attempt-error="passwordPrompt.attemptError"
+      @submit="(pw, save) => passwordPrompt?.submit(pw, save)"
+      @cancel="passwordPrompt = null"
+    />
+
+    <SettingsDialog
+      v-if="settingsOpen && settings"
+      ref="settingsRef"
+      :settings="settings"
+      :paths="paths"
+      :known-hosts="knownHosts"
+      :host-count="hosts.hosts.length"
+      @save="saveSettings"
+      @close="settingsOpen = false"
+      @remove-known-host="removeKnownHost"
+      @export-hosts="exportHosts"
+      @import-hosts="importHosts"
+      @restart-monitor="restartMonitor"
+    />
+
+    <div v-if="confirmState" class="modal-mask" @click.self="confirmState = null">
+      <div class="confirm">
+        <div class="confirm-text">{{ confirmState.text }}</div>
+        <div class="confirm-btns">
+          <button @click="confirmState = null">取消</button>
+          <button class="danger" @click="confirmState.onOk()">确定</button>
         </div>
       </div>
     </div>
@@ -166,18 +484,6 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #1111
 
 <style scoped>
 .app { display: flex; height: 100vh; }
-.sidebar {
-  width: 180px; background: #11111b; border-right: 1px solid #313244;
-  padding: 12px; display: flex; flex-direction: column; gap: 10px;
-}
-.logo { font-size: 18px; font-weight: 700; color: #cdd6f4; }
-.logo span { color: #89b4fa; }
-.connect-btn {
-  background: #89b4fa; color: #11111b; border: none; border-radius: 6px;
-  padding: 8px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
-}
-.connect-btn:hover { background: #b4befe; }
-.hint { color: #45475a; font-size: 11px; }
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .tabbar {
   display: flex; background: #181825; border-bottom: 1px solid #313244;
@@ -186,52 +492,55 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #1111
 .tab {
   display: flex; align-items: center; gap: 6px; padding: 8px 12px;
   font-size: 12px; color: #a6adc8; cursor: pointer; border-right: 1px solid #313244;
-  max-width: 220px;
+  max-width: 260px;
 }
 .tab.active { background: #1e1e2e; color: #cdd6f4; border-top: 2px solid #89b4fa; }
+.dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.retry { font-size: 10px; color: #f9e2af; }
 .tab-close { color: #6c7086; font-size: 14px; }
 .tab-close:hover { color: #f38ba8; }
-.tabbar-right { margin-left: auto; padding-right: 8px; }
+.tabbar-right { margin-left: auto; padding-right: 8px; display: flex; align-items: center; gap: 8px; }
 .icon-btn { background: none; border: none; color: #a6adc8; cursor: pointer; font-size: 16px; }
+.reconnect-btn {
+  background: #a6e3a1; color: #11111b; border: none; border-radius: 5px;
+  padding: 3px 10px; font-size: 11.5px; font-weight: 600; cursor: pointer;
+}
+.banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 7px 12px; font-size: 12px; border-bottom: 1px solid #313244;
+}
+.banner.error { background: #2b1c22; color: #f38ba8; }
+.banner.info { background: #1b2b1e; color: #a6e3a1; }
+.banner button { background: none; border: none; color: inherit; cursor: pointer; font-size: 14px; }
 .content { flex: 1; display: flex; min-height: 0; }
 .term-area { flex: 1; min-width: 0; position: relative; background: #1e1e2e; }
-.monitor-area { width: 300px; border-left: 1px solid #313244; min-width: 220px; }
+.monitor-area { width: 320px; border-left: 1px solid #313244; min-width: 240px; }
 .empty {
   height: 100%; display: flex; flex-direction: column; gap: 12px;
   align-items: center; justify-content: center; color: #6c7086;
 }
 .empty-title { font-size: 28px; font-weight: 700; color: #89b4fa; }
+.empty-sub { font-size: 13px; }
+.empty-hint { font-size: 11px; color: #45475a; }
+.connect-btn {
+  background: #89b4fa; color: #11111b; border: none; border-radius: 6px;
+  padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.connect-btn:hover { background: #b4befe; }
 .modal-mask {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-  display: flex; align-items: center; justify-content: center; z-index: 100;
+  display: flex; align-items: center; justify-content: center; z-index: 120;
 }
-.modal {
+.confirm {
   background: #1e1e2e; border: 1px solid #313244; border-radius: 10px;
-  padding: 20px; width: 400px; display: flex; flex-direction: column; gap: 6px;
+  padding: 18px; width: 380px; display: flex; flex-direction: column; gap: 14px;
 }
-.modal h3 { margin-bottom: 8px; }
-.modal label { font-size: 11px; color: #a6adc8; margin-top: 6px; }
-.modal input, .modal textarea {
-  background: #11111b; border: 1px solid #313244; border-radius: 6px;
-  color: #cdd6f4; padding: 8px; font-size: 13px; width: 100%; box-sizing: border-box;
-  font-family: inherit;
-}
-.modal input:focus, .modal textarea:focus { outline: 1px solid #89b4fa; }
-.host-row { display: flex; gap: 8px; }
-.host-row .port { width: 80px; flex-shrink: 0; }
-.auth-row { display: flex; gap: 8px; }
-.auth-row button {
-  flex: 1; background: #11111b; border: 1px solid #313244; color: #a6adc8;
-  border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px;
-}
-.auth-row button.sel { border-color: #89b4fa; color: #89b4fa; }
-.error { color: #f38ba8; font-size: 12px; margin-top: 8px; word-break: break-all; }
-.modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
-.modal-btns button {
-  padding: 8px 16px; border-radius: 6px; border: 1px solid #313244;
+.confirm-text { font-size: 13px; color: #cdd6f4; line-height: 1.6; }
+.confirm-btns { display: flex; gap: 8px; justify-content: flex-end; }
+.confirm-btns button {
+  padding: 7px 16px; border-radius: 6px; border: 1px solid #313244;
   background: #11111b; color: #a6adc8; cursor: pointer; font-size: 13px;
 }
-.modal-btns .primary { background: #89b4fa; color: #11111b; border: none; font-weight: 600; }
-.modal-btns .primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.confirm-btns .danger { background: #f38ba8; color: #11111b; border: none; font-weight: 600; }
 </style>

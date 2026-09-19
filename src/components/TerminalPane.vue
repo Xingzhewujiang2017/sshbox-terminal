@@ -2,7 +2,7 @@
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import { invoke } from '@tauri-apps/api/core'
+import { api } from '../api'
 import { listen } from '@tauri-apps/api/event'
 
 const props = defineProps<{ sid: string; active: boolean }>()
@@ -12,12 +12,26 @@ let term: Terminal | null = null
 let fit: FitAddon | null = null
 let unlisten: (() => void) | null = null
 let ro: ResizeObserver | null = null
+let resizeTimer: number | undefined
+let currentSid = ''
 
 function b64decode(b64: string): Uint8Array {
   const bin = atob(b64)
   const bytes = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
   return bytes
+}
+
+function pushSize() {
+  if (!term) return
+  api.termResize(currentSid, term.cols, term.rows).catch(() => {})
+}
+
+function doResize() {
+  if (!term || !fit) return
+  fit.fit()
+  clearTimeout(resizeTimer)
+  resizeTimer = window.setTimeout(pushSize, 100)
 }
 
 onMounted(async () => {
@@ -31,7 +45,7 @@ onMounted(async () => {
       cursor: '#f5e0dc',
       selectionBackground: '#45475a',
     },
-    scrollback: 5000,
+    scrollback: 10000,
   })
   fit = new FitAddon()
   term.loadAddon(fit)
@@ -39,31 +53,34 @@ onMounted(async () => {
   fit.fit()
 
   term.onData((data) => {
-    invoke('term_write', { sid: props.sid, data })
+    if (!currentSid) return
+    api.termWrite(currentSid, data).catch(() => {})
   })
 
-  // Push resize to PTY (debounced)
-  let resizeTimer: number | undefined
-  const doResize = () => {
-    if (!term || !fit) return
-    fit.fit()
-    clearTimeout(resizeTimer)
-    resizeTimer = window.setTimeout(() => {
-      invoke('term_resize', { sid: props.sid, cols: term!.cols, rows: term!.rows })
-    }, 100)
-  }
   ro = new ResizeObserver(doResize)
   ro.observe(termEl.value!)
 
+  // The listener reads the *current* sid, so a reconnect does not need to
+  // re-subscribe and the scrollback above the reconnect marker is preserved.
   unlisten = await listen<{ sid: string; data: string }>('ssh://data', (e) => {
-    if (e.payload.sid === props.sid) {
-      term?.write(b64decode(e.payload.data))
-    }
+    if (e.payload.sid === currentSid) term?.write(b64decode(e.payload.data))
   })
 
-  // Sync initial size
-  invoke('term_resize', { sid: props.sid, cols: term.cols, rows: term.rows })
+  currentSid = props.sid
+  pushSize()
 })
+
+watch(
+  () => props.sid,
+  (sid, old) => {
+    if (!sid || sid === old) return
+    currentSid = sid
+    term?.writeln('')
+    term?.writeln('\x1b[33m─── 已重新连接 ───\x1b[0m')
+    if (fit) fit.fit()
+    pushSize()
+  }
+)
 
 watch(
   () => props.active,
@@ -71,7 +88,7 @@ watch(
     if (a && term && fit) {
       fit.fit()
       term.focus()
-      invoke('term_resize', { sid: props.sid, cols: term.cols, rows: term.rows })
+      pushSize()
     }
   }
 )
@@ -79,6 +96,7 @@ watch(
 onBeforeUnmount(() => {
   unlisten?.()
   ro?.disconnect()
+  clearTimeout(resizeTimer)
   term?.dispose()
 })
 </script>

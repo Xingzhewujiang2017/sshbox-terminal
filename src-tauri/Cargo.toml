@@ -24,6 +24,10 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 log = "0.4"
+keyring = "4.2.0"
+dirs = "7.0.0"
+chrono = "0.4.45"
+tauri-plugin-log = "2.9.1"
 
 [profile.release]
 codegen-units = 1
