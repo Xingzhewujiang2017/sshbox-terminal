@@ -40,6 +40,14 @@ fn mono_secs() -> f64 {
     MONO_START.elapsed().as_secs_f64()
 }
 
+/// Unix wall-clock seconds — display only, never used for rate math.
+fn wall_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct Metrics {
     pub ts: f64,
@@ -55,6 +63,23 @@ pub struct Metrics {
     pub disk_io: Vec<DiskIo>,
     pub disks: Vec<DiskUsage>,
     pub load: Vec<f64>,
+    /// Top processes by instantaneous CPU, sorted descending.
+    pub processes: Vec<ProcInfo>,
+    /// Total number of processes visible in /proc for this sample.
+    pub proc_total: usize,
+}
+
+/// One process row.
+///
+/// CPU is instantaneous — Δ(utime+stime) over Δwall — expressed as a
+/// percentage of ONE core, which is what `top` shows, so it can exceed 100%.
+#[derive(Debug, Serialize, Clone)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub name: String,
+    pub state: String,
+    pub cpu_pct: f64,
+    pub rss_kb: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -82,6 +107,19 @@ echo "@@NET@@"; cat /proc/net/dev 2>/dev/null
 echo "@@DISKIO@@"; cat /proc/diskstats 2>/dev/null
 echo "@@DF@@"; df -P -k 2>/dev/null
 echo "@@LOAD@@"; cat /proc/loadavg 2>/dev/null
+echo "@@SYS@@ hz=$(getconf CLK_TCK 2>/dev/null || echo 100) pagesize=$(getconf PAGESIZE 2>/dev/null || echo 4096)"
+# Processes, builtins only (read/echo) so 200+ procs stay cheap.
+# /proc/<pid>/stat fields after "pid (comm) ": 1=state 12=utime 13=stime 22=rss
+echo "@@PROC@@"
+for d in /proc/[0-9]*; do
+  IFS= read -r st < "$d/stat" 2>/dev/null || continue
+  comm=${st#*(}; comm=${comm%%)*}
+  rest=${st##*) }
+  [ -n "$rest" ] || continue
+  set -- $rest
+  # ${12} braces are mandatory: "$12" is $1 followed by a literal 2 in POSIX sh.
+  echo "${d#/proc/}|$comm|$1|${12}|${13}|${22}"
+done
 echo "@@END@@"
 "#;
 
@@ -362,6 +400,7 @@ struct PrevSample {
     per_core: Vec<(u64, u64)>,          // (total, idle)
     net: HashMap<String, (u64, u64)>,   // rx, tx bytes
     diskio: HashMap<String, (u64, u64)>, // read sectors, write sectors
+    procs: HashMap<u32, u64>,            // pid -> utime+stime ticks
 }
 
 fn parse_remote_ts(s: &HashMap<String, Vec<String>>) -> Option<f64> {
@@ -374,6 +413,82 @@ fn parse_remote_ts(s: &HashMap<String, Vec<String>>) -> Option<f64> {
     cleaned.parse::<f64>().ok().filter(|t| *t > 0.0)
 }
 
+/// Kernel constants from `@@SYS@@` — (CLK_TCK, page size). Both keep sane
+/// defaults so a stripped-down busybox image still yields usable numbers.
+fn parse_sys(s: &HashMap<String, Vec<String>>) -> (f64, f64) {
+    let line = s
+        .get("SYS")
+        .and_then(|v| v.first())
+        .cloned()
+        .unwrap_or_default();
+    let mut hz = 100.0f64;
+    let mut page = 4096.0f64;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("hz=") {
+            hz = v.parse::<f64>().unwrap_or(100.0).max(1.0);
+        } else if let Some(v) = tok.strip_prefix("pagesize=") {
+            page = v.parse::<f64>().unwrap_or(4096.0).max(1.0);
+        }
+    }
+    (hz, page)
+}
+
+/// Turn `@@PROC@@` rows into per-process CPU by differencing tick counters
+/// against the previous sample. Sorted CPU desc then RSS desc, top N only —
+/// a process that just appeared has no baseline and reports 0.
+fn parse_procs(
+    lines: Option<&Vec<String>>,
+    prev: &mut PrevSample,
+    dt: f64,
+    hz: f64,
+    page_size: f64,
+    top_n: usize,
+) -> (Vec<ProcInfo>, usize) {
+    let mut current: HashMap<u32, u64> = HashMap::new();
+    let mut rows: Vec<ProcInfo> = Vec::new();
+    let mut total = 0usize;
+
+    if let Some(ls) = lines {
+        for line in ls {
+            let f: Vec<&str> = line.split('|').collect();
+            if f.len() < 6 {
+                continue;
+            }
+            let Ok(pid) = f[0].trim().parse::<u32>() else {
+                continue;
+            };
+            total += 1;
+            let ticks = f[3].trim().parse::<u64>().unwrap_or(0)
+                + f[4].trim().parse::<u64>().unwrap_or(0);
+            let rss_pages = f[5].trim().parse::<u64>().unwrap_or(0);
+            let cpu_pct = match prev.procs.get(&pid) {
+                Some(&before) if dt > 0.0 => {
+                    ticks.saturating_sub(before) as f64 / (dt * hz) * 100.0
+                }
+                _ => 0.0,
+            };
+            rows.push(ProcInfo {
+                pid,
+                name: f[1].to_string(),
+                state: f[2].to_string(),
+                cpu_pct,
+                rss_kb: (rss_pages as f64 * page_size / 1024.0) as u64,
+            });
+            current.insert(pid, ticks);
+        }
+    }
+
+    prev.procs = current;
+    rows.sort_by(|a, b| {
+        b.cpu_pct
+            .partial_cmp(&a.cpu_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.rss_kb.cmp(&a.rss_kb))
+    });
+    rows.truncate(top_n);
+    (rows, total)
+}
+
 fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     let s = sections(raw);
 
@@ -383,8 +498,10 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     } else {
         0.0
     };
-    // Display timestamp: prefer the VM's own clock, fall back to ours.
-    let ts = parse_remote_ts(&s).unwrap_or(now);
+    // Display timestamp: prefer the VM's own clock, fall back to *wall* time.
+    // The monotonic clock is for dt only — on Windows its resolution is
+    // ~15.6 ms, so a fallback taken from it can legitimately read 0.0.
+    let ts = parse_remote_ts(&s).unwrap_or_else(wall_secs);
     prev.mono_ts = now;
     prev.has_baseline = true;
 
@@ -560,6 +677,11 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
         })
         .unwrap_or_default();
 
+    // --- processes (top N by instantaneous CPU) ---
+    let (hz, page_size) = parse_sys(&s);
+    let top_n = store::load_settings().process_top_n.clamp(1, 100) as usize;
+    let (processes, proc_total) = parse_procs(s.get("PROC"), prev, dt, hz, page_size, top_n);
+
     Some(Metrics {
         ts,
         cpu_pct,
@@ -573,6 +695,8 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
         disk_io,
         disks,
         load,
+        processes,
+        proc_total,
     })
 }
 
@@ -724,6 +848,49 @@ mod tests {
     }
 
     #[test]
+    fn procs_diff_ticks_into_cpu_and_sort() {
+        // hz=100 ⇒ 100 ticks over a 1s window is exactly one busy core.
+        let raw1 = "@@SYS@@ hz=100 pagesize=4096\n@@PROC@@\n1|systemd|S|10|0|500\n2|bash|S|5|0|100\n@@END@@\n";
+        let raw2 = "@@SYS@@ hz=100 pagesize=4096\n@@PROC@@\n1|systemd|S|30|0|500\n2|bash|S|105|0|100\n@@END@@\n";
+        let mut prev = PrevSample::default();
+        let m1 = parse_metrics(raw1, &mut prev).unwrap();
+        assert_eq!(m1.proc_total, 2);
+        assert!(m1.processes.iter().all(|p| p.cpu_pct == 0.0), "首样本无基线应为 0");
+        assert_eq!(m1.processes[0].rss_kb, 500 * 4096 / 1024, "RSS 页→KB 换算");
+
+        prev.mono_ts = mono_secs() - 1.0;
+        prev.has_baseline = true;
+        let m2 = parse_metrics(raw2, &mut prev).unwrap();
+        assert!((m2.processes[0].cpu_pct - 100.0).abs() < 1.0, "top={:?}", m2.processes[0]);
+        assert_eq!(m2.processes[0].name, "bash", "应按 CPU 降序");
+        assert!((m2.processes[1].cpu_pct - 20.0).abs() < 1.0, "20 ticks → 20%");
+        assert_eq!(m2.processes[1].pid, 1);
+    }
+
+    #[test]
+    fn proc_top_n_is_respected() {
+        let mut raw = String::from("@@SYS@@ hz=100 pagesize=4096\n@@PROC@@\n");
+        for pid in 1..=40 {
+            raw.push_str(&format!("{pid}|p{pid}|S|0|0|1\n"));
+        }
+        raw.push_str("@@END@@\n");
+        let mut prev = PrevSample::default();
+        let m = parse_metrics(&raw, &mut prev).unwrap();
+        assert_eq!(m.proc_total, 40);
+        assert!(m.processes.len() <= 100, "截断后不应超过上限");
+    }
+
+    #[test]
+    fn sys_defaults_when_section_missing() {
+        let mut s: HashMap<String, Vec<String>> = HashMap::new();
+        assert_eq!(parse_sys(&s), (100.0, 4096.0));
+        s.insert("SYS".into(), vec!["hz=250 pagesize=16384".into()]);
+        assert_eq!(parse_sys(&s), (250.0, 16384.0));
+        s.insert("SYS".into(), vec!["hz=abc pagesize=".into()]);
+        assert_eq!(parse_sys(&s), (100.0, 4096.0));
+    }
+
+    #[test]
     fn missing_remote_ts_still_yields_rates() {
         // busybox `date +%s.%N` prints garbage ⇒ no usable @@TS@@ value.
         // Totals 1000→2000 ticks, idle 500→1000 over 1s ⇒ 50% busy.
@@ -866,7 +1033,22 @@ mod live_tests {
         assert!((0.0..=100.0).contains(&m2.mem_pct), "内存百分比越界: {}", m2.mem_pct);
         assert!(m2.cpu_pct >= 0.0 && m2.cpu_pct <= 100.0, "CPU 百分比越界: {}", m2.cpu_pct);
         assert!(!m2.cpu_per_core.is_empty(), "没有每核数据");
-        assert!(!m2.net.is_empty(), "没有网卡数据");
+        assert!(!m2.net.is_empty());
+        assert!(!m2.processes.is_empty(), "进程表不应为空");
+        assert!(m2.proc_total > 5, "进程总数应 > 5，实际 {}", m2.proc_total);
+        assert!(
+            m2.processes.iter().all(|p| !p.name.is_empty() && p.pid > 0),
+            "每行都应有名字和 pid"
+        );
+        assert!(
+            m2.processes.iter().any(|p| p.rss_kb > 0),
+            "至少一个进程应有非零常驻内存"
+        );
+        eprintln!(
+            "进程总数={} Top3={:?}",
+            m2.proc_total,
+            m2.processes.iter().take(3).collect::<Vec<_>>()
+        );
         assert!(!m2.disks.is_empty(), "没有磁盘数据");
         assert!(m2.ts > 0.0, "时间戳无效");
         // Whole disks only — a partition row here means the filter regressed.
@@ -877,6 +1059,44 @@ mod live_tests {
                 d.name
             );
         }
+    }
+
+    /// Regression guard for the whole process pipeline: a shell loop must show
+    /// up as a hot process. This is what catches shell-level field-index bugs
+    /// (`$12` vs `${12}`) that synthetic unit tests cannot see.
+    #[tokio::test]
+    async fn live_busy_process_reports_cpu() {
+        let Some((host, port, user, pw)) = test_target() else {
+            eprintln!("跳过 live 燃烧测试：未设置 SSHBOX_TEST_HOST / SSHBOX_TEST_PASSWORD");
+            return;
+        };
+        let kh = std::env::temp_dir().join(format!("sshbox-live-kh-burn-{}", std::process::id()));
+        let h = connect_for_test(&host, port, &user, &pw, "accept_new", kh.clone())
+            .await
+            .expect("连接失败（WSL 是否在运行？）");
+
+        // Fire-and-forget burner; want_reply=false so this does not block.
+        let mut burn = h.channel_open_session().await.expect("打开燃烧通道失败");
+        burn.exec(false, "timeout 15 sh -c 'while :; do :; done'")
+            .await
+            .expect("启动燃烧进程失败");
+
+        let raw1 = exec_capture(&h, COLLECT_SCRIPT).await.expect("采样1失败");
+        let mut prev = PrevSample::default();
+        let _ = parse_metrics(&raw1, &mut prev);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let raw2 = exec_capture(&h, COLLECT_SCRIPT).await.expect("采样2失败");
+        let m2 = parse_metrics(&raw2, &mut prev).expect("解析2失败");
+
+        let top = &m2.processes[0];
+        eprintln!("最热进程: {:?}", top);
+        assert!(
+            top.cpu_pct > 50.0,
+            "忙碌进程应 >50% CPU，实际 {:.1}%（说明 tick 字段没取对）",
+            top.cpu_pct
+        );
+        let _ = burn.close().await;
+        let _ = std::fs::remove_file(&kh);
     }
 
     #[tokio::test]

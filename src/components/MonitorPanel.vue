@@ -16,6 +16,7 @@ interface StaticInfo {
 }
 interface NetIf { name: string; rx_bps: number; tx_bps: number }
 interface DiskIo { name: string; read_bps: number; write_bps: number }
+interface ProcInfo { pid: number; name: string; state: string; cpu_pct: number; rss_kb: number }
 interface Metrics {
   ts: number
   cpu_pct: number
@@ -29,6 +30,8 @@ interface Metrics {
   disk_io: DiskIo[]
   disks: StaticInfo['disks']
   load: number[]
+  processes: ProcInfo[]
+  proc_total: number
 }
 
 const props = defineProps<{ sid: string; active: boolean }>()
@@ -188,6 +191,19 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <div class="proc-box">
+        <div class="section-title">
+          进程<span class="proc-count">共 {{ metrics.proc_total }} 个 · 按瞬时 CPU 排序</span>
+        </div>
+        <div class="proc-head"><span>PID</span><span>名称</span><span>CPU</span><span>内存</span></div>
+        <div v-for="p in metrics.processes" :key="p.pid" class="proc-row">
+          <span class="pid">{{ p.pid }}</span>
+          <span class="pname" :title="p.name">{{ p.name }}</span>
+          <span class="pcpu" :class="{ hot: p.cpu_pct > 50 }">{{ p.cpu_pct.toFixed(1) }}%</span>
+          <span class="pmem">{{ fmtKB(p.rss_kb) }}</span>
+        </div>
+      </div>
+
       <div class="chart-box" ref="chartEl"></div>
 
       <div v-if="metrics.load.length" class="load-box">
@@ -242,4 +258,14 @@ onBeforeUnmount(() => {
 .bar-fill.warn { background: #f38ba8; }
 .chart-box { height: 160px; margin-bottom: 8px; }
 .load-box { color: #6c7086; text-align: center; padding: 4px 0; }
+.proc-box { background: #1e1e2e; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.proc-count { color: #6c7086; font-weight: 400; font-size: 10px; margin-left: 6px; }
+.proc-head, .proc-row { display: grid; grid-template-columns: 50px 1fr 52px 66px; gap: 6px; align-items: center; }
+.proc-head { color: #6c7086; font-size: 10px; padding-bottom: 4px; border-bottom: 1px solid #313244; margin-bottom: 4px; }
+.proc-row { padding: 2px 0; font-size: 11px; }
+.proc-row .pid { color: #6c7086; }
+.proc-row .pname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proc-row .pcpu { text-align: right; color: #a6e3a1; }
+.proc-row .pcpu.hot { color: #f38ba8; font-weight: 600; }
+.proc-row .pmem { text-align: right; color: #a6adc8; }
 </style>
