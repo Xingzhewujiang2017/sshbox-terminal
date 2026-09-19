@@ -58,7 +58,6 @@ pub fn run() {
             history::history_hosts,
             history::history_stats,
             history::history_export,
-            ssh::history_bind,
         ])
         .setup(|_app| {
             // Writer thread first: samples may start arriving as soon as a

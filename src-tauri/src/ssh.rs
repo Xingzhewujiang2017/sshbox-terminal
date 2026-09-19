@@ -545,6 +545,12 @@ async fn do_connect(
         info: info.clone(),
         closed: closed.clone(),
     };
+    // Bind before the monitor task starts: otherwise the very first sample can
+    // be filed under a temporary key while a frontend round-trip is still in
+    // flight, splitting one machine's history in two.
+    if let Some(h) = params.host_id.as_deref().filter(|h| !h.is_empty()) {
+        history::bind(&sid, h);
+    }
     state
         .sessions
         .lock()
@@ -655,20 +661,6 @@ pub fn monitor_paused(sid: SessionId) -> bool {
 #[tauri::command]
 pub fn monitor_sample_now(sid: SessionId) -> std::result::Result<(), String> {
     monitor::sample_now(&sid);
-    Ok(())
-}
-
-/// Tell the history store which saved host a session belongs to.
-///
-/// Session ids are per-connection uuids, so without this every reconnect would
-/// start a fresh history series for the same machine. Called by the frontend
-/// right after connecting; sessions without a saved host keep a temporary key.
-#[tauri::command]
-pub fn history_bind(sid: SessionId, host_id: Option<String>) -> std::result::Result<(), String> {
-    match host_id {
-        Some(h) if !h.is_empty() => history::bind(&sid, &h),
-        _ => history::unbind(&sid),
-    }
     Ok(())
 }
 

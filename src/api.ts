@@ -109,6 +109,48 @@ export interface Settings {
   history_retention_days: number
 }
 
+// --- live metrics (shared by the monitor panel and the fleet overview) ---
+
+export interface DiskUsage {
+  mount: string
+  total_kb: number
+  used_kb: number
+  use_pct: number
+}
+export interface NetIf {
+  name: string
+  rx_bps: number
+  tx_bps: number
+}
+export interface DiskIo {
+  name: string
+  read_bps: number
+  write_bps: number
+}
+export interface ProcInfo {
+  pid: number
+  name: string
+  state: string
+  cpu_pct: number
+  rss_kb: number
+}
+export interface Metrics {
+  ts: number
+  cpu_pct: number
+  cpu_per_core: number[]
+  mem_total_kb: number
+  mem_used_kb: number
+  mem_pct: number
+  swap_total_kb: number
+  swap_used_kb: number
+  net: NetIf[]
+  disk_io: DiskIo[]
+  disks: DiskUsage[]
+  load: number[]
+  processes: ProcInfo[]
+  proc_total: number
+}
+
 // --- history ---
 
 export interface HistoryBucket {
@@ -257,8 +299,6 @@ export const api = {
   monitorSampleNow: (sid: string) => call<void>('monitor_sample_now', { sid }),
 
   // history
-  historyBind: (sid: string, hostId: string | null) =>
-    call<void>('history_bind', { sid, hostId }),
   historyRange: (hostId: string, from: number, to: number, maxPoints?: number) =>
     call<HistoryRange>('history_range', {
       hostId,

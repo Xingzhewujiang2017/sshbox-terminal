@@ -2,7 +2,7 @@
 import { onMounted, onBeforeUnmount, ref, computed, nextTick } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
-import { api } from '../api'
+import { api, type DiskUsage, type Metrics } from '../api'
 
 interface StaticInfo {
   hostname: string
@@ -13,11 +13,8 @@ interface StaticInfo {
   cpu_cores: number
   mem_total_kb: number
   uptime_secs: number
-  disks: { mount: string; total_kb: number; used_kb: number; use_pct: number }[]
+  disks: DiskUsage[]
 }
-interface NetIf { name: string; rx_bps: number; tx_bps: number }
-interface DiskIo { name: string; read_bps: number; write_bps: number }
-interface ProcInfo { pid: number; name: string; state: string; cpu_pct: number; rss_kb: number }
 interface FailedUnit { name: string; desc: string }
 interface PortInfo { proto: string; port: number; addrs: string[] }
 interface ContainerInfo { name: string; image: string; status: string }
@@ -28,23 +25,6 @@ interface ServiceInfo {
   containers: ContainerInfo[]
   docker_available: boolean
 }
-interface Metrics {
-  ts: number
-  cpu_pct: number
-  cpu_per_core: number[]
-  mem_total_kb: number
-  mem_used_kb: number
-  mem_pct: number
-  swap_total_kb: number
-  swap_used_kb: number
-  net: NetIf[]
-  disk_io: DiskIo[]
-  disks: StaticInfo['disks']
-  load: number[]
-  processes: ProcInfo[]
-  proc_total: number
-}
-
 const props = defineProps<{ sid: string; active: boolean; interval: number }>()
 const emit = defineEmits<{ (e: 'setInterval', secs: number): void }>()
 

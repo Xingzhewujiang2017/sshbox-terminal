@@ -3,9 +3,11 @@ import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
+import { disposeFleet, forgetSession, initFleet } from './fleet'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
+import OverviewPanel from './components/OverviewPanel.vue'
 import HostList from './components/HostList.vue'
 import HostDialog from './components/HostDialog.vue'
 import HostKeyDialog from './components/HostKeyDialog.vue'
@@ -55,6 +57,7 @@ const activeTab = computed(() => tabs.value[activeIdx.value])
 const hostDialog = ref<{ open: boolean; host: Host | null }>({ open: false, host: null })
 const settingsOpen = ref(false)
 const historyOpen = ref(false)
+const overviewOpen = ref(false)
 const hostKeyPrompt = ref<{ payload: ErrPayload; retry: () => void } | null>(null)
 const passwordPrompt = ref<{
   payload: ErrPayload
@@ -101,6 +104,9 @@ async function loadAll() {
 }
 
 onMounted(async () => {
+  // Subscribe to every session's metrics once, for the whole app: the monitor
+  // panel only hears its own tab, which is why an overview needs this.
+  await initFleet()
   try {
     await loadAll()
   } catch (e) {
@@ -119,7 +125,10 @@ onMounted(async () => {
   window.addEventListener('keydown', onKey)
 })
 
-onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKey)
+  disposeFleet()
+})
 
 function onKey(e: KeyboardEvent) {
   if (!e.ctrlKey) return
@@ -130,6 +139,23 @@ function onKey(e: KeyboardEvent) {
     e.preventDefault()
     if (activeTab.value) closeTab(activeIdx.value)
   }
+}
+
+/** Jump to the tab holding a session (used by the overview). */
+function focusTab(sid: string) {
+  const i = tabs.value.findIndex((t) => t.sid === sid)
+  if (i >= 0) {
+    activeIdx.value = i
+    overviewOpen.value = false
+  }
+}
+
+/** Connect a saved host from the overview — one host, never a batch. */
+function connectFromOverview(hostId: string) {
+  const host = hosts.value.hosts.find((h) => h.id === hostId)
+  if (!host) return
+  overviewOpen.value = false
+  void connectHost(host)
 }
 
 /** Show an exported file in Explorer. */
@@ -143,10 +169,8 @@ async function revealExport(path: string) {
 
 // --- connecting ------------------------------------------------------------
 function addTab(sid: string, host?: Host, label?: string, id?: string) {
-  // Tell the history store which saved host this session belongs to. Session
-  // ids are per-connection uuids, so without this every reconnect would look
-  // like a brand new machine in the history.
-  void api.historyBind(sid, host?.id ?? null)
+  // History ownership is bound backend-side at connect time, so there is no
+  // frontend round-trip to race with the first sample.
   const tab: Tab = {
     id: id ?? sid,
     sid,
@@ -310,6 +334,7 @@ function closeTab(i: number) {
       }
     }
     tabs.value.splice(i, 1)
+    forgetSession(t.sid)
     if (activeIdx.value >= tabs.value.length) activeIdx.value = Math.max(0, tabs.value.length - 1)
   }
   if (settings.value?.confirm_on_close_tab && t.status === 'connected') {
@@ -463,6 +488,9 @@ function statusDot(t: Tab) {
             class="reconnect-btn"
             @click="manualReconnect(activeTab)"
           >重连</button>
+          <button class="icon-btn" title="总览（所有已连接主机）" @click="overviewOpen = true">
+            总览
+          </button>
           <button class="icon-btn" title="历史回看（落盘数据）" @click="historyOpen = true">
             历史
           </button>
@@ -502,6 +530,17 @@ function statusDot(t: Tab) {
         </div>
       </div>
     </main>
+
+    <OverviewPanel
+      v-if="overviewOpen"
+      :tabs="tabs"
+      :hosts="hosts"
+      :interval="settings?.sample_interval_secs ?? 2"
+      :active-sid="activeTab?.sid"
+      @close="overviewOpen = false"
+      @focus="focusTab"
+      @connect="connectFromOverview"
+    />
 
     <HistoryPanel
       v-if="historyOpen"
