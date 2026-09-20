@@ -1,8 +1,22 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import type { AppPaths, KnownHostEntry, Settings } from '../api'
 import type { ThemeMode } from '../theme'
 import AiSettingsPane from './AiSettingsPane.vue'
+import { getVersion } from '@tauri-apps/api/app'
+
+/** 版本号从打包信息读，不在前端硬编码 —— 免得"关于页写的版本"和"装出来的版本"不一致。 */
+const version = ref('…')
+const versionSource = ref('读取中…')
+onMounted(async () => {
+  try {
+    version.value = await getVersion()
+    versionSource.value = '来自打包信息'
+  } catch (e) {
+    version.value = '未知'
+    versionSource.value = `读取失败：${(e as Error).message}`
+  }
+})
 
 const props = defineProps<{
   settings: Settings
@@ -275,9 +289,10 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
 
       <!-- 关于 -->
       <div v-else class="pane">
-        <div class="about-title">SSHBox</div>
-        <div class="hintline">SSH 终端 + 虚拟机实时监控 · 开源 (MIT)</div>
+        <div class="about-title">SSHBox <span class="about-ver">v{{ version }}</span></div>
+        <div class="hintline">SSH 终端 + 虚拟机实时监控 + AI 助手 · 开源 (MIT)</div>
         <div class="paths">
+          <div class="p"><span>版本</span><code>{{ version }}（{{ versionSource }}）</code></div>
           <div class="p"><span>配置目录</span><code>{{ paths?.data_dir }}</code></div>
           <div class="p"><span>主机列表</span><code>{{ paths?.hosts_json }}</code></div>
           <div class="p"><span>设置</span><code>{{ paths?.settings_json }}</code></div>
@@ -401,6 +416,7 @@ input:focus { outline: 1px solid var(--ctp-blue); }
 .sep { height: 1px; background: var(--ctp-surface0); margin: 14px 0 4px; }
 .msg { font-size: 11.5px; color: var(--ctp-green); margin-top: 8px; }
 .about-title { font-size: 20px; font-weight: 700; color: var(--ctp-blue); }
+.about-ver { color: var(--ctp-overlay0); font-size: 12px; font-weight: 400; }
 .paths { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
 .p { display: flex; gap: 10px; font-size: 11.5px; }
 .p span { color: var(--ctp-overlay0); min-width: 84px; flex-shrink: 0; }

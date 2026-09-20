@@ -492,31 +492,49 @@ fn apply_headers(
 }
 
 /// 非流式请求：用于「测试连接」和报告结论段（要的就是完整一句话）。
+///
+/// **空回复会重试一次**。实测 aiaaa.cc 大约每 3 次就有 1 次返回 `content: ""`
+/// （HTTP 200、没有 error 字段、耗时正常）—— 当成功处理的话，用户只会看到
+/// 报告里少一段、对话框里空一格，而且完全不知道为什么。
 pub async fn send_once(
     profile: &AiProfile,
     key: Option<&str>,
     messages: &[ChatMessage],
 ) -> Result<String> {
-    let built = build_request(profile, key, messages, false);
     let proto = Protocol::parse(&profile.protocol);
-    let resp = apply_headers(client()?.post(&built.url), &built.headers)
-        .json(&built.body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("请求失败：{e}"))?;
-    let status = resp.status().as_u16();
-    let text = resp.text().await.unwrap_or_default();
-    if !(200..300).contains(&status) {
-        return Err(anyhow!(extract_error(proto, status, &text)));
+    for attempt in 0..2 {
+        let built = build_request(profile, key, messages, false);
+        let resp = apply_headers(client()?.post(&built.url), &built.headers)
+            .json(&built.body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("请求失败：{e}"))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(anyhow!(extract_error(proto, status, &text)));
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| anyhow!("响应不是合法 JSON：{e}"))?;
+        let out = extract_text(proto, &v).unwrap_or_default();
+        if !out.trim().is_empty() {
+            return Ok(out);
+        }
+        if attempt == 0 {
+            log::warn!("[ai] 模型返回空内容，重试一次：{}", built.url);
+        }
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| anyhow!("响应不是合法 JSON：{e}"))?;
-    extract_text(proto, &v).ok_or_else(|| anyhow!("响应里没有文本内容"))
+    Err(anyhow!(
+        "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型"
+    ))
 }
 
 /// 流式请求。每个增量通过 `on_delta` 交出去，返回完整文本。
 ///
-/// 流中途断开**不丢已收到的内容** —— 部分回答也比一句「失败」有用。
+/// 两条约定：
+/// - 流中途断开**不丢已收到的内容** —— 部分回答也比一句「失败」有用；
+/// - 「干净地结束但一个字都没有」**重试一次**（提供方偶发空回复，见 `send_once`）；
+///   只在还没有任何增量时重试，所以不会把文本吐两遍。
 pub async fn send_stream<F>(
     profile: &AiProfile,
     key: Option<&str>,
@@ -527,55 +545,76 @@ pub async fn send_stream<F>(
 where
     F: FnMut(&str),
 {
-    let built = build_request(profile, key, messages, true);
     let proto = Protocol::parse(&profile.protocol);
-    let mut resp = apply_headers(client()?.post(&built.url), &built.headers)
-        .json(&built.body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("请求失败：{e}"))?;
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!(extract_error(proto, status, &text)));
-    }
-
     let mut acc = String::new();
-    let mut buf = String::new();
-    let mut finished = false;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| anyhow!("读取流失败：{e}"))?
-    {
-        if is_cancelled(req_id) {
-            break;
+    for attempt in 0..2 {
+        let built = build_request(profile, key, messages, true);
+        let mut resp = apply_headers(client()?.post(&built.url), &built.headers)
+            .json(&built.body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("请求失败：{e}"))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(extract_error(proto, status, &text)));
         }
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        // SSE 以空行分隔事件；一行一行处理，半个事件留在 buf 里等下一块。
-        while let Some(pos) = buf.find('\n') {
-            let line = buf[..pos].trim_end_matches('\r').to_string();
-            buf.drain(..=pos);
-            let Some(data) = line.strip_prefix("data:") else {
-                continue; // event: / id: / 注释行都不需要
-            };
-            let data = data.trim_start();
-            if is_done(proto, data) {
-                finished = true;
+
+        acc.clear();
+        let mut buf = String::new();
+        let mut finished = false;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| anyhow!("读取流失败：{e}"))?
+        {
+            if is_cancelled(req_id) {
                 break;
             }
-            if let Some(text) = parse_delta(proto, data) {
-                acc.push_str(&text);
-                on_delta(&text);
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            // SSE 以空行分隔事件；一行一行处理，半个事件留在 buf 里等下一块。
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim_end_matches('\r').to_string();
+                buf.drain(..=pos);
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue; // event: / id: / 注释行都不需要
+                };
+                let data = data.trim_start();
+                if is_done(proto, data) {
+                    finished = true;
+                    break;
+                }
+                if let Some(text) = parse_delta(proto, data) {
+                    acc.push_str(&text);
+                    on_delta(&text);
+                }
+            }
+            if finished {
+                break;
             }
         }
-        if finished {
+
+        if is_cancelled(req_id) {
+            // 用户点了停止：拿到多少算多少，不重试、不报错
+            clear_cancel(req_id);
+            return Ok(acc);
+        }
+        if !acc.trim().is_empty() {
             break;
+        }
+        if !finished {
+            clear_cancel(req_id);
+            return Err(anyhow!("模型没有返回任何内容（连接可能被中断）"));
+        }
+        if attempt == 0 {
+            log::warn!("[ai] 模型返回空内容，重试一次：{}", built.url);
         }
     }
     clear_cancel(req_id);
-    if acc.is_empty() && !finished {
-        return Err(anyhow!("模型没有返回任何内容（连接可能被中断）"));
+    if acc.trim().is_empty() {
+        return Err(anyhow!(
+            "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型"
+        ));
     }
     Ok(acc)
 }

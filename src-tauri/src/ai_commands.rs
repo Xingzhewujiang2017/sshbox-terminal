@@ -135,11 +135,29 @@ pub async fn ai_test(id: Option<String>) -> Result<String, String> {
     let key = store::get_secret(&ai::key_entry(&p.id)).ok();
     let msgs = vec![ChatMessage::user("ping")];
     let started = std::time::Instant::now();
+    // 测试连接也留一行日志：四条 AI 路径（测试/解释/命令/对话/报告）都要能在日志里对上。
+    log::info!(
+        "[ai] 测试连接 profile={} 协议={} model={} 端点={} 密钥={}",
+        p.name,
+        p.protocol,
+        p.model,
+        ai::endpoint(&p),
+        if key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false) {
+            "有"
+        } else {
+            "无"
+        }
+    );
     let reply = ai::send_once(&p, key.as_deref(), &msgs)
         .await
         .map_err(|e| format!("{e:#}"))?;
     let ms = started.elapsed().as_millis();
     let echo: String = reply.trim().chars().take(60).collect();
+    log::info!(
+        "[ai] 测试连接完成 {}ms，回显 {} 字",
+        ms,
+        reply.trim().chars().count()
+    );
     Ok(format!(
         "{} · {} · {}ms · 回显「{}」",
         p.name,

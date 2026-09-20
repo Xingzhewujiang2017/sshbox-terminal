@@ -744,12 +744,32 @@ async fn ai_summary(d: &ReportData) -> Result<String> {
             .join("、"),
         facts
     );
-    crate::ai::send_once(
+    // 报告这条也留一行日志：之前它走 send_once 不打日志，出了"报告里少一段 AI 结论"
+    // 只能靠猜（实测提供方偶发空回复，见 ai::send_once 的说明）。
+    let t0 = std::time::Instant::now();
+    let out = crate::ai::send_once(
         &profile,
         key.as_deref(),
         &[crate::ai::ChatMessage::user(prompt)],
     )
-    .await
+    .await;
+    match &out {
+        Ok(t) => log::info!(
+            "[ai] 报告结论 profile={} model={} 端点={} {}ms，{} 字",
+            profile.name,
+            profile.model,
+            crate::ai::endpoint(&profile),
+            t0.elapsed().as_millis(),
+            t.chars().count()
+        ),
+        Err(e) => log::warn!(
+            "[ai] 报告结论失败 profile={} model={} {}ms：{e:#}",
+            profile.name,
+            profile.model,
+            t0.elapsed().as_millis()
+        ),
+    }
+    out
 }
 
 #[tauri::command]
