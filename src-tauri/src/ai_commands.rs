@@ -171,6 +171,21 @@ pub async fn ai_chat(
     let key = store::get_secret(&ai::key_entry(&p.id)).ok();
     let rid = req_id.clone();
     let app2 = app.clone();
+    // 每次 AI 请求都留一行日志：模型、地址、耗时、结果。
+    // 没有这行，"答案怎么是空的"只能靠猜——是密钥、模型名、超时还是模型真没说话，
+    // 全靠这里的 endpoint + 耗时 + 错误文本区分。
+    let t0 = std::time::Instant::now();
+    let has_key = key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false);
+    log::info!(
+        "[ai] 请求 kind={} profile={} 协议={} model={} 端点={} 密钥={} 消息={} 条",
+        req_id,
+        p.name,
+        p.protocol,
+        p.model,
+        ai::endpoint(&p),
+        if has_key { "有" } else { "无" },
+        messages.len()
+    );
     let result = ai::send_stream(&p, key.as_deref(), &messages, &req_id, move |text| {
         let _ = app2.emit(
             "ssh://ai/delta",
@@ -180,6 +195,11 @@ pub async fn ai_chat(
     .await;
     match result {
         Ok(full) => {
+            log::info!(
+                "[ai] 完成 {}ms，回答 {} 字",
+                t0.elapsed().as_millis(),
+                full.chars().count()
+            );
             let _ = app.emit(
                 "ssh://ai/done",
                 serde_json::json!({ "req_id": req_id, "text": full, "profile": p.name, "model": p.model }),
@@ -188,6 +208,11 @@ pub async fn ai_chat(
         }
         Err(e) => {
             let msg = format!("{e:#}");
+            log::warn!(
+                "[ai] 失败 {}ms：{}",
+                t0.elapsed().as_millis(),
+                msg.chars().take(300).collect::<String>()
+            );
             let _ = app.emit(
                 "ssh://ai/error",
                 serde_json::json!({ "req_id": req_id, "message": msg }),
@@ -267,14 +292,34 @@ pub fn command_messages(brief: &str, ask: &str, tail: &str) -> Vec<ChatMessage> 
     vec![ChatMessage::system(system), ChatMessage::user(user)]
 }
 
-/// 侧栏对话：多轮，系统提示带上主机背景。
-pub fn chat_messages(brief: &str, history: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let system = format!(
+/// 侧栏对话：多轮，系统提示带上主机背景**和终端最近的输出**。
+///
+/// 三条约定，每条都对应一个踩过的坑：
+/// 1. `history` 是**之前的**轮次，当前提问由 `ask` 单独传入并追加在最后 ——
+///    少了它模型看不到问题（只看到终端输出），只能靠猜；
+/// 2. 消息列表必须**以 user 结尾**：Ollama 的 OpenAI 兼容层遇到末尾是
+///    assistant 的消息会直接返回空字符串（`finish_reason: stop`、0 字），
+///    不报错也不说话；
+/// 3. 终端尾部放系统消息里，用户看到的对话历史保持原样。
+pub fn chat_messages(
+    brief: &str,
+    history: Vec<ChatMessage>,
+    ask: &str,
+    tail: &str,
+) -> Vec<ChatMessage> {
+    let mut system = format!(
         "你是嵌在 SSH 客户端里的运维助手，帮用户分析和操作这台服务器。\
          回答用中文、简短、给可执行的命令；不确定就说不确定，不要编造输出。\n\n{brief}"
     );
+    if !tail.trim().is_empty() {
+        system.push_str("\n\n当前终端最近的输出（用户可能就着这段提问）：\n");
+        system.push_str(&crate::ai::truncate_middle(tail, TAIL_BUDGET));
+    }
     let mut out = vec![ChatMessage::system(system)];
     out.extend(history);
+    if !ask.trim().is_empty() {
+        out.push(ChatMessage::user(ask.trim()));
+    }
     out
 }
 
@@ -325,7 +370,7 @@ pub async fn ai_ask(
     let messages = match kind.as_str() {
         "explain" => explain_messages(&brief, &sel, &tail),
         "command" => command_messages(&brief, &ask, &tail),
-        _ => chat_messages(&brief, history.unwrap_or_default()),
+        _ => chat_messages(&brief, history.unwrap_or_default(), &ask, &tail),
     };
     ai_chat(app, req_id, messages, profile_id).await
 }
@@ -336,6 +381,55 @@ mod tests {
 
     fn brief() -> String {
         host_brief("127.0.0.1", 22, "root", "Ubuntu 22.04", "r9000p")
+    }
+
+    #[test]
+    fn chat_carries_terminal_tail_so_you_can_point_at_it() {
+        let hist = vec![ChatMessage::user("上一问")];
+        let m = chat_messages(
+            &brief(),
+            hist,
+            "刚才那条命令为什么失败",
+            "cat: /etc/nope: No such file or directory",
+        );
+        assert_eq!(m.len(), 3, "系统消息 + 一轮历史 + 当前提问");
+        assert_eq!(m[0].role, "system");
+        assert!(
+            m[0].content.contains("No such file"),
+            "终端尾部要进系统消息：{}",
+            m[0].content
+        );
+        assert!(m[0].content.contains("当前终端最近的输出"));
+    }
+
+    /// 这条钉住两个真实 bug：当前提问必须进请求体；列表必须以 user 结尾
+    /// （Ollama 遇到末尾是 assistant 会返回 0 字且不报错）。
+    #[test]
+    fn chat_ends_with_the_current_question() {
+        let hist = vec![
+            ChatMessage::user("第一问"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: "第一答".into(),
+            },
+        ];
+        let m = chat_messages(&brief(), hist, "第二问", "");
+        assert_eq!(m.len(), 4, "system + 第一问 + 第一答 + 第二问");
+        let last = m.last().unwrap();
+        assert_eq!(last.role, "user", "必须以 user 结尾：{m:?}");
+        assert_eq!(last.content, "第二问");
+        // 历史保持原样
+        assert_eq!(m[1].content, "第一问");
+        assert_eq!(m[2].content, "第一答");
+    }
+
+    #[test]
+    fn chat_without_tail_has_no_empty_section() {
+        let m = chat_messages(&brief(), vec![ChatMessage::user("你好")], "在吗", "   ");
+        assert!(
+            !m[0].content.contains("当前终端最近的输出"),
+            "空尾部不该留一个空标题"
+        );
     }
 
     #[test]
@@ -394,7 +488,7 @@ mod tests {
             },
             ChatMessage::user("第二问"),
         ];
-        let msgs = chat_messages(&brief(), history);
+        let msgs = chat_messages(&brief(), history, "", "");
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].content, "第一问");

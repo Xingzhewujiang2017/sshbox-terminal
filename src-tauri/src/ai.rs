@@ -584,6 +584,19 @@ where
 // 测试
 // ---------------------------------------------------------------------------
 
+/// 这个 profile 最终会请求到哪个 URL —— 日志和"测试连接"都要显示它。
+/// 三种协议的路径拼法不同（Gemini 把模型放进路径），所以只能在这里统一算。
+pub fn endpoint(p: &AiProfile) -> String {
+    match Protocol::parse(&p.protocol) {
+        Protocol::OpenAi => join_url(&p.base_url, "/chat/completions"),
+        Protocol::Anthropic => join_url(&p.base_url, "/messages"),
+        Protocol::Gemini => format!(
+            "{}?alt=sse",
+            join_url(&p.base_url, &format!("/models/{}:streamGenerateContent", p.model))
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +651,26 @@ mod tests {
         assert_eq!(r.body["messages"][0]["role"], "user");
         assert_eq!(r.body["system"], "be terse");
         assert!(r.body["max_tokens"].is_number(), "max_tokens 必填");
+    }
+
+    #[test]
+    fn endpoint_matches_the_url_each_protocol_actually_calls() {
+        let e = endpoint(&p("openai"));
+        assert_eq!(e, "https://example.com/v1/chat/completions");
+        let e = endpoint(&p("anthropic"));
+        assert_eq!(e, "https://example.com/v1/messages");
+        let e = endpoint(&p("gemini"));
+        assert_eq!(
+            e,
+            "https://example.com/v1/models/m1:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn endpoint_shows_where_a_local_profile_will_go() {
+        let mut q = p("openai");
+        q.base_url = "http://127.0.0.1:11434/v1".into();
+        assert_eq!(endpoint(&q), "http://127.0.0.1:11434/v1/chat/completions");
     }
 
     #[test]
