@@ -606,6 +606,15 @@ async fn do_connect(
     // flight, splitting one machine's history in two.
     if let Some(h) = params.host_id.as_deref().filter(|h| !h.is_empty()) {
         history::bind(&sid, h);
+    } else {
+        // 未绑定已保存主机的会话（快速连接、密码弹窗重连）也要有个能读的名字：
+        // 用连接目标而不是 sid 前缀，同一个目标的多条会话才会归成一行 ——
+        // 否则总览里会冒出一堆「临时连接 865c879a」，谁也认不出是哪台机器。
+        let port = params.port.unwrap_or(22);
+        history::bind(
+            &sid,
+            &format!("临时-{}@{}:{}", params.username, params.host, port),
+        );
     }
     state
         .sessions
@@ -665,6 +674,9 @@ pub async fn disconnect(
     }
     drop(sessions);
     history::unbind(&sid);
+    // 会话真的结束了：连静态缓存一起清（sid 不会再被复用）。
+    // 只 stop() 是不够的 —— 收尾逻辑会刻意保留静态缓存，好让「重启监控」不丢主机信息。
+    monitor::forget(&sid);
     Ok(())
 }
 

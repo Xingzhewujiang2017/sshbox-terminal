@@ -43,6 +43,7 @@ pub fn run() {
             commands::host_delete,
             commands::host_reorder,
             commands::host_touch,
+            commands::groups_reorder,
             // --- credentials ---
             commands::credential_has,
             commands::credential_set,

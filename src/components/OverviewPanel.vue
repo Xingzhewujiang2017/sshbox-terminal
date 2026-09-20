@@ -74,7 +74,10 @@ function fmtAge(sec: number): string {
 function hostLabelOf(id: string | null | undefined): string {
   if (!id) return '未保存的主机'
   const h = props.hosts.hosts.find((x) => x.id === id)
-  return h ? h.name || h.host : id.startsWith('临时-') ? '临时连接' : id
+  // 临时 key 现在带连接目标（临时-root@127.0.0.1:22），直接显示出来，
+  // 否则总览里一排「临时连接」谁也认不出是哪台机器。
+  if (!h && id.startsWith('临时-')) return `临时连接 ${id.slice(3)}`
+  return h ? h.name || h.host : id
 }
 function subtitleOf(id: string | null | undefined): string {
   const h = props.hosts.hosts.find((x) => x.id === id)

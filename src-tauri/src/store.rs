@@ -180,12 +180,22 @@ pub fn get_host(id: &str) -> Option<Host> {
     load_hosts().hosts.into_iter().find(|h| h.id == id)
 }
 
-/// Insert or update by id, keeping list order stable for existing entries.
-pub fn upsert_host(mut host: Host) -> Result<Host> {
-    let mut file = load_hosts();
+/// 给还没有 id 的主机补一个 uuid。
+///
+/// 单独抽出来是因为**调用顺序有意义**：凭据要按 id 存，所以必须先补 id 再写密码。
+/// 以前 `host_save` 直接 `set_secret(&host.id, …)`，新建主机的 id 还是空串，
+/// 密码被写到一个空 key 上，主机本体随后拿到新 uuid —— 名下没有密码，
+/// 于是「刚输入过密码，双击又让输一次」。
+pub fn ensure_host_id(host: &mut Host) {
     if host.id.trim().is_empty() {
         host.id = uuid::Uuid::new_v4().to_string();
     }
+}
+
+/// Insert or update by id, keeping list order stable for existing entries.
+pub fn upsert_host(mut host: Host) -> Result<Host> {
+    let mut file = load_hosts();
+    ensure_host_id(&mut host);
     if host.created_at == 0 {
         host.created_at = chrono::Utc::now().timestamp();
     }
@@ -437,6 +447,38 @@ mod tests {
         let back: HostsFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.hosts[0].id, "a");
         assert_eq!(back.hosts[0].port, 22);
+    }
+
+    #[test]
+    fn ensure_host_id_fills_only_empty_ids() {
+        // 凭据按 id 存，所以新建主机必须先有 id 再写密码 —— 这条钉住那个顺序契约。
+        let mk = |id: &str| Host {
+            id: id.into(),
+            name: "新机器".into(),
+            group: "默认".into(),
+            host: "1.2.3.4".into(),
+            port: 22,
+            username: "root".into(),
+            auth: "password".into(),
+            key_path: None,
+            save_password: true,
+            auto_reconnect: true,
+            host_key_policy: None,
+            forwards: Vec::new(),
+            color: None,
+            note: None,
+            last_used: None,
+            created_at: 0,
+        };
+
+        let mut h = mk("");
+        ensure_host_id(&mut h);
+        assert!(!h.id.trim().is_empty(), "空 id 要被补成 uuid");
+        assert_eq!(h.id.len(), 36, "补出来的应该是标准 uuid: {}", h.id);
+
+        let mut keep = mk("wsl-ubuntu-test");
+        ensure_host_id(&mut keep);
+        assert_eq!(keep.id, "wsl-ubuntu-test", "已有 id 不能被改写");
     }
 
     #[test]

@@ -70,6 +70,20 @@ function colorOption(p: ReturnType<typeof chartPalette>, seriesColors: string[])
   }
 }
 
+/**
+ * 轴的样式。三个 init* 都会重建 xAxis/yAxis（要加 type/min/formatter），
+ * 而重建会把上面 colorOption 展开的轴样式整个盖掉 —— 包括 splitLine 颜色，
+ * 于是网格线退回 ECharts 默认的浅灰，在深色主题下横线比曲线还亮，
+ * 中间没有数据的区域就只剩一排刺眼的白线。
+ */
+function axisStyle(p: ReturnType<typeof chartPalette>) {
+  return {
+    axisLabel: { color: p.axis },
+    splitLine: { lineStyle: { color: p.split } },
+    axisLine: { lineStyle: { color: p.split } },
+  }
+}
+
 function repaint() {
   const p = chartPalette()
   const c = seriesColors()
@@ -196,6 +210,23 @@ const coverage = computed(() => {
   return { oldest: s.oldest, newest: s.newest, span: s.newest - s.oldest }
 })
 
+/**
+ * 窗口内「真正有数据」的那一段。选了 30 天而库里只有一天多时，曲线会贴在底部
+ * （主机本来就空闲），横轴又只标几个稀疏刻度，看着就像这个标签页坏了。
+ * 数据没铺满窗口时把实际覆盖范围写出来，把「没数据」和「数据是平的」分开。
+ */
+const windowCoverage = computed(() => {
+  const s = data.value
+  const q = queried.value
+  if (!s || !q || !s.buckets.length) return null
+  const first = s.buckets[0].ts
+  const last = s.buckets[s.buckets.length - 1].ts
+  const span = last - first
+  const win = q.to - q.from
+  if (win <= 0 || span / win > 0.9) return null
+  return { first, last, span, ratio: span / win }
+})
+
 // --- loading ---------------------------------------------------------------
 
 async function loadHosts() {
@@ -250,22 +281,23 @@ async function load() {
 // --- charts ----------------------------------------------------------------
 
 function initPct(el: HTMLDivElement, names: string[], colors: string[]): echarts.ECharts {
+  const p = chartPalette()
   const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
-    ...colorOption(chartPalette(), colors),
+    ...colorOption(p, colors),
     grid: { left: 34, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: names },
     tooltip: {
       trigger: 'axis',
       valueFormatter: (v: number) => (v == null ? '—' : v.toFixed(1) + '%'),
     },
-    xAxis: { type: 'category', data: [], axisLabel: AXIS },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
     yAxis: {
       type: 'value',
       min: 0,
       max: 100,
-      axisLabel: AXIS,
+      ...axisStyle(p),
     },
     series: names.map((n, i) => ({
       name: n,
@@ -282,17 +314,19 @@ function initPct(el: HTMLDivElement, names: string[], colors: string[]): echarts
 }
 
 function initRate(el: HTMLDivElement, names: string[], colors: string[]): echarts.ECharts {
+  const p = chartPalette()
   const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
-    ...colorOption(chartPalette(), colors),
+    ...colorOption(p, colors),
     grid: { left: 46, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: names },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => fmtBytes(v) },
-    xAxis: { type: 'category', data: [], axisLabel: AXIS },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
     yAxis: {
       type: 'value',
       min: 0,
+      ...axisStyle(p),
       axisLabel: { ...AXIS, formatter: fmtRateShort },
     },
     series: names.map((n, i) => ({
@@ -311,15 +345,16 @@ function initRate(el: HTMLDivElement, names: string[], colors: string[]): echart
 
 /** Load average: 1-minute value, auto-scaled (no meaningful fixed max). */
 function initLoad(el: HTMLDivElement): echarts.ECharts {
+  const p = chartPalette()
   const c = echarts.init(el)
   c.setOption({
     backgroundColor: 'transparent',
-    ...colorOption(chartPalette(), seriesColors().load),
+    ...colorOption(p, seriesColors().load),
     grid: { left: 34, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: ['负载 (1 分钟)'] },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => (v == null ? '—' : v.toFixed(2)) },
-    xAxis: { type: 'category', data: [], axisLabel: AXIS },
-    yAxis: { type: 'value', min: 0, axisLabel: AXIS },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: { type: 'value', min: 0, ...axisStyle(p) },
     series: [
       {
         name: '负载 (1 分钟)',
@@ -481,6 +516,12 @@ onBeforeUnmount(() => {
 
       <div v-if="error" class="err">{{ error }}</div>
 
+      <div v-if="windowCoverage && !error" class="cov-hint">
+        窗口内实际有数据的时段：<b>{{ stamp(windowCoverage.first) }}</b> → <b>{{ stampFull(windowCoverage.last) }}</b>
+        （{{ fmtDur(windowCoverage.span) }}，占窗口约 {{ Math.round(windowCoverage.ratio * 100) }}%）。
+        其余时段没有采样点，曲线平贴底部是主机本来就空闲，不是没查到数据。
+      </div>
+
       <div v-if="data && !data.buckets.length && !error" class="empty-win">
         这个时段没有数据。{{ coverage ? `已存数据从 ${stamp(coverage.oldest)} 开始。` : '' }}
       </div>
@@ -636,6 +677,17 @@ onBeforeUnmount(() => {
   color: var(--ctp-overlay0);
   padding: 8px 0;
 }
+.cov-hint {
+  background: var(--ctp-surface0);
+  color: var(--ctp-subtext0);
+  border-left: 2px solid var(--ctp-yellow);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin: 6px 0 2px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.cov-hint b { color: var(--ctp-text); }
 .charts {
   display: flex;
   flex-direction: column;

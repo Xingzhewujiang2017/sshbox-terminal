@@ -357,6 +357,7 @@ export const api = {
   hostDelete: (id: string) => call<void>('host_delete', { id }),
   hostReorder: (ids: string[]) => call<void>('host_reorder', { ids }),
   hostTouch: (id: string) => call<void>('host_touch', { id }),
+  groupsReorder: (order: string[]) => call<string[]>('groups_reorder', { order }),
 
   // credentials
   credentialHas: (id: string) => call<boolean>('credential_has', { id }),

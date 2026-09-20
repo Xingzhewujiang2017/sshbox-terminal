@@ -18,12 +18,30 @@ const password = ref('')
 const showPassword = ref(false)
 const isEdit = computed(() => !!props.host?.id)
 const hadPassword = computed(() => !!props.host?.save_password)
-const valid = computed(() => !!form.value.host.trim() && !!form.value.username.trim())
+/** 端口必须是 1-65535：留空或填了非数字时，后端只会回一句
+ *  `invalid args host for command host_save: invalid type: string "", expected u16`，
+ *  看不懂。这里先在按钮上拦住。 */
+const portOk = computed(() => {
+  const p = Number(form.value.port)
+  return Number.isFinite(p) && p >= 1 && p <= 65535
+})
+const valid = computed(() => !!form.value.host.trim() && !!form.value.username.trim() && portOk.value)
+/** 密码认证且系统里还没存过密码时，密码也是必填。 */
+const passwordRequired = computed(() => form.value.auth === 'password' && !hadPassword.value)
 
 const groupOptions = computed(() => {
   const set = new Set([...props.existingGroups, ...props.groups, '默认'])
   return [...set].filter(Boolean)
 })
+
+// 分组下拉自己实现：原来用 input+datalist，输入框里已经填着「默认」，
+// 浏览器的 datalist 会按当前值过滤，于是点开只看到「默认」一条，
+// 非得先把内容删掉才看得到其它分组。自定义列表则始终列出全部分组。
+const groupOpen = ref(false)
+function pickGroup(g: string) {
+  form.value.group = g
+  groupOpen.value = false
+}
 
 function submit() {
   if (!valid.value) return
@@ -48,20 +66,41 @@ function submit() {
         </div>
         <div>
           <label>分组</label>
-          <input v-model="form.group" list="group-list" placeholder="默认" />
-          <datalist id="group-list">
-            <option v-for="g in groupOptions" :key="g" :value="g" />
-          </datalist>
+          <div class="combo">
+            <input
+              v-model="form.group"
+              placeholder="默认"
+              @keyup.enter="submit"
+              @focus="groupOpen = true"
+              @blur="groupOpen = false"
+            />
+            <button
+              type="button"
+              class="caret"
+              title="选择已有分组"
+              @mousedown.prevent
+              @click="groupOpen = !groupOpen"
+            >▾</button>
+            <div v-if="groupOpen" class="combo-list">
+              <div
+                v-for="g in groupOptions"
+                :key="g"
+                class="combo-item"
+                :class="{ on: form.group === g }"
+                @mousedown.prevent="pickGroup(g)"
+              >{{ g }}</div>
+            </div>
+          </div>
         </div>
       </div>
 
-      <label>主机地址</label>
+      <label>主机地址<span class="req">*</span></label>
       <div class="row">
         <input v-model="form.host" placeholder="192.168.x.x 或域名" autofocus @keyup.enter="submit" />
         <input v-model.number="form.port" type="number" class="port" />
       </div>
 
-      <label>用户名</label>
+      <label>用户名<span class="req">*</span></label>
       <input v-model="form.username" @keyup.enter="submit" />
 
       <label>认证方式</label>
@@ -72,7 +111,7 @@ function submit() {
 
       <template v-if="form.auth === 'password'">
         <label>
-          密码
+          密码<span v-if="passwordRequired" class="req">*</span>
           <span v-if="hadPassword" class="note">（已保存，留空则不修改）</span>
         </label>
         <div class="row">
@@ -124,6 +163,7 @@ function submit() {
       <input v-model="form.note" placeholder="可选" />
 
       <div class="btns">
+        <span class="reqnote"><span class="req">*</span> 为必填项</span>
         <button @click="emit('close')">取消</button>
         <button class="primary" :disabled="!valid" @click="submit">保存</button>
       </div>
@@ -171,6 +211,23 @@ input:focus { outline: 1px solid var(--ctp-blue); }
   border-radius: 5px; padding: 6px 8px; margin-top: 4px; line-height: 1.5;
 }
 .hintline { font-size: 11px; color: var(--ctp-overlay0); margin-top: 4px; }
+/* 必填标记：红色星号，颜色走 token，浅色主题下也看得见 */
+.req { color: var(--ctp-red); margin-left: 2px; }
+.reqnote { margin-right: auto; font-size: 11px; color: var(--ctp-overlay0); }
+/* 分组下拉：列表始终列出全部分组，不受输入框当前值影响 */
+.combo { position: relative; display: flex; gap: 6px; }
+.combo .caret {
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); border-radius: 6px;
+  color: var(--ctp-subtext0); cursor: pointer; padding: 0 9px; flex-shrink: 0;
+}
+.combo-list {
+  position: absolute; top: 100%; left: 0; right: 0; z-index: 5;
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface1); border-radius: 6px;
+  margin-top: 3px; max-height: 150px; overflow-y: auto; box-shadow: 0 6px 18px var(--mask);
+}
+.combo-item { padding: 6px 9px; font-size: 12px; color: var(--ctp-subtext0); cursor: pointer; }
+.combo-item:hover { background: var(--ctp-surface0); color: var(--ctp-text); }
+.combo-item.on { color: var(--ctp-blue); }
 .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
 .btns button {
   padding: 7px 16px; border-radius: 6px; border: 1px solid var(--ctp-surface0);

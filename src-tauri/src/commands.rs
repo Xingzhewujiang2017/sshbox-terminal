@@ -18,6 +18,9 @@ pub fn hosts_list() -> store::HostsFile {
 #[tauri::command]
 pub fn host_save(host: store::Host, password: Option<String>) -> Result<store::Host, String> {
     let mut host = host;
+    // 先补 id 再写凭据：新建主机的 id 是空的，凭据按 id 存 ——
+    // 顺序反了密码就落到空 key 上，主机名下没有密码，下次连接又问一遍。
+    store::ensure_host_id(&mut host);
     if let Some(pw) = password.filter(|p| !p.is_empty()) {
         store::set_secret(&host.id, &pw).map_err(e)?;
         host.save_password = true;
@@ -50,6 +53,23 @@ pub fn host_reorder(ids: Vec<String>) -> Result<(), String> {
 #[tauri::command]
 pub fn host_touch(id: String) {
     store::mark_used(&id);
+}
+
+/// 保存分组顺序（侧边栏拖动排序）。没出现在 order 里的分组保留在末尾，
+/// 免得拖一次就把别的分组从文件里抹掉。
+#[tauri::command]
+pub fn groups_reorder(order: Vec<String>) -> Result<Vec<String>, String> {
+    let mut file = store::load_hosts();
+    let mut next: Vec<String> = Vec::new();
+    for g in order.iter().chain(file.groups.iter()) {
+        let g = g.trim();
+        if !g.is_empty() && !next.iter().any(|x| x == g) {
+            next.push(g.to_string());
+        }
+    }
+    file.groups = next.clone();
+    store::save_hosts(&file).map_err(e)?;
+    Ok(next)
 }
 
 // ---------------------------------------------------------------------------

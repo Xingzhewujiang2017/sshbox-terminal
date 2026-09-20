@@ -1,0 +1,15 @@
+[
+  {
+    "host_id": "wsl-ubuntu-test",
+    "ts": 1787288890.3291154,
+    "cpu_pct": 42.0,
+    "mem_pct": 42.0,
+    "mem_used_kb": 1000,
+    "net_rx": 0.0,
+    "net_tx": 0.0,
+    "disk_r": 0.0,
+    "disk_w": 0.0,
+    "load1": 0.0,
+    "proc_total": 1
+  }
+]

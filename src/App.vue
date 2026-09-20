@@ -573,6 +573,17 @@ async function saveHost(host: Host, password: string | null) {
   }
 }
 
+/** 侧边栏拖动调整分组顺序：写回 hosts.json 的 groups 数组。 */
+async function reorderGroups(order: string[]) {
+  try {
+    await api.groupsReorder(order)
+    hosts.value = await api.hostsList()
+    toast('info', '分组顺序已保存')
+  } catch (e) {
+    toast('error', `保存分组顺序失败: ${(e as Error).message}`)
+  }
+}
+
 async function deleteHost(host: Host) {
   confirmState.value = {
     text: `删除主机「${host.name || host.host}」？同时会删除已保存的密码。`,
@@ -656,6 +667,20 @@ async function setSampleInterval(secs: number) {
   }
 }
 
+/** 进程列表条数（0 = 全部）。改完要让监控任务重来一次，否则要等下一轮才生效。 */
+async function setProcessTopN(n: number) {
+  if (!settings.value) return
+  const next = { ...settings.value, process_top_n: n }
+  try {
+    await api.settingsSet(next)
+    settings.value = next
+    if (activeTab.value) await api.monitorRestart(activeTab.value.sid).catch(() => {})
+    toast('info', n === 0 ? '进程列表已改为「全部」' : `进程列表已改为前 ${n} 个`)
+  } catch (e) {
+    toast('error', `改进程条数失败: ${(e as Error).message}`)
+  }
+}
+
 async function removeKnownHost(host: string, port: number) {
   try {
     const n = await api.knownHostsRemove(host, port)
@@ -717,6 +742,7 @@ function statusDot(t: Tab) {
       @duplicate="duplicateHost"
       @delete="deleteHost"
       @settings="settingsOpen = true"
+      @reorder-groups="reorderGroups"
     />
 
     <main class="main">
@@ -836,11 +862,17 @@ function statusDot(t: Tab) {
           </div>
         </div>
         <div v-if="monitorVisible && activeTab" class="monitor-area">
+          <!-- key 绑定 sid：切标签 / 关标签时重建面板。否则组件被复用，
+               静态信息（主机名等一次性事件）和图表历史都还是上一台主机的，
+               看起来就是「监控没跟着切」。 -->
           <MonitorPanel
+            :key="activeTab.sid"
             :sid="activeTab.sid"
             :active="true"
             :interval="settings?.sample_interval_secs ?? 2"
+            :top-n="settings?.process_top_n ?? 12"
             @set-interval="setSampleInterval"
+            @set-top-n="setProcessTopN"
           />
         </div>
       </div>

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, computed, nextTick, watch } from 'vue'
+import { onMounted, onBeforeUnmount, reactive, ref, computed, nextTick, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
 import { chartPalette, themeVersion } from '../theme'
 import { api, type DiskUsage, type Metrics } from '../api'
+import Pager from './Pager.vue'
 
 interface StaticInfo {
   hostname: string
@@ -44,8 +45,45 @@ interface HardwareInfo {
   gpus: GpuInfo[]
 }
 
-const props = defineProps<{ sid: string; active: boolean; interval: number }>()
-const emit = defineEmits<{ (e: 'setInterval', secs: number): void }>()
+const props = defineProps<{ sid: string; active: boolean; interval: number; topN: number }>()
+const emit = defineEmits<{
+  (e: 'setInterval', secs: number): void
+  (e: 'setTopN', n: number): void
+}>()
+
+// --- 列表分页 ---------------------------------------------------------------
+// 网络接口 / 磁盘 / 磁盘 IO / 进程 / 端口都按 10 条一页；点「全部」才铺开。
+// 一份状态按 section 名索引，省得给每张卡写一遍。
+const PAGE_SIZE = 10
+const page = reactive<Record<string, number>>({
+  net: 1,
+  disk: 1,
+  io: 1,
+  proc: 1,
+  port: 1,
+})
+const showAll = reactive<Record<string, boolean>>({
+  net: false,
+  disk: false,
+  io: false,
+  proc: false,
+  port: false,
+})
+
+/** 当前页的切片。切页越界（数据变少）时自动回到最后一页，不留空白页。 */
+function paged<T>(key: string, list: T[]): T[] {
+  if (showAll[key]) return list
+  const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE))
+  const cur = Math.min(page[key] ?? 1, pages)
+  if (cur !== page[key]) page[key] = cur
+  return list.slice((cur - 1) * PAGE_SIZE, cur * PAGE_SIZE)
+}
+
+/** 进程条数选项：0 = 全部（后端不截断）。 */
+const PROC_N = [12, 50, 0] as const
+function procNLabel(n: number) {
+  return n === 0 ? '全部' : String(n)
+}
 
 const info = ref<StaticInfo | null>(null)
 const metrics = ref<Metrics | null>(null)
@@ -64,8 +102,6 @@ const shownTemps = computed(() => {
   return tempsExpanded.value ? t : t.slice(0, TEMP_SHOWN)
 })
 const INTERVALS = [1, 2, 5, 10]
-/** Ports shown as chips; the count still reflects every listener. */
-const PORT_SHOWN = 14
 
 /** The chart window depends on the interval: 150 points is not always 5 min. */
 const windowLabel = computed(() => {
@@ -135,6 +171,20 @@ function colorOption(p: ReturnType<typeof chartPalette>, seriesColors: string[])
   }
 }
 
+/**
+ * 轴的样式。**每个图都会重建 xAxis/yAxis**（要加 type/min/formatter），
+ * 重建就把 colorOption 里展开的轴样式整个盖掉了 —— 包括网格线颜色，
+ * 于是退回 ECharts 默认的浅灰，深色主题下比曲线本身还显眼。
+ * 所以凡是要自己写 xAxis/yAxis 的图，都得把这份样式再展开一次。
+ */
+function axisStyle(p: ReturnType<typeof chartPalette>) {
+  return {
+    axisLabel: { color: p.axis },
+    splitLine: { lineStyle: { color: p.split } },
+    axisLine: { lineStyle: { color: p.split } },
+  }
+}
+
 /** 三个图的系列配色（和下面仪表环保持一致：CPU 蓝、内存绿、读橙、写紫）。 */
 function seriesColors(): string[][] {
   const p = chartPalette()
@@ -160,6 +210,15 @@ function heat(c: number): string {
 }
 function utilHeat(p: number): string {
   return p >= 85 ? 'hot' : p >= 50 ? 'warm' : 'ok'
+}
+/**
+ * 环形图与折线图的百分比必须同精度。环形原来固定 toFixed(0)，
+ * 而折线画的是 toFixed(1)：CPU 0.3% 时环形写「0%」、折线却在 0.3 处，
+ * 看着像两个数据源在打架，其实同源，只是精度不同。
+ * 低于 10 保留一位（0.3% 圆成 0% 会被读成「没数据」），10 以上整数够用。
+ */
+function pctText(v: number): string {
+  return v < 10 ? v.toFixed(1) : v.toFixed(0)
 }
 /** VRAM 上百 GB 的卡按 MB 显示读不出来，超过 1 GB 换成 GB。 */
 function fmtMB(mb: number | null): string {
@@ -220,8 +279,8 @@ function initPct(el: HTMLDivElement): echarts.ECharts {
     grid: { left: 34, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: ['CPU %', '内存 %'] },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => v.toFixed(1) + '%' },
-    xAxis: { type: 'category', data: [], axisLabel: AXIS },
-    yAxis: { type: 'value', min: 0, max: 100, axisLabel: AXIS },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: { type: 'value', min: 0, max: 100, ...axisStyle(p) },
     // 系列在这里重建，会盖掉上面 colorOption 展开的 series，所以颜色必须显式带上，
     // 否则这张图会退回 ECharts 自带调色板，切主题时颜色会跳一下。
     series: [['CPU %', p.blue], ['内存 %', p.green]].map(([name, color]) => ({
@@ -248,8 +307,8 @@ function initRate(el: HTMLDivElement, names: string[], colors: string[]): echart
     grid: { left: 46, right: 10, top: 24, bottom: 20 },
     legend: { ...LEGEND, data: names },
     tooltip: { trigger: 'axis', valueFormatter: (v: number) => fmtBytes(v) },
-    xAxis: { type: 'category', data: [], axisLabel: AXIS },
-    yAxis: { type: 'value', min: 0, axisLabel: { ...AXIS, formatter: fmtRateShort } },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: { type: 'value', min: 0, ...axisStyle(p), axisLabel: { ...AXIS, formatter: fmtRateShort } },
     series: names.map((n, i) => ({
       name: n, type: 'line', data: [], smooth: true, showSymbol: false,
       lineStyle: { width: 1.5, color: colors[i] },
@@ -387,14 +446,22 @@ onBeforeUnmount(() => {
     <template v-if="metrics">
       <div class="gauges">
         <div class="gauge">
-          <div class="ring" :style="{ '--pct': metrics.cpu_pct + '%', '--color': metrics.cpu_pct > 85 ? 'var(--ctp-red)' : 'var(--ctp-blue)' }">
-            <div class="ring-val">{{ metrics.cpu_pct.toFixed(0) }}%</div>
+          <div
+            class="ring"
+            :style="{ '--pct': metrics.cpu_pct + '%', '--color': metrics.cpu_pct > 85 ? 'var(--ctp-red)' : 'var(--ctp-blue)' }"
+            :title="`CPU 瞬时 ${metrics.cpu_pct.toFixed(1)}%（与下面折线图最后一个点同一份数据）`"
+          >
+            <div class="ring-val">{{ pctText(metrics.cpu_pct) }}%</div>
           </div>
           <div class="gauge-label">CPU</div>
         </div>
         <div class="gauge">
-          <div class="ring" :style="{ '--pct': metrics.mem_pct + '%', '--color': metrics.mem_pct > 85 ? 'var(--ctp-red)' : 'var(--ctp-green)' }">
-            <div class="ring-val">{{ metrics.mem_pct.toFixed(0) }}%</div>
+          <div
+            class="ring"
+            :style="{ '--pct': metrics.mem_pct + '%', '--color': metrics.mem_pct > 85 ? 'var(--ctp-red)' : 'var(--ctp-green)' }"
+            :title="`内存瞬时 ${metrics.mem_pct.toFixed(1)}%（与下面折线图最后一个点同一份数据）`"
+          >
+            <div class="ring-val">{{ pctText(metrics.mem_pct) }}%</div>
           </div>
           <div class="gauge-label">{{ fmtKB(metrics.mem_used_kb) }} / {{ fmtKB(metrics.mem_total_kb) }}</div>
         </div>
@@ -412,30 +479,54 @@ onBeforeUnmount(() => {
           <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
         </div>
         <div class="chart-box" ref="netEl"></div>
-        <div v-for="n in metrics.net" :key="n.name" class="net-if">
+        <div v-for="n in paged('net', metrics.net)" :key="n.name" class="net-if">
           <span class="ifname">{{ n.name }}</span>
           <span>↓{{ fmtBytes(n.rx_bps) }}</span>
           <span>↑{{ fmtBytes(n.tx_bps) }}</span>
         </div>
+        <Pager
+          :total="metrics.net.length"
+          :page="page.net"
+          :all="showAll.net"
+          unit="张网卡"
+          @update:page="page.net = $event"
+          @update:all="showAll.net = $event"
+        />
       </div>
 
       <div class="disk-box">
         <div class="section-title">磁盘</div>
-        <div v-for="d in metrics.disks" :key="d.mount" class="disk-row">
+        <div v-for="d in paged('disk', metrics.disks)" :key="d.mount" class="disk-row">
           <div class="disk-head">
             <span>{{ d.mount }}</span>
             <span>{{ fmtKB(d.used_kb) }} / {{ fmtKB(d.total_kb) }}</span>
           </div>
           <div class="bar"><div class="bar-fill" :class="{ warn: d.use_pct > 85 }" :style="{ width: d.use_pct + '%' }"></div></div>
         </div>
+        <Pager
+          :total="metrics.disks.length"
+          :page="page.disk"
+          :all="showAll.disk"
+          unit="个挂载点"
+          @update:page="page.disk = $event"
+          @update:all="showAll.disk = $event"
+        />
         <template v-if="metrics.disk_io.length">
           <div class="section-title">磁盘 IO <span class="unit">{{ windowLabel }}</span></div>
           <div class="chart-box" ref="ioEl"></div>
-          <div v-for="io in metrics.disk_io" :key="io.name" class="io-row">
+          <div v-for="io in paged('io', metrics.disk_io)" :key="io.name" class="io-row">
             <span class="ifname">{{ io.name }}</span>
             <span>R {{ fmtBytes(io.read_bps) }}</span>
             <span>W {{ fmtBytes(io.write_bps) }}</span>
           </div>
+          <Pager
+            :total="metrics.disk_io.length"
+            :page="page.io"
+            :all="showAll.io"
+            unit="块设备"
+            @update:page="page.io = $event"
+            @update:all="showAll.io = $event"
+          />
         </template>
       </div>
 
@@ -454,16 +545,21 @@ onBeforeUnmount(() => {
         <div class="svc-sub">监听端口 {{ services.port_total }} 个</div>
         <div class="port-wrap">
           <span
-            v-for="p in services.ports.slice(0, PORT_SHOWN)"
+            v-for="p in paged('port', services.ports)"
             :key="p.proto + p.port"
             class="port-chip"
             :title="p.addrs.join('\n')"
           >{{ p.port }}/{{ p.proto }}</span>
-          <span v-if="services.port_total > PORT_SHOWN" class="port-more">
-            +{{ services.port_total - PORT_SHOWN }}
-          </span>
           <span v-if="!services.port_total" class="svc-sub muted">（没读到监听端口）</span>
         </div>
+        <Pager
+          :total="services.ports.length"
+          :page="page.port"
+          :all="showAll.port"
+          unit="个端口"
+          @update:page="page.port = $event"
+          @update:all="showAll.port = $event"
+        />
 
         <template v-if="services.docker_available">
           <div class="svc-sub">容器 {{ services.containers.length }} 个</div>
@@ -518,13 +614,34 @@ onBeforeUnmount(() => {
       <div class="proc-box">
         <div class="section-title">
           进程<span class="proc-count">共 {{ metrics.proc_total }} 个 · 按瞬时 CPU 排序</span>
+          <span class="proc-n">
+            <button
+              v-for="n in PROC_N"
+              :key="n"
+              class="chip mini"
+              :class="{ on: props.topN === n }"
+              :title="n === 0 ? '取回全部进程（列表仍按 10 条一页）' : `只取 CPU 前 ${n} 个`"
+              @click="emit('setTopN', n)"
+            >{{ procNLabel(n) }}</button>
+          </span>
         </div>
         <div class="proc-head"><span>PID</span><span>名称</span><span>CPU</span><span>内存</span></div>
-        <div v-for="p in metrics.processes" :key="p.pid" class="proc-row">
+        <div v-for="p in paged('proc', metrics.processes)" :key="p.pid" class="proc-row">
           <span class="pid">{{ p.pid }}</span>
           <span class="pname" :title="p.name">{{ p.name }}</span>
           <span class="pcpu" :class="{ hot: p.cpu_pct > 50 }">{{ p.cpu_pct.toFixed(1) }}%</span>
           <span class="pmem">{{ fmtKB(p.rss_kb) }}</span>
+        </div>
+        <Pager
+          :total="metrics.processes.length"
+          :page="page.proc"
+          :all="showAll.proc"
+          unit="个进程"
+          @update:page="page.proc = $event"
+          @update:all="showAll.proc = $event"
+        />
+        <div v-if="metrics.proc_total > metrics.processes.length" class="svc-sub muted">
+          只取了前 {{ metrics.processes.length }} 个；点上方「全部」取回所有 {{ metrics.proc_total }} 个进程
         </div>
       </div>
 
@@ -557,6 +674,7 @@ onBeforeUnmount(() => {
 .chip:hover { border-color: var(--ctp-surface2); color: var(--ctp-text); }
 .chip.on { background: var(--ctp-blue); border-color: var(--ctp-blue); color: var(--on-accent); font-weight: 600; }
 .chip.warn { background: var(--ctp-yellow); border-color: var(--ctp-yellow); color: var(--on-accent); font-weight: 600; }
+.chip.mini { padding: 0 5px; font-size: 10px; border-radius: 4px; }
 .paused-banner {
   background: var(--ctp-surface0); color: var(--ctp-yellow); border-radius: 6px; padding: 5px 8px;
   margin-bottom: 8px; font-size: 11px; text-align: center;
@@ -637,6 +755,8 @@ onBeforeUnmount(() => {
 .fan-chip { color: var(--ctp-subtext0); font-family: ui-monospace, monospace; margin-left: 6px; }
 .proc-box { background: var(--ctp-base); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
 .proc-count { color: var(--ctp-overlay0); font-weight: 400; font-size: 10px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
+.proc-n { float: right; display: inline-flex; gap: 4px; align-items: center; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.proc-n::before { content: '取前'; color: var(--ctp-overlay0); font-size: 10px; }
 .proc-head, .proc-row { display: grid; grid-template-columns: 50px 1fr 52px 66px; gap: 6px; align-items: center; }
 .proc-head { color: var(--ctp-overlay0); font-size: 10px; padding-bottom: 4px; border-bottom: 1px solid var(--ctp-surface0); margin-bottom: 4px; }
 .proc-row { padding: 2px 0; font-size: 11px; }

@@ -136,7 +136,9 @@ for f in /sys/class/net/*/operstate; do
   [ -r "$f" ] || continue
   n=${f#/sys/class/net/}; n=${n%/operstate}
   IFS= read -r st < "$f" 2>/dev/null
-  echo "$n $st"
+  # type 772 = ARPHRD_LOOPBACK：WSL 的环回叫 loopback0 而不是 lo，光比名字会漏
+  IFS= read -r ty < "/sys/class/net/$n/type" 2>/dev/null
+  echo "$n $st ${ty:-0}"
 done
 echo "@@DISKIO@@"; cat /proc/diskstats 2>/dev/null
 echo "@@DF@@"; df -P -k 2>/dev/null
@@ -614,7 +616,9 @@ fn parse_procs(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.rss_kb.cmp(&a.rss_kb))
     });
-    rows.truncate(top_n);
+    if top_n > 0 {
+        rows.truncate(top_n);
+    }
     (rows, total)
 }
 
@@ -1059,13 +1063,20 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     // --- Network from /proc/net/dev ---
     // Interfaces the kernel reports as down are pure noise (WSL ships idle
     // eth2, docker leaves br-* around); /proc/net/dev itself has no state.
-    let mut down: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Loopback is noise too — and it must be detected by *type*, not by name:
+    // WSL's loopback is `loopback0`, so a literal `name == "lo"` check lets it
+    // through while it carries the localhost-relayed traffic (i.e. this app's
+    // own SSH session), which then dominates the header totals.
+    let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(ns) = s.get("NETSTATE") {
         for line in ns {
-            if let Some((n, st)) = line.split_once(' ') {
-                if st.trim().eq_ignore_ascii_case("down") {
-                    down.insert(n.trim().to_string());
-                }
+            let mut it = line.split_whitespace();
+            let Some(name) = it.next() else { continue };
+            let state = it.next().unwrap_or("");
+            let ty = it.next().unwrap_or("0");
+            let is_loopback = ty == "772" || name == "lo" || name.starts_with("loopback");
+            if is_loopback || state.eq_ignore_ascii_case("down") {
+                hidden.insert(name.to_string());
             }
         }
     }
@@ -1077,7 +1088,7 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
             }
             let (name, rest) = line.split_once(':').unwrap();
             let name = name.trim().to_string();
-            if name == "lo" || down.contains(&name) {
+            if hidden.contains(&name) {
                 continue;
             }
             let f: Vec<&str> = rest.split_whitespace().collect();
@@ -1167,7 +1178,8 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
 
     // --- processes (top N by instantaneous CPU) ---
     let (hz, page_size) = parse_sys(&s);
-    let top_n = store::load_settings().process_top_n.clamp(1, 100) as usize;
+    // 0 = 全部进程（前端「全部」选项）；上限 2000，防止畸形主机把每帧 payload 撑爆
+    let top_n = store::load_settings().process_top_n.min(2000) as usize;
     let (processes, proc_total) = parse_procs(s.get("PROC"), prev, dt, hz, page_size, top_n);
 
     Some(Metrics {
@@ -1337,12 +1349,39 @@ pub fn spawn(
                 }
             }
         }
-        registry().remove(&sid);
-        STATIC_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&sid);
+        // 只有「当前注册的那个任务」才配清注册表。
+        // 重启监控（monitor_restart / 设置里的「重启监控任务」）是 stop() + 立刻 spawn()，
+        // 而 stop() 只是置个标志位：旧任务要等到下一轮才收尾。如果旧任务跑在新任务
+        // 注册之后，无条件 remove 会把新任务刚注册的条目和它刚写好的静态缓存一起抹掉 ——
+        // 表现就是重启后主机信息卡永远停在「采集系统信息中…」，暂停/可见性也失灵。
+        // 静态缓存同理：同一个会话重启监控不该丢主机信息，它由新任务覆盖写。
+        retire(&sid, &stop_flag);
     });
+}
+
+/// 任务收尾：只有当注册表里登记的仍是「我自己」时才注销自己。
+///
+/// 抽出来是为了能单测这个竞态 —— 被顶替的旧任务收尾时绝不能把新任务抹掉。
+pub(crate) fn retire(sid: &SessionId, stop_flag: &Arc<AtomicBool>) {
+    let mut reg = registry();
+    let is_current = reg
+        .get(sid)
+        .map(|t| Arc::ptr_eq(&t.stop, stop_flag))
+        .unwrap_or(false);
+    if is_current {
+        reg.remove(sid);
+    }
+}
+
+/// Drop everything belonging to a session that is really gone (disconnect).
+/// 和任务收尾不同：这里要连静态缓存一起清，因为 sid 不会再被复用。
+pub fn forget(sid: &SessionId) {
+    stop(sid);
+    registry().remove(sid);
+    STATIC_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(sid);
 }
 
 pub fn stop(sid: &SessionId) {
@@ -1528,6 +1567,51 @@ mod tests {
         assert_eq!(m2.net[1].rx_bps, 0.0);
     }
 
+    #[test]
+    fn net_hides_loopback_by_type_not_name() {
+        // WSL 的环回不叫 lo 而叫 loopback0，而且状态是 up —— 只比名字会漏掉它，
+        // 而它恰好承载着经 localhost 转发的 SSH 流量（也就是本应用自己的连接），
+        // 于是它会排在最前、还把顶部合计拉高，看起来像主机的真实网卡在跑。
+        let raw1 = "@@TS@@ 100.0\n@@STAT@@\ncpu  100 0 100 800 0 0 0 0 0 0\n@@NET@@\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  lo: 10 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0\n  loopback0: 700 0 0 0 0 0 0 0 800 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up 1\nlo up 772\nloopback0 up 772\n@@END@@\n";
+        let raw2 = "@@TS@@ 102.0\n@@STAT@@\ncpu  600 0 600 1800 0 0 0 0 0 0\n@@NET@@\n  eth0: 15000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  lo: 10 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0\n  loopback0: 90000 0 0 0 0 0 0 0 800 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up 1\nlo up 772\nloopback0 up 772\n@@END@@\n";
+        let mut prev = PrevSample::default();
+        let _ = parse_metrics(raw1, &mut prev).unwrap();
+        prev.mono_ts = mono_secs() - 2.0;
+        let m2 = parse_metrics(raw2, &mut prev).unwrap();
+        let names: Vec<&str> = m2.net.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["eth0"], "环回（含 WSL 的 loopback0）不该出现在网络卡");
+        assert!(
+            (m2.net[0].rx_bps - 7000.0).abs() < 1.0,
+            "rx={}",
+            m2.net[0].rx_bps
+        );
+    }
+
+    #[test]
+    fn superseded_task_does_not_evict_the_new_one() {
+        // 重启监控 = stop() + 立刻 spawn()，旧任务可能晚于新任务才收尾。
+        // 它只能注销自己：无条件 remove 会把新任务的注册项和静态缓存一起抹掉。
+        let sid = "sid-restart".to_string();
+        let old_stop = Arc::new(AtomicBool::new(true));
+        let new_stop = Arc::new(AtomicBool::new(false));
+        let new_handle = TaskHandle {
+            visible: Arc::new(AtomicBool::new(true)),
+            stop: new_stop.clone(),
+            paused: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        };
+        registry().insert(sid.clone(), new_handle);
+
+        retire(&sid, &old_stop); // 旧任务收尾
+        assert!(
+            registry().contains_key(&sid),
+            "被顶替的旧任务不该注销新任务"
+        );
+
+        retire(&sid, &new_stop); // 当前任务收尾
+        assert!(!registry().contains_key(&sid), "当前任务收尾应正常注销");
+    }
+
     fn dummy_handle() -> TaskHandle {
         TaskHandle {
             visible: Arc::new(AtomicBool::new(true)),
@@ -1643,6 +1727,21 @@ mod tests {
         let m = parse_metrics(&raw, &mut prev).unwrap();
         assert_eq!(m.proc_total, 40);
         assert!(m.processes.len() <= 100, "截断后不应超过上限");
+    }
+
+    #[test]
+    fn proc_top_n_zero_means_every_process() {
+        // 「全部」用 0 表示：不截断，但仍按 CPU 降序，前端分页才有稳定顺序。
+        let mut ls: Vec<String> = Vec::new();
+        for pid in 1..=40 {
+            ls.push(format!("{pid}|p{pid}|S|0|0|1"));
+        }
+        let mut prev = PrevSample::default();
+        let (rows, total) = parse_procs(Some(&ls), &mut prev, 1.0, 100.0, 4096.0, 0);
+        assert_eq!(total, 40);
+        assert_eq!(rows.len(), 40, "top_n=0 要返回全部进程");
+        let (rows3, _) = parse_procs(Some(&ls), &mut prev, 1.0, 100.0, 4096.0, 3);
+        assert_eq!(rows3.len(), 3, "有限值仍要截断");
     }
 
     #[test]

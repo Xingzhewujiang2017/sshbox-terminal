@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { Host, HostsFile } from '../api'
 
 const props = defineProps<{
@@ -15,6 +15,7 @@ const emit = defineEmits<{
   (e: 'duplicate', host: Host): void
   (e: 'new'): void
   (e: 'settings'): void
+  (e: 'reorderGroups', order: string[]): void
 }>()
 
 const query = ref('')
@@ -32,6 +33,11 @@ const filtered = computed(() => {
   )
 })
 
+/** 分组顺序取自 hosts.json 的 groups 数组（拖动排序会写回去），没记录的排后面。 */
+function groupOrder(): string[] {
+  return props.data.groups ?? []
+}
+
 const groups = computed(() => {
   const map = new Map<string, Host[]>()
   for (const h of filtered.value) {
@@ -39,8 +45,32 @@ const groups = computed(() => {
     if (!map.has(g)) map.set(g, [])
     map.get(g)!.push(h)
   }
-  return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0], 'zh'))
+  const order = groupOrder()
+  const rank = (g: string) => {
+    const i = order.indexOf(g)
+    return i < 0 ? order.length : i
+  }
+  return [...map.entries()].sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0], 'zh'))
 })
+
+// 首次拿到数据时：第一个分组展开，其余默认收起 —— 分组一多，全部铺开列表会很长。
+const inited = ref(false)
+watch(
+  () => props.data,
+  (d) => {
+    if (inited.value || !d?.hosts?.length) return
+    const names = [...new Set(d.hosts.map((h) => h.group || '默认'))]
+    const order = groupOrder()
+    const rank = (g: string) => {
+      const i = order.indexOf(g)
+      return i < 0 ? order.length : i
+    }
+    names.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b, 'zh'))
+    names.slice(1).forEach((g) => (collapsed.value[g] = true))
+    inited.value = true
+  },
+  { immediate: true }
+)
 
 const menu = ref<{ host: Host; x: number; y: number } | null>(null)
 
@@ -53,6 +83,60 @@ function closeMenu() {
 }
 function toggle(g: string) {
   collapsed.value[g] = !collapsed.value[g]
+}
+
+// --- 分组拖动排序 -----------------------------------------------------------
+// Tauri 开着原生 drag-drop（OS 拖文件进窗口要用），页面里的 HTML5 dragstart
+// 收不到，所以内部拖动一律用指针事件自己算：按下记名字，移动超过 4px 才算拖动
+// （否则普通点击被吃掉），按指针命中的分组头算落点，松手提交。
+const dragFrom = ref<string | null>(null)
+const dragTo = ref<string | null>(null)
+let downY = 0
+let dragging = false
+
+function onGroupDown(g: string, ev: MouseEvent) {
+  dragFrom.value = g
+  downY = ev.clientY
+  dragging = false
+  window.addEventListener('mousemove', onGroupMove)
+  window.addEventListener('mouseup', onGroupUp)
+}
+
+function onGroupMove(ev: MouseEvent) {
+  if (!dragFrom.value) return
+  if (!dragging && Math.abs(ev.clientY - downY) < 4) return
+  dragging = true
+  const heads = [...document.querySelectorAll<HTMLElement>('.group-head')]
+  const hit = heads.find((el) => {
+    const r = el.getBoundingClientRect()
+    return ev.clientY >= r.top && ev.clientY <= r.bottom
+  })
+  dragTo.value = hit?.dataset.group ?? null
+}
+
+function onGroupUp() {
+  window.removeEventListener('mousemove', onGroupMove)
+  window.removeEventListener('mouseup', onGroupUp)
+  const from = dragFrom.value
+  const to = dragTo.value
+  if (dragging && from && to && from !== to) {
+    const names = groups.value.map(([g]) => g)
+    const i = names.indexOf(from)
+    const j = names.indexOf(to)
+    if (i >= 0 && j >= 0) {
+      names.splice(j, 0, ...names.splice(i, 1))
+      emit('reorderGroups', names)
+    }
+  }
+  dragFrom.value = null
+  dragTo.value = null
+  dragging = false
+}
+
+/** 拖动结束的那一下不要顺手把分组折叠了。 */
+function onGroupClick(g: string) {
+  if (dragging) return
+  toggle(g)
 }
 </script>
 
@@ -72,7 +156,15 @@ function toggle(g: string) {
         {{ data.hosts.length ? '没有匹配的主机' : '还没有主机，点「新建连接」添加' }}
       </div>
       <template v-for="[group, hosts] in groups" :key="group">
-        <div class="group-head" @click="toggle(group)">
+        <div
+          class="group-head"
+          :class="{ dragging: dragFrom === group, 'drop-target': dragTo === group && dragFrom !== group }"
+          :data-group="group"
+          :title="`${group} · 拖动可调整分组顺序`"
+          @mousedown="onGroupDown(group, $event)"
+          @click="onGroupClick(group)"
+        >
+          <span class="grip">⠿</span>
           <span class="caret">{{ collapsed[group] ? '▸' : '▾' }}</span>
           <span class="group-name">{{ group }}</span>
           <span class="count">{{ hosts.length }}</span>
@@ -156,6 +248,10 @@ function toggle(g: string) {
   color: var(--ctp-overlay0); font-size: 11px; padding: 5px 2px 3px; user-select: none;
 }
 .group-head:hover { color: var(--ctp-subtext0); }
+.grip { font-size: 10px; color: var(--ctp-surface2); cursor: grab; letter-spacing: -1px; }
+.group-head:hover .grip { color: var(--ctp-overlay0); }
+.group-head.dragging { color: var(--ctp-blue); opacity: 0.7; }
+.group-head.drop-target { box-shadow: inset 0 -2px 0 var(--ctp-blue); }
 .caret { font-size: 9px; }
 .group-name { flex: 1; text-transform: uppercase; letter-spacing: 0.4px; }
 .count { color: var(--ctp-surface1); }
