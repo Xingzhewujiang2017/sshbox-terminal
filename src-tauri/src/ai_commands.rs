@@ -154,6 +154,7 @@ pub async fn ai_test(id: Option<String>) -> Result<String, String> {
 pub async fn ai_chat(
     app: AppHandle,
     req_id: String,
+    kind: String,
     messages: Vec<ChatMessage>,
     profile_id: Option<String>,
 ) -> Result<String, String> {
@@ -177,8 +178,9 @@ pub async fn ai_chat(
     let t0 = std::time::Instant::now();
     let has_key = key.as_deref().map(|k| !k.trim().is_empty()).unwrap_or(false);
     log::info!(
-        "[ai] 请求 kind={} profile={} 协议={} model={} 端点={} 密钥={} 消息={} 条",
+        "[ai] 请求 req={} kind={} profile={} 协议={} model={} 端点={} 密钥={} 消息={} 条",
         req_id,
+        kind,
         p.name,
         p.protocol,
         p.model,
@@ -372,7 +374,7 @@ pub async fn ai_ask(
         "command" => command_messages(&brief, &ask, &tail),
         _ => chat_messages(&brief, history.unwrap_or_default(), &ask, &tail),
     };
-    ai_chat(app, req_id, messages, profile_id).await
+    ai_chat(app, req_id, kind, messages, profile_id).await
 }
 
 #[cfg(test)]
