@@ -315,6 +315,67 @@ function sparkPath(vals: number[], w: number, h: number): string {
 const cpuSeries = (r: HistoryRange) => r.buckets.map((b) => b.cpu_pct)
 const memSeries = (r: HistoryRange) => r.buckets.map((b) => b.mem_pct)
 
+// --- 导出 CSV（#4） ---
+function downloadCsv(filename: string, rows: (string | number)[][]) {
+  const esc = (v: string | number) => {
+    const s = String(v ?? '')
+    if (s.indexOf(',') >= 0 || s.indexOf('"') >= 0) {
+          return '"' + s.split('"').join('""') + '"'
+        }
+    return s
+  }
+  // BOM 前缀，Excel 打开 UTF-8 中文不乱码
+  const csv = "\ufeff" + rows.map((r) => r.map(esc).join(',')).join("\r\n")
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+function csvDate(): string {
+  const d = new Date()
+  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+}
+
+function exportSnapshotCsv() {
+  const name = groupFilter.value === '__none' ? '未分组' : groupFilter.value || '全部'
+  const rows: (string | number)[][] = [
+    ['主机', '分组', '状态', '年龄(秒)', 'CPU%', '内存%', '磁盘%', '网络↓B/s', '网络↑B/s', '负载1', '进程数'],
+  ]
+  for (const r of filteredRows.value) {
+    rows.push([
+      r.title,
+      groupOfHost(r.hostId) ?? '未保存',
+      r.status,
+      r.ageSec ?? '',
+      r.metrics?.cpu_pct ?? r.lastCpu ?? '',
+      r.metrics?.mem_pct ?? r.lastMem ?? '',
+      worstDisk(r.metrics) ?? '',
+      Math.round(netTotals(r.metrics).rx),
+      Math.round(netTotals(r.metrics).tx),
+      r.metrics?.load?.[0] ?? '',
+      r.metrics?.proc_total ?? '',
+    ])
+  }
+  downloadCsv(`SSHBox-总览-${name}-${csvDate()}.csv`, rows)
+}
+
+/** 只导出**当前已加载**的历史窗口（组内历史矩阵的数据），窗口见 histKey。 */
+function exportHistoryCsv() {
+  if (!Object.keys(histData.value).length) return
+  const rows: (string | number)[][] = [
+    ['主机', '时间戳', 'CPU%', '内存%', '网络↓B/s', '网络↑B/s', '磁盘读B/s', '磁盘写B/s', '负载1'],
+  ]
+  for (const [hid, r] of Object.entries(histData.value)) {
+    for (const b of r.buckets) {
+      rows.push([hostLabelOf(hid), b.ts, b.cpu_pct, b.mem_pct, b.net_rx, b.net_tx, b.disk_r, b.disk_w, b.load1])
+    }
+  }
+  downloadCsv(`SSHBox-组历史-${groupFilter.value}-${histKey.value}-${csvDate()}.csv`, rows)
+}
+
 let timer: ReturnType<typeof setInterval> | null = null
 onMounted(async () => {
   await loadHistory()
@@ -366,7 +427,16 @@ onBeforeUnmount(() => {
                 <option value="status">按状态</option>
               </select>
               <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
-            </div>
+                      <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前视图为 CSV（含分组）">导出 CSV</button>
+                      <button
+                        v-if="Object.keys(histData).length"
+                        class="btn ghost"
+                        @click="exportHistoryCsv"
+                        title="导出组内历史序列为 CSV（当前时间窗口）"
+                      >
+                        组历史 CSV
+                      </button>
+                    </div>
 
       <div v-if="historyError" class="err">历史库读取失败：{{ historyError }}</div>
 

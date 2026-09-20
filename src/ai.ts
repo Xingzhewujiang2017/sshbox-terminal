@@ -10,6 +10,7 @@
 import { reactive } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { api, type AiProfile, type AiSettings, type ChatMessage } from './api'
+import { mergeReasoning, stripThinking } from './think'
 
 export type AiKind = 'explain' | 'command' | 'chat'
 
@@ -108,7 +109,10 @@ export async function initAi() {
   })
   await listen<{ req_id: string }>('ssh://ai/done', () => {
     const t = ai.turns[ai.turns.length - 1]
-    if (t && t.role === 'assistant') t.streaming = false
+    if (t && t.role === 'assistant') {
+      t.streaming = false
+      finalizeTurn(t)
+    }
     ai.streaming = false
   })
   await listen<{ req_id: string; message: string }>('ssh://ai/error', (e) => {
@@ -173,6 +177,7 @@ export async function ask(
     if (t && t.role === 'assistant') {
       t.streaming = false
       if (!t.content) t.content = full
+      finalizeTurn(t)
     }
     if (kind === 'command') {
       ai.pendingCommand = cleanCommand(full)
@@ -188,6 +193,16 @@ export async function ask(
     ai.error = msg
   } finally {
     ai.streaming = false
+  }
+}
+
+/** 收尾时剥离"写进正文的思考"（Qwen3 风格自建模型把思考混在 content 里）。
+ *  剥出的思考合进 reasoning 字段 → 面板已有「思考过程」折叠栏承接；正文只留答案。 */
+function finalizeTurn(t: { content: string; reasoning?: string }): void {
+  const { answer, reasoning } = stripThinking(t.content)
+  if (reasoning) {
+    t.content = answer
+    t.reasoning = mergeReasoning(t.reasoning, reasoning)
   }
 }
 

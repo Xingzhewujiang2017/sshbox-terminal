@@ -327,13 +327,14 @@ function insertToTerminal(p: { text: string; sid?: string }) {
   toast('info', `命令已填入 ${tab.label}，确认后按回车执行`)
 }
 
-/** 一键巡检报告。 */
-async function makeReport() {
+/** 一键巡检报告。hours: 1/24/168，默认 24。 */
+async function makeReport(hours = reportHours.value) {
   const tab = activeTab.value
   if (!tab) return
+  reportPickOpen.value = false
   reportBusy.value = true
   try {
-    const r = await api.reportGenerate(tab.sid, 24)
+    const r = await api.reportGenerate(tab.sid, hours)
     const crit = r.critical > 0 ? `，其中 ${r.critical} 项严重` : ''
     const aiNote = r.ai_used ? '，含 AI 结论' : r.ai_error ? `（AI 结论跳过：${r.ai_error}）` : ''
     toast('info', `报告已生成：${r.findings} 项结论${crit}${aiNote}`)
@@ -346,6 +347,9 @@ async function makeReport() {
 }
 
 const reportResult = ref<import('./api').ReportResult | null>(null)
+const reportHours = ref(24)
+/** 报告按钮的弹窗：点「报告」先选时间范围再生成。 */
+const reportPickOpen = ref(false)
 
 function onKey(e: KeyboardEvent) {
   // Esc 优先退广播：这是最容易误操作的模式，先给它
@@ -984,14 +988,23 @@ function statusDot(t: Tab) {
           >
             AI
           </button>
-          <button
-            class="icon-btn"
-            :title="activeTab ? '生成这台机器的巡检报告（Markdown + HTML）' : '先连接一台主机'"
-            :disabled="!activeTab || reportBusy"
-            @click="makeReport()"
-          >
-            {{ reportBusy ? '生成中…' : '报告' }}
-          </button>
+          <span class="report-wrap">
+                      <button
+                        class="icon-btn"
+                        :title="activeTab ? '生成这台机器的巡检报告（Markdown + HTML）' : '先连接一台主机'"
+                        :disabled="!activeTab || reportBusy"
+                        @click="reportBusy ? 0 : (reportPickOpen = !reportPickOpen)"
+                      >
+                        {{ reportBusy ? '生成中…' : '报告' }}
+                      </button>
+                      <div v-if="reportPickOpen" class="report-pick">
+                        <div class="rp-title">报告时间范围</div>
+                        <button class="rp-opt" @click="makeReport(1)">最近 1 小时</button>
+                        <button class="rp-opt" @click="makeReport(24)">最近 24 小时</button>
+                        <button class="rp-opt" @click="makeReport(168)">最近 7 天</button>
+                        <button class="rp-opt cancel" @click="reportPickOpen = false">取消</button>
+                      </div>
+                    </span>
           <button class="icon-btn" title="切换监控面板" @click="monitorVisible = !monitorVisible">
             {{ monitorVisible ? '◧' : '◨' }}
           </button>
@@ -1226,6 +1239,34 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(-
 .tab-close:hover { color: var(--ctp-red); }
 .tabbar-right { margin-left: auto; padding-right: 8px; display: flex; align-items: center; gap: 8px; }
 .icon-btn { background: none; border: none; color: var(--ctp-subtext0); cursor: pointer; font-size: 16px; }
+.report-wrap { position: relative; }
+.report-pick {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  background: var(--ctp-mantle);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+  min-width: 140px;
+}
+.report-pick .rp-title { font-size: 10px; color: var(--ctp-overlay0); padding: 4px 8px 6px; }
+.report-pick .rp-opt {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--ctp-text);
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.report-pick .rp-opt:hover { background: var(--ctp-surface0); }
+.report-pick .rp-opt.cancel { color: var(--ctp-overlay0); border-top: 1px solid var(--ctp-surface0); border-radius: 0 0 5px 5px; margin-top: 4px; }
 .reconnect-btn {
   background: var(--ctp-green); color: var(--on-accent); border: none; border-radius: 5px;
   padding: 3px 10px; font-size: 11.5px; font-weight: 600; cursor: pointer;

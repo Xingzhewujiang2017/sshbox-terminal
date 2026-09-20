@@ -61,6 +61,24 @@ function pickTheme(m: ThemeMode) {
 
 const tab = ref<'general' | 'quick' | 'ai' | 'hostkeys' | 'io' | 'about'>('general')
 const form = ref<Settings>({ ...props.settings })
+
+// 采样间隔：预设按钮是 [1,2,5,10]，自定义则直接往输入框填任意秒数（1-3600）。
+// 后端存的就是 u64，任何值都生效，只是预设按钮没有 UI 而已。
+const customInterval = ref(2)
+watch(
+  () => form.value.sample_interval_secs,
+  (v) => {
+    if (v >= 1) customInterval.value = v
+  },
+  { immediate: true },
+)
+function applyCustomInterval() {
+  let v = customInterval.value
+  if (!Number.isFinite(v) || v < 1) v = 1
+  if (v > 3600) v = 3600
+  customInterval.value = v
+  form.value.sample_interval_secs = v
+}
 const exportPath = ref('D:\\sshbox-hosts.json')
 const importPath = ref('D:\\sshbox-hosts.json')
 const includeSecrets = ref(false)
@@ -147,8 +165,11 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
           <button class="q-btn danger" title="删除" @click="removeQuick(q.id)">×</button>
         </div>
         <p v-if="!(form.quick_commands ?? []).length" class="hintline">还没有快捷命令。</p>
-        <button class="add-quick" @click="addQuick">+ 添加一条</button>
-      </div>
+                <button class="add-quick" @click="addQuick">+ 添加一条</button>
+                <div class="btns">
+                  <button class="primary" @click="save">保存设置</button>
+                </div>
+              </div>
 
       <!-- 常规 -->
       <div v-if="tab === 'general'" class="pane">
@@ -169,11 +190,23 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
         <div class="seg">
           <button
             v-for="s in [1, 2, 5, 10]"
-            :key="s"
-            :class="{ sel: form.sample_interval_secs === s }"
-            @click="form.sample_interval_secs = s"
-          >{{ s }}s</button>
-        </div>
+                        :key="s"
+                        :class="{ sel: form.sample_interval_secs === s }"
+                        @click="form.sample_interval_secs = s"
+                      >{{ s }}s</button>
+                      <label class="custom-int" :class="{ sel: ![1, 2, 5, 10].includes(form.sample_interval_secs) }">
+                        <input
+                          v-model.number="customInterval"
+                          type="number"
+                          min="1"
+                          max="3600"
+                          step="1"
+                          @change="applyCustomInterval"
+                          @focus="($event.target as HTMLInputElement).select()"
+                        />
+                        <span>秒 自定义</span>
+                      </label>
+                    </div>
         <div class="hintline">不可见标签页会自动降频到 5 倍间隔以省带宽。</div>
 
         <label class="check">
@@ -376,6 +409,25 @@ input:not([type='checkbox']) {
 }
 input:focus { outline: 1px solid var(--ctp-blue); }
 .seg { display: flex; gap: 6px; }
+.custom-int {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--ctp-surface0);
+  border-radius: 4px;
+  padding: 1px 6px;
+  color: var(--ctp-subtext0);
+  font-size: 11px;
+}
+.custom-int.sel { border-color: var(--ctp-blue); color: var(--ctp-text); }
+.custom-int input {
+  width: 52px;
+  background: var(--ctp-mantle);
+  color: var(--ctp-text);
+  border: none;
+  font-size: 11px;
+  padding: 2px 0;
+}
 .seg button {
   flex: 1; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
   border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px;

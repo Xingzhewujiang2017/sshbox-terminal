@@ -139,6 +139,67 @@ fn empty_reply_error(finish: &str, raw: &str, body: &str, max_tokens: u32) -> St
     }
 }
 
+/// 剥离自建模型写进正文的思考（Qwen3 / DeepSeek-R1 风格的"Here's a thinking process:"）。
+///
+/// 服务端没拆 reasoning 字段时，思考会混在 content 正文里。规则（用真实样例定）：
+/// 1. 找思考标记行（中文/英文两种都认）；
+/// 2. 思考块 = 标记行起，到**最后一个编号项**（`1.` `2.`…）连同其后缩进的项目符号行；
+/// 3. 剥离是**搬移不是删除**：剥出的内容返回给上层折叠显示，用户展开永远能看到原文。
+/// 找不到编号项（不是编号结构的思考）就原样返回，宁可不剥也不误删正文。
+pub fn strip_thinking(content: &str) -> (String, Option<String>) {
+    let markers = [
+        "here's a thinking process:",
+        "以下是思考过程：",
+        "思考过程：",
+    ];
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mline = lines.iter().position(|l| {
+        let t = l.to_ascii_lowercase();
+        markers.iter().any(|m| t.contains(m))
+    });
+    let Some(mline) = mline else {
+        return (content.to_string(), None);
+    };
+
+    fn is_numbered(l: &str) -> bool {
+        let t = l.trim_start();
+        let b = t.as_bytes();
+        let mut i = 0;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        i > 0 && i < b.len() && b[i] == b'.'
+    }
+
+    let mut end: Option<usize> = None;
+    for (i, l) in lines.iter().enumerate().skip(mline) {
+        if is_numbered(l) {
+            end = Some(i);
+        }
+    }
+    let Some(end) = end else {
+        return (content.to_string(), None);
+    };
+    // 编号项后的子行（项目符号 / 空行）仍属思考块；一旦出现非列表行，正文开始
+    let mut cut = end + 1;
+    while cut < lines.len() {
+        let t = lines[cut].trim_start();
+        if t.is_empty() || t.starts_with('-') || t.starts_with('*') || t.starts_with('+') {
+            cut += 1;
+        } else {
+            break;
+        }
+    }
+    let thinking = lines[mline..cut].join("\n");
+    let answer = lines[..mline]
+        .iter()
+        .chain(lines[cut..].iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (answer, Some(thinking))
+}
+
 /// 密钥在凭据管理器里的条目名。
 pub fn key_entry(profile_id: &str) -> String {
     format!("ai:{profile_id}")
@@ -1058,6 +1119,50 @@ mod tests {
 
     /// 空回复的诊断必须分清「输出被截断」和「提供方偶发空回复」。
     /// 前者重试必然同样失败，建议用户重试等于让他白试。
+    /// 剥离器用**真实样例**做夹具（Qwen3.6-27B 的思考块，用户提供）。
+    /// 手写夹具漏过"思考块以编号项结尾 + 项目符号子行"的真实结构。
+    #[test]
+    fn strip_thinking_detaches_reasoning_but_never_loses_it() {
+        let real = "Here's a thinking process:
+ 
+1.  **Analyze User Input:**
+   - User asks: \"如何查询日志\"
+   - Context: SSH client, target host root@172.22.134.88, K8s node.
+2.  **Identify Key Log Locations:**
+   - System: journalctl, /var/log/messages
+   - K8s: kubectl logs, /var/log/pods/
+ 
+5.  **Self-Correction:**
+   - Language: Chinese ✓
+   - Commands are standard and safe ✓
+ 
+查询日志取决于你要查的对象。常用命令如下：
+
+**1. 系统/服务日志（systemd）**
+```bash
+journalctl -u <服务名> --no-pager
+```";
+        let (answer, think) = strip_thinking(real);
+        let think = think.expect("要能剥出思考块");
+        assert!(think.contains("Here's a thinking process:"), "{think}");
+        assert!(think.contains("Self-Correction"), "思考要含最后一个编号项");
+        assert!(think.contains("safe ✓"), "编号项后的项目符号子行也要归思考");
+        assert!(answer.starts_with("查询日志取决于你要查的对象。"), "正文从编号列表后开始");
+        assert!(answer.contains("journalctl"), "正文里的命令要完整保留");
+        assert!(!answer.contains("thinking process"), "正文里不能再有思考标记");
+
+        // 中文标记
+        let zh = "以下是思考过程：\n1. 分析\n2. 设计\n\n最终答案在这里。";
+        let (a2, t2) = strip_thinking(zh);
+        assert_eq!(a2, "最终答案在这里。");
+        assert!(t2.unwrap().contains("2. 设计"));
+
+        // 没标记 / 没编号：原样返回，不当误删
+        assert_eq!(strip_thinking("正常回答没有思考。").0, "正常回答没有思考。");
+        let no_num = "Here's a thinking process:\n散文式思考没有编号\n\n答案";
+        assert_eq!(strip_thinking(no_num).0, no_num, "没编号结构就不剥");
+    }
+
     #[test]
     fn empty_reply_diagnosis_distinguishes_truncation_from_flakiness() {
         let raw = r#"{"choices":[{"finish_reason":"length","message":{"content":"","reasoning_content":"想了很久"}}]}"#;

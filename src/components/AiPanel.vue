@@ -99,6 +99,10 @@ function looksLikeCommand(line: string): boolean {
   if (!t) return false
   return /^[$#>]\s/.test(t) || /^(sudo|systemctl|journalctl|ss|df|du|ps|top|grep|cat|tail|curl|docker|apt|yum|kill|netstat|lsof|find|awk|sed)\b/.test(t)
 }
+/** 思考文本的展示清洗：只去掉 markdown 加粗星号，不渲染、不砍内容。 */
+function plainThink(s: string): string {
+  return s.split('**').join('')
+}
 </script>
 
 <template>
@@ -124,7 +128,7 @@ function looksLikeCommand(line: string): boolean {
         <button class="mode" :class="{ on: mode === 'chat' }" @click="mode = 'chat'">对话</button>
         <button class="mode" :class="{ on: mode === 'command' }" @click="mode = 'command'">生成命令</button>
       </span>
-      <button class="icon" title="清空对话" @click="clearTurns">🗑</button>
+      <button class="mode" title="清空对话" @click="clearTurns">清空</button>
       <button class="icon" title="关闭" @click="emit('close')">×</button>
     </div>
 
@@ -137,13 +141,16 @@ function looksLikeCommand(line: string): boolean {
 
     <div ref="scroller" class="turns">
       <div v-if="!ai.turns.length" class="empty">
-        <p>三种用法：</p>
+        <p>三条入口，随取随用：</p>
         <ul>
-          <li>在终端里 <b>选中一段报错</b> → 右键「解释这段」</li>
-          <li>按 <b>Ctrl+Shift+I</b> 让 AI 看着最近的输出解释</li>
-          <li>直接在这里提问，或说「找出占用 80 端口的进程」让它生成命令</li>
+          <li><b>右键解释</b>：终端里选中报错/输出 → 右键「解释这段」，AI 只看这一小段</li>
+          <li><b>生成命令</b>：右上切「生成命令」→ 一句话描述要做的事 → 双击命令或点「插入终端」填入（<b>不自动执行</b>，回车由你按）</li>
+          <li><b>直接对话</b>：就在这里提问</li>
         </ul>
-        <p class="hint">上下文会带上当前会话最近的终端输出，所以问题可以很短。</p>
+        <p class="hint">
+          提问自动带上当前会话最近的终端输出作上下文，所以「刚才的服务为什么没起来」不用补背景。
+        </p>
+        <p class="hint"><b>Ctrl+Shift+I</b> 或工具栏 AI 按钮 = 打开/收起本面板。</p>
       </div>
 
       <div v-for="(t, i) in ai.turns" :key="i" class="turn" :class="t.role">
@@ -165,9 +172,9 @@ function looksLikeCommand(line: string): boolean {
           <!-- 思考过程：默认折叠（模型可能吐几千字），标题给字数，展开才看 -->
           <details v-if="t.reasoning" class="think">
             <summary>
-              思考过程（{{ t.reasoning.length }} 字）<span v-if="t.streaming" class="thinking">正在思考…</span>
+              <span class="tk">思考过程</span> {{ t.reasoning.length }} 字<span v-if="t.streaming" class="thinking">正在思考…</span>
             </summary>
-            <pre>{{ t.reasoning }}</pre>
+            <pre>{{ plainThink(t.reasoning) }}</pre>
           </details>
           <template v-for="(line, li) in (t.content || '').split('\n')" :key="li">
             <div v-if="looksLikeCommand(line)" class="code-line">{{ line }}</div>
@@ -222,7 +229,7 @@ function looksLikeCommand(line: string): boolean {
   border-radius: 4px; font-size: 11px; padding: 2px 4px; max-width: 220px; cursor: pointer;
 }
 .picker:hover { border-color: var(--ctp-blue); }
-.title { font-size: 12.5px; font-weight: 600; color: var(--ctp-text); }
+.title { font-size: 12.5px; font-weight: 600; color: var(--ctp-text); white-space: nowrap; flex-shrink: 0; }
 .badge {
   font-size: 10px;
   color: var(--ctp-blue);
@@ -239,9 +246,10 @@ function looksLikeCommand(line: string): boolean {
 .modes { display: flex; gap: 2px; margin-left: 4px; }
 .mode {
   background: none; border: 1px solid var(--ctp-surface0); color: var(--ctp-overlay0);
-  border-radius: 4px; font-size: 10px; padding: 1px 6px; cursor: pointer;
+  border-radius: 4px; font-size: 10px; padding: 2px 7px; cursor: pointer;
+  white-space: nowrap; flex-shrink: 0;
 }
-.mode.on { color: var(--ctp-blue); border-color: var(--ctp-blue); }
+.mode.on { color: var(--ctp-blue); border-color: var(--ctp-blue); background: var(--ctp-surface0); }
 .icon {
   background: none;
   border: none;
@@ -259,17 +267,38 @@ function looksLikeCommand(line: string): boolean {
   line-height: 1.5;
 }
 .notice.err { color: var(--ctp-red); }
-.turns { flex: 1; overflow-y: auto; padding: 10px; min-height: 0; }
+.turns { flex: 1; overflow-y: auto; padding: 12px; min-height: 0; scrollbar-width: thin; scrollbar-color: var(--ctp-surface1) transparent; }
+.turns::-webkit-scrollbar { width: 8px; }
+.turns::-webkit-scrollbar-thumb { background: var(--ctp-surface1); border-radius: 4px; }
+.turns::-webkit-scrollbar-thumb:hover { background: var(--ctp-surface2); }
 .empty { color: var(--ctp-overlay0); font-size: 11.5px; line-height: 1.7; }
 .empty ul { margin: 4px 0 8px; padding-left: 18px; }
 .empty b { color: var(--ctp-subtext0); }
 .empty .hint { color: var(--ctp-surface2); }
-.turn { margin-bottom: 12px; }
-.who { font-size: 10px; color: var(--ctp-overlay0); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.4px; }
-.turn.user .who { color: var(--ctp-blue); }
-.turn.user .body, .turn.user .text-line { color: var(--ctp-text); }
-.body { font-size: 12px; color: var(--ctp-subtext1); line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
-.turn.user .body { color: var(--ctp-text); }
+.turn { margin-bottom: 14px; animation: turn-in 0.15s ease; }
+@keyframes turn-in { from { opacity: 0; transform: translateY(3px); } }
+.who { font-size: 10px; color: var(--ctp-overlay0); margin-bottom: 4px; letter-spacing: 0.4px; }
+.turn.user .who { text-align: right; color: var(--ctp-blue); }
+/* 用户回合：右侧气泡，一眼能区分"我发的"和"AI 回的" */
+.turn.user .body {
+  background: var(--ctp-surface0);
+  border-radius: 9px;
+  border-top-right-radius: 3px;
+  padding: 7px 11px;
+  max-width: 92%;
+  margin-left: auto;
+  color: var(--ctp-text);
+}
+/* 助手回合：名称绿色 + 正文卡片托底（与用户气泡对称，长回复不裸奔） */
+.turn.assistant .who { color: var(--ctp-green); }
+.turn.assistant .body {
+  background: var(--ctp-base);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 9px;
+  border-top-left-radius: 3px;
+  padding: 8px 11px;
+}
+.body { font-size: 12px; color: var(--ctp-subtext1); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
 .text-line { white-space: pre-wrap; }
 .code-line {
   font-family: ui-monospace, monospace;
@@ -285,11 +314,11 @@ function looksLikeCommand(line: string): boolean {
 .cmd-box {
   background: var(--ctp-crust);
   border: 1px solid var(--ctp-surface1);
-  border-radius: 6px;
-  padding: 8px;
+  border-radius: 8px;
+  padding: 10px 12px;
   cursor: pointer;
 }
-.cmd-box:hover { border-color: var(--ctp-green); }
+.cmd-box:hover { border-color: var(--ctp-green); box-shadow: 0 0 0 1px var(--ctp-green); }
 .cmd-box code {
   display: block;
   font-family: ui-monospace, monospace;
@@ -310,17 +339,26 @@ function looksLikeCommand(line: string): boolean {
 }
 .mini.primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
 .mini-hint { font-size: 10px; color: var(--ctp-overlay0); }
-.think { margin: 0 0 6px; border-left: 2px solid var(--ctp-surface1); padding-left: 8px; }
+.think {
+  margin: 0 0 8px;
+  background: var(--ctp-crust);
+  border-left: 3px solid var(--ctp-surface2);
+  border-radius: 0 6px 6px 0;
+  padding: 6px 10px;
+}
 .think summary {
-  font-size: 11px; color: var(--ctp-overlay0); cursor: pointer; user-select: none; list-style: none;
+  font-size: 10.5px; color: var(--ctp-overlay0); cursor: pointer; user-select: none; list-style: none;
 }
 .think summary:hover { color: var(--ctp-subtext0); }
 .think summary::-webkit-details-marker { display: none; }
 .think summary::before { content: '▸ '; }
 .think[open] summary::before { content: '▾ '; }
+.tk { color: var(--ctp-subtext0); font-weight: 600; }
 .think pre {
-  margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
-  font-size: 11px; color: var(--ctp-overlay0); font-family: inherit; line-height: 1.5;
+  margin: 8px 0 0; padding-top: 8px; border-top: 1px dashed var(--ctp-surface0);
+  white-space: pre-wrap; word-break: break-word;
+  font-family: ui-monospace, monospace; font-size: 10.5px;
+  color: var(--ctp-overlay0); line-height: 1.6;
 }
 .thinking { color: var(--ctp-blue); margin-left: 6px; }
 .caret { color: var(--ctp-blue); animation: blink 1s steps(2) infinite; }
@@ -347,7 +385,8 @@ function looksLikeCommand(line: string): boolean {
   border-radius: 6px;
   font-size: 12px;
   font-weight: 600;
-  padding: 7px 12px;
+  padding: 7px 14px;
+  min-width: 52px;
   cursor: pointer;
 }
 .send:disabled { opacity: 0.45; cursor: not-allowed; }

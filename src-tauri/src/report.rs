@@ -848,6 +848,7 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
             serde_json::to_string(&d.series).unwrap_or_else(|_| "[]".into())
         ));
         o.push_str(CHART_JS);
+        o.push_str(PAGINATE_JS);
     }
 
     o.push_str("<hr><div class=\"meta\">由 SSHBox 生成 · 数值来自对目标机的实时采集</div></body></html>");
@@ -978,6 +979,32 @@ fn mb(kb: u64) -> String {
     }
 }
 
+
+// 长列表分页：磁盘挂载点、监听端口这类可能几十行的表，默认只显示前 10 条，
+// 配「展开全部 N 条」按钮。自包含原则不变——纯 JS，不引库。
+const PAGINATE_JS: &str = r##"
+<script>
+(function () {
+  document.querySelectorAll('table').forEach(function (t) {
+    var trs = Array.prototype.slice.call(t.querySelectorAll('tr'));
+    var data = trs.filter(function (r) { return !r.querySelector('th'); });
+    if (data.length <= 10) return;
+    data.forEach(function (r, i) { if (i >= 10) r.style.display = 'none'; });
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '展开全部 ' + data.length + ' 条';
+    btn.style.cssText = 'margin:6px 0;padding:3px 10px;font-size:11px;cursor:pointer;' +
+      'background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;display:block';
+    btn.onclick = function () {
+      var opening = data[data.length - 1].style.display === 'none';
+      data.forEach(function (r) { r.style.display = opening ? '' : 'none'; });
+      btn.textContent = opening ? '收起' : '展开全部 ' + data.length + ' 条';
+    };
+    t.parentNode.insertBefore(btn, t.nextSibling);
+  });
+})();
+</script>
+"##;
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -1128,7 +1155,17 @@ async fn ai_summary(d: &ReportData) -> Result<String> {
             t0.elapsed().as_millis()
         ),
     }
-    out
+    // 自建模型（Qwen3 风格）常把思考写进正文且服务端不拆字段 → 剥离后再进报告
+    out.map(|t| {
+        let (answer, think) = crate::ai::strip_thinking(&t);
+        if let Some(th) = &think {
+            log::info!(
+                "[ai] 报告结论：从正文剥离思考 {} 字（模型把思考写进了 content）",
+                th.chars().count()
+            );
+        }
+        answer
+    })
 }
 
 #[tauri::command]
