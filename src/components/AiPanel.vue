@@ -226,7 +226,8 @@ function plainThink(s: string): string {
 }
 .picker {
   background: var(--ctp-crust); color: var(--ctp-text); border: 1px solid var(--ctp-surface1);
-  border-radius: 4px; font-size: 11px; padding: 2px 4px; max-width: 220px; cursor: pointer;
+  border-radius: 4px; font-size: 11px; padding: 2px 4px; max-width: 150px; min-width: 0;
+  flex-shrink: 1; cursor: pointer;
 }
 .picker:hover { border-color: var(--ctp-blue); }
 .title { font-size: 12.5px; font-weight: 600; color: var(--ctp-text); white-space: nowrap; flex-shrink: 0; }
@@ -257,6 +258,7 @@ function plainThink(s: string): string {
   font-size: 14px;
   cursor: pointer;
   padding: 0 3px;
+  flex-shrink: 0;
 }
 .icon:hover { color: var(--ctp-text); }
 .notice {

@@ -468,6 +468,13 @@ export const api = {
       to,
       destDir: destDir ?? null,
     }),
+  /** 总览 CSV：后端落盘到导出目录（<a download> 在 WebView2 里会被静默拦截）。 */
+  exportCsvText: (filename: string, content: string, destDir?: string | null) =>
+    call<HistoryExport>('export_csv_text', {
+      filename,
+      content,
+      destDir: destDir ?? null,
+    }),
 
   // sftp / 本地文件
   localList: (path?: string | null) => call<LocalListing>('local_list', { path: path ?? null }),

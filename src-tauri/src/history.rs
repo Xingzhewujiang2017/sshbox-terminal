@@ -703,6 +703,52 @@ pub async fn history_export(
     .await
 }
 
+/// 把一段 CSV 文本（前端已拼好 BOM+CRLF）落盘到导出目录。
+/// 总览面板的「导出 CSV / 组历史 CSV」走这里 —— WebView2 里 <a download>
+/// 会被静默拦截，按钮点了没反应，所以导出一律走后端写盘（与历史回看同款）。
+#[tauri::command]
+pub async fn export_csv_text(
+    filename: String,
+    content: String,
+    dest_dir: Option<String>,
+) -> std::result::Result<ExportResult, String> {
+    blocking(move || {
+        let dir = match dest_dir {
+            Some(d) => PathBuf::from(d),
+            None => db_path()
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("exports"),
+        };
+        export_csv_text_at(&filename, &content, &dir)
+    })
+    .await
+}
+
+fn export_csv_text_at(filename: &str, content: &str, dir: &Path) -> Result<ExportResult> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("创建导出目录失败: {}", dir.display()))?;
+    // 只拦 Windows 文件名非法字符，中文分组名要原样保留
+    let safe: String = filename
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0' | '\r' | '\n' => '_',
+            _ => c,
+        })
+        .collect();
+    let path = dir.join(safe);
+    let bytes = content.as_bytes().len() as u64;
+    std::fs::write(&path, content.as_bytes())
+        .with_context(|| format!("写入失败: {}", path.display()))?;
+    // content.lines() 认识 \r\n，不会把 \r 算进行内容
+    let rows = content.lines().count().saturating_sub(1) as i64;
+    Ok(ExportResult {
+        path: path.display().to_string(),
+        rows,
+        bytes,
+    })
+}
+
 // --- tests -----------------------------------------------------------------
 
 #[cfg(test)]
@@ -722,6 +768,28 @@ mod tests {
         let _ = std::fs::remove_file(p.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(p.with_extension("sqlite-shm"));
         p
+    }
+
+    #[test]
+    fn export_csv_text_writes_bom_crlf_chinese_name() {
+        let dir = std::env::temp_dir().join(format!("sshbox-csv-{}", now_unix() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = "\u{feff}主机,分组,CPU%\r\n测试机,测试组,0.5\r\n";
+        let res = export_csv_text_at(
+            "SSHBox-总览-测试组-20260920.csv",
+            content,
+            &dir,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&res.path).unwrap();
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "要带 BOM，Excel 才不串码");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\r\n"), "要 CRLF 换行");
+        assert!(text.contains("测试组"), "中文分组名原样保留");
+        assert_eq!(res.rows, 1, "1 条数据行（表头不计）");
+        assert_eq!(res.bytes as usize, content.as_bytes().len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn metrics(cpu: f64, mem: f64, net: Vec<NetIf>, io: Vec<DiskIo>) -> Metrics {

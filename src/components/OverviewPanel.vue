@@ -316,22 +316,27 @@ const cpuSeries = (r: HistoryRange) => r.buckets.map((b) => b.cpu_pct)
 const memSeries = (r: HistoryRange) => r.buckets.map((b) => b.mem_pct)
 
 // --- 导出 CSV（#4） ---
-function downloadCsv(filename: string, rows: (string | number)[][]) {
+const exportMsg = ref('')
+
+async function downloadCsv(filename: string, rows: (string | number)[][]) {
   const esc = (v: string | number) => {
     const s = String(v ?? '')
     if (s.indexOf(',') >= 0 || s.indexOf('"') >= 0) {
-          return '"' + s.split('"').join('""') + '"'
-        }
+      return '"' + s.split('"').join('""') + '"'
+    }
     return s
   }
   // BOM 前缀，Excel 打开 UTF-8 中文不乱码
-  const csv = "\ufeff" + rows.map((r) => r.map(esc).join(',')).join("\r\n")
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(a.href)
+  const csv = '﻿' + rows.map((r) => r.map(esc).join(',')).join(String.fromCharCode(13, 10))
+// WebView2 里 <a download> 会被静默拦截（点了没反应），所以走后端落盘，
+  // 与历史回看的导出同一条路子（写 %APPDATA%\sshbox\exports\ 并返回路径）。
+  try {
+    const r = await api.exportCsvText(filename, csv)
+    const kb = (r.bytes / 1024).toFixed(1)
+    exportMsg.value = `已导出 ${r.rows} 行（${kb} KB）→ ${r.path}`
+  } catch (e) {
+    exportMsg.value = `导出失败：${(e as Error).message}`
+  }
 }
 
 function csvDate(): string {
@@ -364,7 +369,10 @@ function exportSnapshotCsv() {
 
 /** 只导出**当前已加载**的历史窗口（组内历史矩阵的数据），窗口见 histKey。 */
 function exportHistoryCsv() {
-  if (!Object.keys(histData.value).length) return
+  if (!Object.keys(histData.value).length) {
+    exportMsg.value = '该组暂无历史数据 —— 先让组内主机在线跑一会儿，再点刷新'
+    return
+  }
   const rows: (string | number)[][] = [
     ['主机', '时间戳', 'CPU%', '内存%', '网络↓B/s', '网络↑B/s', '磁盘读B/s', '磁盘写B/s', '负载1'],
   ]
@@ -435,10 +443,11 @@ onBeforeUnmount(() => {
                         title="导出组内历史序列为 CSV（当前时间窗口）"
                       >
                         组历史 CSV
-                      </button>
-                    </div>
+                                              </button>
+                                            </div>
+                              <div v-if="exportMsg" class="export-msg" :class="{ err: exportMsg.startsWith('导出失败') }">{{ exportMsg }}</div>
 
-      <div v-if="historyError" class="err">历史库读取失败：{{ historyError }}</div>
+                              <div v-if="historyError" class="err">历史库读取失败：{{ historyError }}</div>
 
       <div v-if="!rows.length" class="empty">
         当前没有已连接的会话。双击左侧主机连接，或勾选「包含离线」看历史最后状态。
