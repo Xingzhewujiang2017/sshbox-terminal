@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::history;
-use crate::monitor::{self, HardwareInfo, Metrics, ProcInfo, ServiceInfo};
+use crate::monitor::{self, HardwareInfo, Metrics, PingInfo, ProcInfo, ServiceInfo};
 use crate::ssh::{SessionManager, StaticInfo};
 
 // ---------------------------------------------------------------------------
@@ -102,6 +102,8 @@ pub struct ReportData {
     pub series: Vec<ChartSeries>,
     /// 进程表（采集时已按 CPU 降序）。报告里只列 Top N。
     pub processes: Vec<ProcInfo>,
+    /// 到默认网关的时延/丢包。拿不到就是 None —— 那一节整块不显示，不编数字。
+    pub ping: Option<PingInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +501,23 @@ pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
     }
     o.push('\n');
 
+    if let Some(p) = &d.ping {
+        o.push_str("| 链路质量（到默认网关） | 值 |\n|---|---|\n");
+        o.push_str(&format!("| 目标 | {} |\n", p.target));
+        o.push_str(&format!(
+            "| 平均时延 | {:.2} ms（min {:.2} / max {:.2}） |\n",
+            p.rtt_avg, p.rtt_min, p.rtt_max
+        ));
+        if p.jitter > 0.0 {
+            o.push_str(&format!("| 抖动 | {:.2} ms |\n", p.jitter));
+        }
+        o.push_str(&format!(
+            "| 丢包 | {:.0}%（{}/{} 个包通） |\n",
+            p.loss_pct, p.recv, p.sent
+        ));
+    }
+    o.push('\n');
+
     o.push_str("## 磁盘\n\n");
     o.push_str("| 挂载点 | 已用 | 总量 | 使用率 |\n|---|---|---|---|\n");
     for disk in &m.disks {
@@ -784,6 +803,23 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
         o.push_str(&format!(
             "<tr><td>负载 (1 分钟)</td><td>—</td><td>{:.2}</td></tr>",
             h.load_max
+        ));
+        o.push_str("</table>");
+    }
+
+    if let Some(p) = &d.ping {
+        o.push_str("<table><tr><th>链路质量（到默认网关）</th><th>值</th></tr>");
+        o.push_str(&format!("<tr><td>目标</td><td>{}</td></tr>", esc(&p.target)));
+        o.push_str(&format!(
+            "<tr><td>平均时延</td><td>{:.2} ms（min {:.2} / max {:.2}）</td></tr>",
+            p.rtt_avg, p.rtt_min, p.rtt_max
+        ));
+        if p.jitter > 0.0 {
+            o.push_str(&format!("<tr><td>抖动</td><td>{:.2} ms</td></tr>", p.jitter));
+        }
+        o.push_str(&format!(
+            "<tr><td>丢包</td><td>{:.0}%（{}/{} 个包通）</td></tr>",
+            p.loss_pct, p.recv, p.sent
         ));
         o.push_str("</table>");
     }
@@ -1152,6 +1188,7 @@ pub async fn report_generate(
         history: hist,
         series,
         processes: snap.processes,
+        ping: snap.ping,
     };
 
     let mut ai_used = false;
@@ -1291,6 +1328,7 @@ mod tests {
             history: None,
             series: vec![],
             processes: vec![],
+            ping: None,
         }
     }
 
@@ -1453,6 +1491,34 @@ mod tests {
         // 进程名为空也不能渲染出破表
         assert!(top_procs(&d.processes, false, 2).len() == 2);
         assert!(top_procs(&d.processes, true, 1)[0].pid == 2);
+    }
+
+    /// 链路质量：有数据才显示；拿不到就整块不出现（不编 0 ms 骗人）。
+    #[test]
+    fn network_section_shows_latency_and_loss_only_when_available() {
+        let mut d = mk(10.0, 10.0, 0, 0);
+        d.ping = Some(PingInfo {
+            target: "172.20.0.1".into(),
+            sent: 3,
+            recv: 3,
+            loss_pct: 0.0,
+            rtt_min: 0.04,
+            rtt_avg: 0.05,
+            rtt_max: 0.06,
+            jitter: 0.007,
+        });
+        let md = render_markdown(&d, None);
+        assert!(md.contains("链路质量"), "{md}");
+        assert!(md.contains("0.05"), "平均时延要显示出来");
+        assert!(md.contains("丢包"), "丢包要显示");
+        let html = render_html(&d, None);
+        assert!(html.contains("链路质量") && html.contains("172.20.0.1"));
+
+        // 拿不到 ping（没网关/没装 ping）→ 整块不出现
+        let mut d2 = mk(10.0, 10.0, 0, 0);
+        d2.ping = None;
+        assert!(!render_markdown(&d2, None).contains("链路质量"));
+        assert!(!render_html(&d2, None).contains("链路质量"));
     }
 
     #[test]

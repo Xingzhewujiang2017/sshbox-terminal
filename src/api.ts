@@ -213,6 +213,18 @@ export interface DiskUsage {
   used_kb: number
   use_pct: number
 }
+/// 到默认网关的时延/丢包。拿不到就是 null（没网关 / 没装 ping）。
+export interface PingInfo {
+  target: string
+  sent: number
+  recv: number
+  loss_pct: number
+  rtt_min: number
+  rtt_avg: number
+  rtt_max: number
+  jitter: number
+}
+
 export interface NetIf {
   name: string
   rx_bps: number

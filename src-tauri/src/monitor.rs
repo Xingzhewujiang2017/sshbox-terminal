@@ -106,6 +106,21 @@ pub struct ProcInfo {
     pub rss_kb: u64,
 }
 
+/// 时延 / 丢包。测的是到**默认网关**的质量：不依赖公网，网关不通本身就该报警。
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct PingInfo {
+    /// 被 ping 的目标（网关地址）。空表示这次没测到。
+    pub target: String,
+    pub sent: u32,
+    pub recv: u32,
+    pub loss_pct: f64,
+    pub rtt_min: f64,
+    pub rtt_avg: f64,
+    pub rtt_max: f64,
+    /// 抖动（mdev）。iputils 才给，busybox 没有就留 0。
+    pub jitter: f64,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct NetIf {
     pub name: String,
@@ -192,6 +207,19 @@ if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
   if [ $? -eq 0 ]; then
     echo "@@DOCKER_YES@@"
     printf '%s\n' "$out" | head -20
+  fi
+fi
+echo "@@PING@@"
+# 时延/丢包测的是**到默认网关**的链路质量：不依赖公网、不受墙影响，
+# 而且网关不通本身就是最该报警的事。默认网关拿不到就整段跳过。
+GW=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+[ -z "$GW" ] && GW=$(route -n 2>/dev/null | awk '$1=="0.0.0.0" {print $2; exit}')
+if [ -n "$GW" ] && command -v ping >/dev/null 2>&1; then
+  # -c 3 -i 0.3 -W 1 ≈ 1 秒；外面再套 timeout，网关黑洞时也不会拖住 15 秒的慢采集。
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5 ping -c 3 -i 0.3 -W 1 "$GW" 2>&1 | tail -3
+  else
+    ping -c 3 -i 0.3 -W 1 "$GW" 2>&1 | tail -3
   fi
 fi
 echo "@@HW_TEMP@@"
@@ -567,6 +595,69 @@ fn parse_sys(s: &HashMap<String, Vec<String>>) -> (f64, f64) {
 /// Turn `@@PROC@@` rows into per-process CPU by differencing tick counters
 /// against the previous sample. Sorted CPU desc then RSS desc, top N only —
 /// a process that just appeared has no baseline and reports 0.
+/// 解析 ping 输出。
+///
+/// 两种格式都要认：iputils 给 `rtt min/avg/max/mdev = a/b/c/d ms`，
+/// busybox（Alpine 之类）给 `round-trip min/avg/max = a/b/c ms` 且没有 mdev。
+/// 只认一种的话，一类发行版上时延会永远是空 —— 这种"功能静默失效"最难查。
+fn parse_ping(sec: &HashMap<String, Vec<String>>) -> Option<PingInfo> {
+    let lines = sec.get("PING")?;
+    let mut info = PingInfo::default();
+    let mut got_stats = false;
+
+    for l in lines {
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("PING ") {
+            if let Some(host) = t.split_whitespace().nth(1) {
+                info.target = host.to_string();
+            }
+        }
+        if let Some(i) = t.find("% packet loss") {
+            // "3 packets transmitted, 3 received, 0% packet loss, time 605ms"
+            let head = &t[..i];
+            if let Some(pct) = head.split_whitespace().last() {
+                info.loss_pct = pct.parse().unwrap_or(0.0);
+            }
+            if let Some(n) = head.split(" packets transmitted").next() {
+                info.sent = n.trim().parse().unwrap_or(0);
+            }
+            if let Some(seg) = head.split(", ").nth(1) {
+                let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+                info.recv = digits.parse().unwrap_or(0);
+            }
+            got_stats = true;
+        }
+        // rtt min/avg/max/mdev = 0.045/0.052/0.061/0.007 ms
+        // round-trip min/avg/max = 0.045/0.052/0.061 ms
+        if t.starts_with("rtt ") || t.starts_with("round-trip ") {
+            if let Some((_, rhs)) = t.split_once('=') {
+                let nums: Vec<f64> = rhs
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .split('/')
+                    .filter_map(|x| x.parse().ok())
+                    .collect();
+                if nums.len() >= 3 {
+                    info.rtt_min = nums[0];
+                    info.rtt_avg = nums[1];
+                    info.rtt_max = nums[2];
+                    info.jitter = nums.get(3).copied().unwrap_or(0.0);
+                    got_stats = true;
+                }
+            }
+        }
+    }
+
+    if !got_stats || info.target.is_empty() {
+        return None;
+    }
+    Some(info)
+}
+
 fn parse_procs(
     lines: Option<&Vec<String>>,
     prev: &mut PrevSample,
@@ -1212,6 +1303,8 @@ pub struct Snapshot {
     pub hardware: HardwareInfo,
     /// 进程表（报告里的「进程」小节用）。`parse_procs` 顺带按 CPU 降序排好。
     pub processes: Vec<ProcInfo>,
+    /// 时延/丢包（到默认网关）。拿不到就是 None，报告里那一节直接不显示。
+    pub ping: Option<PingInfo>,
 }
 
 /// 采一次完整快照，给报告用。
@@ -1240,10 +1333,10 @@ pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<
         .ok_or_else(|| anyhow::anyhow!("指标解析失败（采集脚本输出异常）"))?;
 
     // 服务/硬件失败不致命：报告少两节，总比整份出不来强。
-    let (services, hardware) = match exec_capture(handle, &slow_script()).await {
+    let (services, hardware, ping) = match exec_capture(handle, &slow_script()).await {
         Ok(sraw) => {
             let sec = sections(&sraw);
-            (parse_services(&sec), parse_hardware(&sec))
+            (parse_services(&sec), parse_hardware(&sec), parse_ping(&sec))
         }
         Err(e) => {
             log::warn!("报告：服务/硬件采集失败: {:#}", e);
@@ -1260,6 +1353,7 @@ pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<
                     fans: Vec::new(),
                     gpus: Vec::new(),
                 },
+                None,
             )
         }
     };
@@ -1270,6 +1364,7 @@ pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<
         services,
         hardware,
         processes,
+        ping,
     })
 }
 
@@ -1391,6 +1486,13 @@ pub fn spawn(
                         let _ = app.emit(
                             "ssh://hardware",
                             serde_json::json!({ "sid": sid, "hardware": hw }),
+                        );
+                        // 时延/丢包跟慢采集同频：ping 一次约 1 秒 wall time，
+                        // 塞进 2 秒的快循环会互相打架，而链路质量本来也不会秒级跳变。
+                        let pg = parse_ping(&sec);
+                        let _ = app.emit(
+                            "ssh://ping",
+                            serde_json::json!({ "sid": sid, "ping": pg }),
                         );
                     }
                     Err(e) => log::warn!("服务信息采集失败: {:#}", e),
@@ -1787,6 +1889,47 @@ mod tests {
             "20 ticks → 20%"
         );
         assert_eq!(m2.processes[1].pid, 1);
+    }
+
+    /// 时延解析要认两种格式：iputils 给 mdev，busybox 只给 min/avg/max。
+    /// 只认一种的话，一类发行版上时延永远空白 —— 这种"功能静默失效"最难查。
+    #[test]
+    fn parse_ping_handles_iputils_and_busybox() {
+        let mut sec = HashMap::new();
+        sec.insert(
+            "PING".to_string(),
+            vec![
+                "PING 172.20.0.1 (172.20.0.1) 56(84) bytes of data.".to_string(),
+                "64 bytes from 172.20.0.1: icmp_seq=1 ttl=64 time=0.052 ms".to_string(),
+                "--- 172.20.0.1 ping statistics ---".to_string(),
+                "3 packets transmitted, 3 received, 0% packet loss, time 605ms".to_string(),
+                "rtt min/avg/max/mdev = 0.045/0.052/0.061/0.007 ms".to_string(),
+            ],
+        );
+        let p = parse_ping(&sec).expect("iputils 格式要能解析");
+        assert_eq!(p.target, "172.20.0.1");
+        assert_eq!((p.sent, p.recv), (3, 3));
+        assert_eq!(p.loss_pct, 0.0);
+        assert!((p.rtt_avg - 0.052).abs() < 1e-9);
+        assert!((p.jitter - 0.007).abs() < 1e-9);
+
+        let mut b = HashMap::new();
+        b.insert(
+            "PING".to_string(),
+            vec![
+                "PING 10.0.0.1 (10.0.0.1): 56 data bytes".to_string(),
+                "3 packets transmitted, 2 packets received, 33% packet loss".to_string(),
+                "round-trip min/avg/max = 1.1/2.2/3.3 ms".to_string(),
+            ],
+        );
+        let p2 = parse_ping(&b).expect("busybox 格式要能解析");
+        assert_eq!(p2.loss_pct, 33.0);
+        assert_eq!((p2.sent, p2.recv), (3, 2));
+        assert!((p2.rtt_max - 3.3).abs() < 1e-9);
+        assert_eq!(p2.jitter, 0.0, "busybox 没有 mdev，留 0 而不是瞎猜");
+
+        // 没网关 / 没装 ping / 目标不可达时整段跳过 → None，报告里那一节不显示
+        assert!(parse_ping(&HashMap::new()).is_none());
     }
 
     #[test]

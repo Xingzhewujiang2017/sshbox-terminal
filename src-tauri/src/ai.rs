@@ -112,6 +112,27 @@ pub fn presets() -> Vec<AiProfile> {
     ]
 }
 
+/// 空回复时的诊断。**必须分清两种情况**，否则用户会一直重试一个永远不会成功的请求：
+///
+/// - `finish_reason = length`：输出上限被吃光，重试必然同样截断。推理模型尤其常见 ——
+///   思考过程把额度花完，正文一个字都没留下。要调「最大输出」或换模型，而不是重试。
+/// - 其它：提供方偶发空回复（HTTP 200 + 空正文），重试一次有意义。
+fn empty_reply_error(finish: &str, raw: &str, body: &str) -> String {
+    if finish == "length" {
+        let thought = raw.contains("reasoning_content") || raw.contains("\"thinking\"");
+        let hint = if thought {
+            "模型的思考过程写满了输出上限，正文一个字都没留下"
+        } else {
+            "输出被输出上限截断了，正文一个字都没留下"
+        };
+        format!("{hint} —— 这不是网络或密钥问题：把「最大输出」调大，或换一个非推理模型。\n原始响应：{body}")
+    } else {
+        format!(
+            "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型。\n原始响应：{body}"
+        )
+    }
+}
+
 /// 密钥在凭据管理器里的条目名。
 pub fn key_entry(profile_id: &str) -> String {
     format!("ai:{profile_id}")
@@ -608,7 +629,19 @@ pub async fn send_once(
         if !out.trim().is_empty() {
             return Ok(out);
         }
-        // 空回复时把**原始响应**带出来：只报"空内容"等于让用户去猜是限流、模型名、
+        let finish = v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        // 输出上限被吃光时**重试毫无意义**（下次同样截断），直接给准确诊断，别浪费一次请求。
+        if finish == "length" {
+            let body: String = text.chars().take(400).collect();
+            log::warn!("[ai] 输出被截断且正文为空：{}", built.url);
+            return Err(anyhow!("{}", empty_reply_error(finish, &text, &body)));
+        }
+        // 其余空回复把**原始响应**带出来：只报"空内容"等于让用户去猜是限流、模型名、
         // 还是服务端形状变了。截断保存，最后一轮的响应进错误信息。
         last_body = text.chars().take(400).collect();
         if attempt == 0 {
@@ -619,9 +652,7 @@ pub async fn send_once(
             );
         }
     }
-    Err(anyhow!(
-        "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型。\n原始响应：{last_body}"
-    ))
+    Err(anyhow!("{}", empty_reply_error("", "", &last_body)))
 }
 
 /// 流式请求。每个增量通过 `on_delta` 交出去，返回完整文本。
@@ -1011,6 +1042,26 @@ mod tests {
 
         // 短文本原样返回
         assert_eq!(truncate_middle("short", 100), "short");
+    }
+
+    /// 空回复的诊断必须分清「输出被截断」和「提供方偶发空回复」。
+    /// 前者重试必然同样失败，建议用户重试等于让他白试。
+    #[test]
+    fn empty_reply_diagnosis_distinguishes_truncation_from_flakiness() {
+        let raw = r#"{"choices":[{"finish_reason":"length","message":{"content":"","reasoning_content":"想了很久"}}]}"#;
+        let e = empty_reply_error("length", raw, raw);
+        assert!(e.contains("思考过程写满了输出上限"), "{e}");
+        assert!(e.contains("换一个非推理模型"), "{e}");
+        assert!(!e.contains("可再试一次"), "截断重试没用，不能这么建议：{e}");
+
+        // 普通模型输出上限太小（没有思考内容）
+        let e3 = empty_reply_error("length", "{}", "{}");
+        assert!(e3.contains("输出被输出上限截断"), "{e3}");
+
+        // 真·偶发空回复：保留重试建议，且必须带原始响应
+        let e2 = empty_reply_error("stop", "{}", "{}");
+        assert!(e2.contains("可再试一次"), "{e2}");
+        assert!(e2.contains("原始响应"), "{e2}");
     }
 
     #[test]

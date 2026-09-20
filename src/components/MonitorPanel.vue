@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, reactive, ref, computed, nextTick, watch } from 'vue'
+import type { PingInfo } from '../api'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
 import { chartPalette, themeVersion } from '../theme'
@@ -90,6 +91,7 @@ const metrics = ref<Metrics | null>(null)
 const paused = ref(false)
 const services = ref<ServiceInfo | null>(null)
 const hardware = ref<HardwareInfo | null>(null)
+const ping = ref<PingInfo | null>(null)
 /** 传感器多起来（8 核 + 2 个 NVMe）会淹掉面板，默认只露最热的几个。 */
 const TEMP_SHOWN = 5
 const tempsExpanded = ref(false)
@@ -137,6 +139,7 @@ let unlistenStatic: (() => void) | null = null
 let unlistenMetrics: (() => void) | null = null
 let unlistenServices: (() => void) | null = null
 let unlistenHardware: (() => void) | null = null
+let unlistenPing: (() => void) | null = null
 
 const rootEl = ref<HTMLDivElement>()
 const cpuEl = ref<HTMLDivElement>()
@@ -370,6 +373,9 @@ onMounted(async () => {
   } catch {
     /* 还没采到就等事件 */
   }
+  unlistenPing = await listen<{ sid: string; ping: PingInfo | null }>('ssh://ping', (e) => {
+    if (e.payload.sid === props.sid) ping.value = e.payload.ping
+  })
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
     const m = e.payload.metrics
@@ -405,6 +411,7 @@ onBeforeUnmount(() => {
   unlistenMetrics?.()
   unlistenServices?.()
   unlistenHardware?.()
+  unlistenPing?.()
   ro?.disconnect()
   cpuChart?.dispose()
   netChart?.dispose()
@@ -474,6 +481,12 @@ onBeforeUnmount(() => {
 
       <div class="net-box">
         <div class="section-title">网络 <span class="unit">{{ windowLabel }}</span></div>
+        <div v-if="ping" class="net-quality">
+          <span>时延 {{ ping.rtt_avg.toFixed(2) }} ms</span>
+          <span v-if="ping.jitter > 0">抖动 {{ ping.jitter.toFixed(2) }} ms</span>
+          <span :class="{ bad: ping.loss_pct >= 5 }">丢包 {{ ping.loss_pct.toFixed(0) }}%</span>
+          <span class="unit">到 {{ ping.target }}</span>
+        </div>
         <div class="net-total">
           <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
           <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
@@ -703,6 +716,8 @@ onBeforeUnmount(() => {
 .section-title .unit { color: var(--ctp-surface2); font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 6px; }
 .card, .net-box, .disk-box { background: var(--ctp-base); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
 .net-total { display: flex; gap: 16px; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+.net-quality { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.net-quality .bad { color: #e5484d; font-weight: 600; }
 .down { color: var(--ctp-green); } .up { color: var(--ctp-blue); }
 .net-if, .io-row { display: flex; gap: 10px; color: var(--ctp-subtext0); padding: 1px 0; }
 .ifname { color: var(--ctp-overlay0); min-width: 56px; }
