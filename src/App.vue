@@ -204,13 +204,25 @@ async function initDrop() {
 
 // --- AI（v0.5） --------------------------------------------------------------
 /** 终端实例按 sid 存：AI 要读「当前会话」的选中文本和最近输出。 */
-const termRefs = new Map<string, { getSelection?: () => string; getTail?: (n?: number) => string }>()
+type TermHandle = {
+  getSelection?: () => string
+  getTail?: (n?: number) => string
+  copySelection?: () => Promise<boolean>
+  pasteClipboard?: () => Promise<boolean>
+  selectAllText?: () => void
+  clearScreen?: () => void
+}
+const termRefs = new Map<string, TermHandle>()
 function setTermRef(sid: string, el: unknown) {
-  if (el) termRefs.set(sid, el as { getSelection: () => string; getTail: () => string })
+  if (el) termRefs.set(sid, el as TermHandle)
   else termRefs.delete(sid)
 }
 
-const aiMenu = ref<{ x: number; y: number; selection: string } | null>(null)
+/**
+ * 右键菜单状态。**sid 一起记下来**：菜单要作用在「右键的那块终端」上，
+ * 而不是「当前激活的标签」—— 多标签下这两者不一定是一回事。
+ */
+const aiMenu = ref<{ x: number; y: number; selection: string; sid: string } | null>(null)
 const reportBusy = ref(false)
 
 function toggleAi() {
@@ -218,9 +230,41 @@ function toggleAi() {
   if (ai.open && !aiReady()) ai.error = aiDisabledReason()
 }
 
-/** 终端右键：记下坐标和选中文本，弹小菜单。 */
-function onTermContext(payload: { x: number; y: number; selection: string }) {
-  aiMenu.value = payload
+/** 终端右键：记下坐标、选中文本和属于哪个会话，弹菜单。 */
+function onTermContext(payload: { x: number; y: number; selection: string }, sid: string) {
+  aiMenu.value = { ...payload, sid }
+}
+
+function termBanner(kind: 'error' | 'info', text: string) {
+  banner.value = { kind, text }
+  if (kind === 'info') window.setTimeout(() => (banner.value = null), 4000)
+}
+
+/** 菜单里的复制/粘贴/全选/清屏都作用于右键的那块终端。 */
+async function copyFromTerm() {
+  const sid = aiMenu.value?.sid ?? ''
+  aiMenu.value = null
+  const ok = await termRefs.get(sid)?.copySelection?.()
+  termBanner(ok ? 'info' : 'error', ok ? '已复制到剪贴板' : '没有选中内容 —— 先拖选一段再复制')
+}
+
+async function pasteToTerm() {
+  const sid = aiMenu.value?.sid ?? ''
+  aiMenu.value = null
+  const ok = await termRefs.get(sid)?.pasteClipboard?.()
+  termBanner(ok ? 'info' : 'error', ok ? '已粘贴（没有回车，确认后自己按）' : '剪贴板是空的，或系统不允许读取')
+}
+
+function selectAllInTerm() {
+  const sid = aiMenu.value?.sid ?? ''
+  aiMenu.value = null
+  termRefs.get(sid)?.selectAllText?.()
+}
+
+function clearTerm() {
+  const sid = aiMenu.value?.sid ?? ''
+  aiMenu.value = null
+  termRefs.get(sid)?.clearScreen?.()
 }
 
 function currentTerm() {
@@ -228,7 +272,7 @@ function currentTerm() {
   return sid ? termRefs.get(sid) : undefined
 }
 
-function openAiFor(kind: 'explain' | 'command', selection: string, prompt = '') {
+function openAiFor(kind: 'explain' | 'command', selection: string, prompt = '', sid?: string) {
   aiMenu.value = null
   ai.open = true
   if (!aiReady()) {
@@ -238,20 +282,22 @@ function openAiFor(kind: 'explain' | 'command', selection: string, prompt = '') 
   void ask(kind, {
     selection,
     prompt,
-    sid: activeTab.value?.sid ?? undefined,
+    sid: sid ?? activeTab.value?.sid ?? undefined,
   })
 }
 
 function explainSelection() {
-  openAiFor('explain', aiMenu.value?.selection ?? '')
+  const sid = aiMenu.value?.sid
+  openAiFor('explain', aiMenu.value?.selection ?? '', '', sid)
 }
 
 function askCommandFromSelection() {
   const sel = aiMenu.value?.selection ?? ''
+  const sid = aiMenu.value?.sid
   aiMenu.value = null
   ai.open = true
   // 选中内容当"需求描述"的默认值，用户可以在面板里改
-  void ask('command', { prompt: sel.trim() || '', sid: activeTab.value?.sid ?? undefined })
+  void ask('command', { prompt: sel.trim() || '', sid: sid ?? activeTab.value?.sid ?? undefined })
 }
 
 /** 把 AI 生成的命令填进终端 —— **不自动回车**，由用户确认。
@@ -985,7 +1031,7 @@ function statusDot(t: Tab) {
             :active="i === activeIdx"
             :ref="(el) => setTermRef(t.sid, el)"
             @data="(d) => onTermData(t, d)"
-            @context="onTermContext"
+            @context="(p) => onTermContext(p, t.sid)"
           />
           </div>
         </div>
@@ -1033,10 +1079,22 @@ function statusDot(t: Tab) {
       :style="{ left: aiMenu.x + 'px', top: aiMenu.y + 'px' }"
       @click.stop
     >
-      <div class="ai-ctx-item" @click="explainSelection()">
-        解释这段{{ aiMenu.selection.trim() ? '' : '（最近的输出）' }}
+      <!-- 复制粘贴是基本盘，永远排在最上面；AI 是增强，永远在分隔线下面。
+           没选中时「复制」置灰并说明原因，不做一个点了没反应的按钮。 -->
+      <div class="ai-ctx-item" :class="{ dim: !aiMenu.selection.trim() }" @click="copyFromTerm()">
+        复制<span class="ai-ctx-key">Ctrl+Shift+C</span>
       </div>
-      <div class="ai-ctx-item" @click="askCommandFromSelection()">用自然语言生成命令…</div>
+      <div class="ai-ctx-item" @click="pasteToTerm()">
+        粘贴<span class="ai-ctx-key">Ctrl+Shift+V</span>
+      </div>
+      <div class="ai-ctx-sep"></div>
+      <div class="ai-ctx-item" @click="explainSelection()">
+        解释这段（AI）{{ aiMenu.selection.trim() ? '' : '· 最近的输出' }}
+      </div>
+      <div class="ai-ctx-item" @click="askCommandFromSelection()">用自然语言生成命令…（AI）</div>
+      <div class="ai-ctx-sep"></div>
+      <div class="ai-ctx-item" @click="selectAllInTerm()">全选</div>
+      <div class="ai-ctx-item" @click="clearTerm()">清屏</div>
       <div class="ai-ctx-sep"></div>
       <div class="ai-ctx-item" @click="aiMenu = null">取消</div>
     </div>
@@ -1187,6 +1245,9 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(-
 }
 .ai-ctx-item { padding: 6px 10px; font-size: 12px; color: var(--ctp-text); border-radius: 4px; cursor: pointer; }
 .ai-ctx-item:hover { background: var(--ctp-surface0); }
+.ai-ctx-item.dim { color: var(--ctp-overlay0); }
+.ai-ctx-item.dim:hover { background: transparent; cursor: default; }
+.ai-ctx-key { float: right; margin-left: 16px; color: var(--ctp-overlay0); font-size: 11px; }
 .ai-ctx-sep { height: 1px; background: var(--ctp-surface0); margin: 4px 2px; }
 /* 报告生成后的浮层卡片 */
 .report-card {

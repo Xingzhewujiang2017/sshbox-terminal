@@ -43,7 +43,48 @@ function getTail(lines = 200): string {
   return out.join('\n')
 }
 
-defineExpose({ getSelection, getTail })
+/** 复制选中内容到系统剪贴板。返回 false = 没有选中或剪贴板不可用。 */
+async function copySelection(): Promise<boolean> {
+  const text = term?.getSelection() ?? ''
+  if (!text) return false
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 把剪贴板内容粘进终端。**不自动回车** —— 由用户确认后再按。 */
+async function pasteClipboard(): Promise<boolean> {
+  try {
+    const text = await navigator.clipboard.readText()
+    if (!text) return false
+    // 走 xterm 自己的 paste：它会处理 bracketed paste，比直接写 pty 安全
+    term?.paste(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function selectAllText() {
+  term?.selectAll()
+}
+
+/** 清屏只清本地回滚缓冲和视图，不去动远端 shell 的状态。 */
+function clearScreen() {
+  term?.clear()
+}
+
+defineExpose({
+  getSelection,
+  getTail,
+  copySelection,
+  pasteClipboard,
+  selectAllText,
+  clearScreen,
+})
 
 function onContext(e: MouseEvent) {
   // 选中了就提供「解释这段」；没选中也能用（AI 看最近的输出）
@@ -95,6 +136,21 @@ onMounted(async () => {
   term.loadAddon(fit)
   term.open(termEl.value!)
   fit.fit()
+
+  // Ctrl+Shift+C/V 是终端里的复制/粘贴别名。**Ctrl+C 必须原样放行** ——
+  // 在终端里它是中断信号，抢过来做复制会让正在跑的命令停不下来。
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true
+    if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
+      void copySelection()
+      return false
+    }
+    if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
+      void pasteClipboard()
+      return false
+    }
+    return true
+  })
 
   term.onData((data) => {
     if (!currentSid) return
