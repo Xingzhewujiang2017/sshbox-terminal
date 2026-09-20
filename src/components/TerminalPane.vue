@@ -12,7 +12,43 @@ const props = defineProps<{ sid: string; active: boolean }>()
  * 键盘输入一律往上抛：广播模式下 App 要把它同时发给多个会话，
  * 组件自己直接写 term_write 就没法做广播了。
  */
-const emit = defineEmits<{ (e: 'data', data: string): void }>()
+const emit = defineEmits<{
+  (e: 'data', data: string): void
+  /** 右键：带上当前选中文本，App 据此决定要不要弹「解释这段」 */
+  (e: 'context', payload: { x: number; y: number; selection: string }): void
+}>()
+
+/** 给 AI 用的两个读取口：选中的文本、最近的输出。 */
+function getSelection(): string {
+  return term?.getSelection() ?? ''
+}
+
+/**
+ * 终端尾部文本（默认最后 200 行）。
+ *
+ * 从 xterm 的回滚缓冲里取而不是自己攒一份 —— 自己攒会在切换主题、resize、
+ * 清屏之后和真实显示不一致。
+ */
+function getTail(lines = 200): string {
+  const buf = term?.buffer.active
+  if (!buf) return ''
+  const start = Math.max(0, buf.length - lines)
+  const out: string[] = []
+  for (let i = start; i < buf.length; i++) {
+    const line = buf.getLine(i)
+    if (line) out.push(line.translateToString(true))
+  }
+  // 尾部空行没有信息量，去掉
+  while (out.length && !out[out.length - 1].trim()) out.pop()
+  return out.join('\n')
+}
+
+defineExpose({ getSelection, getTail })
+
+function onContext(e: MouseEvent) {
+  // 选中了就提供「解释这段」；没选中也能用（AI 看最近的输出）
+  emit('context', { x: e.clientX, y: e.clientY, selection: getSelection() })
+}
 
 const termEl = ref<HTMLDivElement>()
 let term: Terminal | null = null
@@ -110,7 +146,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="term-wrap" v-show="active">
+  <div class="term-wrap" v-show="active" @contextmenu.prevent="onContext">
     <div ref="termEl" class="term"></div>
   </div>
 </template>

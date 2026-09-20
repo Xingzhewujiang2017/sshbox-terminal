@@ -1,3 +1,5 @@
+mod ai;
+mod ai_commands;
 mod alerts;
 mod commands;
 mod forward;
@@ -5,6 +7,7 @@ mod history;
 mod hostkey;
 mod localfs;
 mod monitor;
+mod report;
 mod sftp;
 mod ssh;
 mod store;
@@ -44,6 +47,23 @@ pub fn run() {
             commands::host_reorder,
             commands::host_touch,
             commands::groups_reorder,
+            // --- AI（v0.5）---
+            ai_commands::ai_settings,
+            ai_commands::ai_profile_save,
+            ai_commands::ai_profile_delete,
+            ai_commands::ai_set_active,
+            ai_commands::ai_set_report_summary,
+            ai_commands::ai_key_has,
+            ai_commands::ai_key_delete,
+            ai_commands::ai_presets,
+            ai_commands::ai_test,
+            ai_commands::ai_chat,
+            ai_commands::ai_ask,
+            ai_commands::ai_cancel,
+            ai_commands::ai_protocol_label,
+            // --- 巡检报告（v0.5）---
+            report::report_generate,
+            report::report_reveal,
             // --- credentials ---
             commands::credential_has,
             commands::credential_set,

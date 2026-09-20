@@ -2,6 +2,7 @@
 import { ref, watch } from 'vue'
 import type { AppPaths, KnownHostEntry, Settings } from '../api'
 import type { ThemeMode } from '../theme'
+import AiSettingsPane from './AiSettingsPane.vue'
 
 const props = defineProps<{
   settings: Settings
@@ -17,6 +18,8 @@ const emit = defineEmits<{
   (e: 'exportHosts', path: string, includeSecrets: boolean): void
   (e: 'importHosts', path: string): void
   (e: 'restartMonitor'): void
+  /** AI 配置变了：App 要重新读一遍，AI 入口的可用状态跟着变 */
+  (e: 'ai-changed'): void
   (e: 'theme', mode: ThemeMode): void
 }>()
 
@@ -42,7 +45,7 @@ function pickTheme(m: ThemeMode) {
   emit('theme', m)
 }
 
-const tab = ref<'general' | 'quick' | 'hostkeys' | 'io' | 'about'>('general')
+const tab = ref<'general' | 'quick' | 'ai' | 'hostkeys' | 'io' | 'about'>('general')
 const form = ref<Settings>({ ...props.settings })
 const exportPath = ref('D:\\sshbox-hosts.json')
 const importPath = ref('D:\\sshbox-hosts.json')
@@ -91,6 +94,7 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
         <button :class="{ on: tab === 'quick' }" @click="tab = 'quick'">
           快捷命令 <span class="badge">{{ (form.quick_commands ?? []).length }}</span>
         </button>
+        <button :class="{ on: tab === 'ai' }" @click="tab = 'ai'">AI 模型</button>
         <button :class="{ on: tab === 'hostkeys' }" @click="tab = 'hostkeys'">
           已知主机密钥 <span class="badge">{{ knownHosts.length }}</span>
         </button>
@@ -223,6 +227,11 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
       </div>
 
       <!-- 已知主机密钥 -->
+      <!-- AI 模型 -->
+      <div v-else-if="tab === 'ai'" class="pane">
+        <AiSettingsPane @changed="emit('ai-changed')" />
+      </div>
+
       <div v-else-if="tab === 'hostkeys'" class="pane">
         <div class="hintline">
           这些是已信任的服务器密钥。删除后下次连接会重新询问指纹。

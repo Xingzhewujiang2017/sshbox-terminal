@@ -319,6 +319,43 @@ export interface KnownHostEntry {
   line: number
 }
 
+/** 一个模型接入点。密钥不在前端 —— 只有 `has_key` 这个布尔值。 */
+export interface AiProfile {
+  id: string
+  name: string
+  /** `openai` | `anthropic` | `gemini` */
+  protocol: string
+  base_url: string
+  model: string
+  temperature: number
+  max_tokens: number
+  has_key: boolean
+}
+
+export interface AiSettings {
+  /** 留空 = 还没选（AI 入口禁用） */
+  active_profile_id: string
+  profiles: AiProfile[]
+  /** 巡检报告里附一段 AI 结论 */
+  report_ai_summary: boolean
+}
+
+export interface ChatMessage {
+  role: string
+  content: string
+}
+
+/** 巡检报告生成结果。 */
+export interface ReportResult {
+  markdown_path: string
+  html_path: string
+  dir: string
+  findings: number
+  critical: number
+  ai_used: boolean
+  ai_error: string | null
+}
+
 export interface AppPaths {
   data_dir: string
   hosts_json: string
@@ -455,6 +492,52 @@ export const api = {
   // settings
   settingsGet: () => call<Settings>('settings_get'),
   settingsSet: (settings: Settings) => call<void>('settings_set', { settings }),
+
+  // AI（v0.5）—— 密钥只在后端，前端只问「有没有」
+  aiSettings: () => call<AiSettings>('ai_settings'),
+  aiProfileSave: (profile: AiProfile, key?: string) =>
+    call<AiSettings>('ai_profile_save', { profile, key: key ?? null }),
+  aiProfileDelete: (id: string) => call<AiSettings>('ai_profile_delete', { id }),
+  aiSetActive: (id: string) => call<AiSettings>('ai_set_active', { id }),
+  aiSetReportSummary: (on: boolean) => call<void>('ai_set_report_summary', { on }),
+  aiKeyHas: (id: string) => call<boolean>('ai_key_has', { id }),
+  aiKeyDelete: (id: string) => call<void>('ai_key_delete', { id }),
+  aiPresets: () => call<AiProfile[]>('ai_presets'),
+  aiTest: (id?: string) => call<string>('ai_test', { id: id ?? null }),
+  /** 流式：增量走 ssh://ai/delta 事件，返回完整文本 */
+  aiChat: (reqId: string, messages: ChatMessage[], profileId?: string) =>
+    call<string>('ai_chat', { reqId, messages, profileId: profileId ?? null }),
+  aiCancel: (reqId: string) => call<void>('ai_cancel', { reqId }),
+  /** 统一入口：按 kind 组装上下文（explain / command / chat）并流式回答 */
+  aiAsk: (opts: {
+    reqId: string
+    kind: string
+    sid?: string | null
+    selection?: string | null
+    ask?: string | null
+    tail?: string | null
+    history?: ChatMessage[] | null
+    profileId?: string | null
+  }) =>
+    call<string>('ai_ask', {
+      reqId: opts.reqId,
+      kind: opts.kind,
+      sid: opts.sid ?? null,
+      selection: opts.selection ?? null,
+      ask: opts.ask ?? null,
+      tail: opts.tail ?? null,
+      history: opts.history ?? null,
+      profileId: opts.profileId ?? null,
+    }),
+
+  // 巡检报告（v0.5）
+  reportGenerate: (sid: string, hours?: number, destDir?: string) =>
+    call<ReportResult>('report_generate', {
+      sid,
+      hours: hours ?? null,
+      destDir: destDir ?? null,
+    }),
+  reportReveal: (path: string) => call<void>('report_reveal', { path }),
 
   // known_hosts
   knownHostsList: () => call<KnownHostEntry[]>('known_hosts_list'),

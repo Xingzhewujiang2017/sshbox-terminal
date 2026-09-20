@@ -5,8 +5,10 @@ import { isPermissionGranted, requestPermission, sendNotification } from '@tauri
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { disposeFleet, forgetSession, initFleet } from './fleet'
 import { initTransfers, pendingDrop, transfers } from './transfers'
+import { ai, ask, initAi, loadAiSettings, setTailProvider, aiReady, aiDisabledReason } from './ai'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
+import AiPanel from './components/AiPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 import OverviewPanel from './components/OverviewPanel.vue'
 import SftpPanel from './components/SftpPanel.vue'
@@ -134,6 +136,10 @@ onMounted(async () => {
   await initFleet()
   // 传输进度是全局的：面板关掉再打开还要能看到进度条
   await initTransfers()
+  // AI：订阅流式事件 + 读一遍配置（决定 AI 入口是否可用）
+  await initAi()
+  await loadAiSettings()
+  setTailProvider(() => currentTerm()?.getTail?.() ?? '')
   void initDrop()
   try {
     await loadAll()
@@ -196,6 +202,86 @@ async function initDrop() {
   })
 }
 
+// --- AI（v0.5） --------------------------------------------------------------
+/** 终端实例按 sid 存：AI 要读「当前会话」的选中文本和最近输出。 */
+const termRefs = new Map<string, { getSelection?: () => string; getTail?: (n?: number) => string }>()
+function setTermRef(sid: string, el: unknown) {
+  if (el) termRefs.set(sid, el as { getSelection: () => string; getTail: () => string })
+  else termRefs.delete(sid)
+}
+
+const aiMenu = ref<{ x: number; y: number; selection: string } | null>(null)
+const reportBusy = ref(false)
+
+function toggleAi() {
+  ai.open = !ai.open
+  if (ai.open && !aiReady()) ai.error = aiDisabledReason()
+}
+
+/** 终端右键：记下坐标和选中文本，弹小菜单。 */
+function onTermContext(payload: { x: number; y: number; selection: string }) {
+  aiMenu.value = payload
+}
+
+function currentTerm() {
+  const sid = activeTab.value?.sid
+  return sid ? termRefs.get(sid) : undefined
+}
+
+function openAiFor(kind: 'explain' | 'command', selection: string, prompt = '') {
+  aiMenu.value = null
+  ai.open = true
+  if (!aiReady()) {
+    ai.error = aiDisabledReason()
+    return
+  }
+  void ask(kind, {
+    selection,
+    prompt,
+    sid: activeTab.value?.sid ?? undefined,
+  })
+}
+
+function explainSelection() {
+  openAiFor('explain', aiMenu.value?.selection ?? '')
+}
+
+function askCommandFromSelection() {
+  const sel = aiMenu.value?.selection ?? ''
+  aiMenu.value = null
+  ai.open = true
+  // 选中内容当"需求描述"的默认值，用户可以在面板里改
+  void ask('command', { prompt: sel.trim() || '', sid: activeTab.value?.sid ?? undefined })
+}
+
+/** 把 AI 生成的命令填进终端 —— **不自动回车**，由用户确认。 */
+function insertToTerminal(text: string) {
+  const tab = activeTab.value
+  if (!tab || !text.trim()) return
+  void api.termWrite(tab.sid, text.trim())
+  toast('info', '命令已填入终端，确认后按回车执行')
+}
+
+/** 一键巡检报告。 */
+async function makeReport() {
+  const tab = activeTab.value
+  if (!tab) return
+  reportBusy.value = true
+  try {
+    const r = await api.reportGenerate(tab.sid, 24)
+    const crit = r.critical > 0 ? `，其中 ${r.critical} 项严重` : ''
+    const aiNote = r.ai_used ? '，含 AI 结论' : r.ai_error ? `（AI 结论跳过：${r.ai_error}）` : ''
+    toast('info', `报告已生成：${r.findings} 项结论${crit}${aiNote}`)
+    reportResult.value = r
+  } catch (e) {
+    toast('error', `生成报告失败：${(e as Error).message}`)
+  } finally {
+    reportBusy.value = false
+  }
+}
+
+const reportResult = ref<import('./api').ReportResult | null>(null)
+
 function onKey(e: KeyboardEvent) {
   // Esc 优先退广播：这是最容易误操作的模式，先给它
   if (e.key === 'Escape' && broadcastOn.value) {
@@ -216,6 +302,11 @@ function onKey(e: KeyboardEvent) {
   if (e.shiftKey && (e.key === 'F' || e.key === 'f')) {
     e.preventDefault()
     if (activeTab.value) sftpOpen.value = !sftpOpen.value
+    return
+  }
+  if (e.shiftKey && (e.key === 'I' || e.key === 'i')) {
+    e.preventDefault()
+    toggleAi()
     return
   }
   if (e.shiftKey && (e.key === 'T' || e.key === 't')) {
@@ -820,6 +911,22 @@ function statusDot(t: Tab) {
           <button class="icon-btn" title="历史回看（落盘数据）" @click="historyOpen = true">
             历史
           </button>
+          <button
+            class="icon-btn"
+            :class="{ 'bc-on': ai.open }"
+            :title="aiReady() ? 'AI 助手（Ctrl+Shift+I）' : aiDisabledReason()"
+            @click="toggleAi()"
+          >
+            AI
+          </button>
+          <button
+            class="icon-btn"
+            :title="activeTab ? '生成这台机器的巡检报告（Markdown + HTML）' : '先连接一台主机'"
+            :disabled="!activeTab || reportBusy"
+            @click="makeReport()"
+          >
+            {{ reportBusy ? '生成中…' : '报告' }}
+          </button>
           <button class="icon-btn" title="切换监控面板" @click="monitorVisible = !monitorVisible">
             {{ monitorVisible ? '◧' : '◨' }}
           </button>
@@ -857,10 +964,19 @@ function statusDot(t: Tab) {
             :key="t.id"
             :sid="t.sid"
             :active="i === activeIdx"
+            :ref="(el) => setTermRef(t.sid, el)"
             @data="(d) => onTermData(t, d)"
+            @context="onTermContext"
           />
           </div>
         </div>
+        <AiPanel
+          v-if="ai.open"
+          :sid="activeTab?.sid"
+          @insert="insertToTerminal"
+          @close="ai.open = false"
+        />
+
         <div v-if="monitorVisible && activeTab" class="monitor-area">
           <!-- key 绑定 sid：切标签 / 关标签时重建面板。否则组件被复用，
                静态信息（主机名等一次性事件）和图表历史都还是上一台主机的，
@@ -877,6 +993,34 @@ function statusDot(t: Tab) {
         </div>
       </div>
     </main>
+
+    <div v-if="reportResult" class="report-card">
+      <div class="rc-title">
+        巡检报告已生成
+        <span class="rc-sub">{{ reportResult.findings }} 项结论<template v-if="reportResult.critical">，{{ reportResult.critical }} 项严重</template></span>
+      </div>
+      <div class="rc-path mono">{{ reportResult.markdown_path }}</div>
+      <div class="rc-actions">
+        <button class="rc-btn primary" @click="api.reportReveal(reportResult.markdown_path)">打开文件夹</button>
+        <button class="rc-btn" @click="api.reportReveal(reportResult.html_path)">定位 HTML</button>
+        <button class="rc-btn" @click="reportResult = null">关闭</button>
+      </div>
+      <div v-if="reportResult.ai_error" class="rc-warn">AI 结论未生成：{{ reportResult.ai_error }}</div>
+    </div>
+
+    <div
+      v-if="aiMenu"
+      class="ai-ctx"
+      :style="{ left: aiMenu.x + 'px', top: aiMenu.y + 'px' }"
+      @click.stop
+    >
+      <div class="ai-ctx-item" @click="explainSelection()">
+        解释这段{{ aiMenu.selection.trim() ? '' : '（最近的输出）' }}
+      </div>
+      <div class="ai-ctx-item" @click="askCommandFromSelection()">用自然语言生成命令…</div>
+      <div class="ai-ctx-sep"></div>
+      <div class="ai-ctx-item" @click="aiMenu = null">取消</div>
+    </div>
 
     <SftpPanel
       v-if="sftpOpen && activeTab"
@@ -951,6 +1095,7 @@ function statusDot(t: Tab) {
       @export-hosts="exportHosts"
       @import-hosts="importHosts"
       @restart-monitor="restartMonitor"
+      @ai-changed="loadAiSettings"
     />
 
     <div v-if="confirmState" class="modal-mask" @click.self="confirmState = null">
@@ -1016,6 +1161,30 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(-
 .banner.info { background: var(--banner-info-bg); color: var(--ctp-green); }
 .banner button { background: none; border: none; color: inherit; cursor: pointer; font-size: 14px; }
 .content { flex: 1; display: flex; min-height: 0; }
+/* 终端右键菜单（解释这段 / 生成命令） */
+.ai-ctx {
+  position: fixed; z-index: 220; background: var(--ctp-base); border: 1px solid var(--ctp-surface0);
+  border-radius: 6px; padding: 4px; min-width: 190px; box-shadow: 0 6px 20px var(--mask);
+}
+.ai-ctx-item { padding: 6px 10px; font-size: 12px; color: var(--ctp-text); border-radius: 4px; cursor: pointer; }
+.ai-ctx-item:hover { background: var(--ctp-surface0); }
+.ai-ctx-sep { height: 1px; background: var(--ctp-surface0); margin: 4px 2px; }
+/* 报告生成后的浮层卡片 */
+.report-card {
+  position: fixed; right: 18px; bottom: 18px; z-index: 220; width: 420px;
+  background: var(--ctp-base); border: 1px solid var(--ctp-surface1); border-radius: 8px;
+  padding: 10px 12px; box-shadow: 0 8px 28px var(--mask);
+}
+.rc-title { font-size: 12.5px; color: var(--ctp-text); font-weight: 600; display: flex; align-items: baseline; gap: 8px; }
+.rc-sub { font-size: 11px; color: var(--ctp-overlay0); font-weight: 400; }
+.rc-path { font-size: 10.5px; color: var(--ctp-overlay0); margin: 6px 0; word-break: break-all; }
+.rc-actions { display: flex; gap: 6px; }
+.rc-btn {
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface1); color: var(--ctp-subtext0);
+  border-radius: 4px; font-size: 11px; padding: 3px 9px; cursor: pointer;
+}
+.rc-btn.primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
+.rc-warn { font-size: 10.5px; color: var(--ctp-yellow); margin-top: 6px; line-height: 1.5; }
 .term-area {
   flex: 1;
   min-width: 0;

@@ -30,6 +30,9 @@ chrono = "0.4.45"
 tauri-plugin-log = "2.9.1"
 tauri-plugin-notification = "2.4.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# AI 请求只从 Rust 侧发：WebView 里发要处理 CORS，而且密钥会进页面内存。
+# rustls 而非 native-tls：Windows 上不用链接 OpenSSL，CI 也好过。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
 # 只为了 GetLogicalDrives 一个调用：一次位图拿到盘符列表，
 # 比逐个 `A:\` 试 metadata 安全（不碰盘、不会被空光驱卡住）。

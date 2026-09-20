@@ -367,6 +367,10 @@ pub struct Settings {
     pub history_interval_secs: u64,
     #[serde(default = "default_retention")]
     pub history_retention_days: u64,
+    /// AI 配置（v0.5）。密钥**不在**这个结构里 —— 它在系统凭据管理器，
+    /// entry = `ai:<profile-id>`，所以 settings.json 可以随便备份/导出。
+    #[serde(default)]
+    pub ai: crate::ai::AiSettings,
 }
 
 fn default_history_interval() -> u64 {
@@ -399,6 +403,7 @@ impl Default for Settings {
             history_enabled: true,
             history_interval_secs: default_history_interval(),
             history_retention_days: default_retention(),
+            ai: crate::ai::AiSettings::default(),
         }
     }
 }

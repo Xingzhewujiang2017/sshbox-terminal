@@ -1201,6 +1201,67 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
 }
 
 // ---------------------------------------------------------------------------
+// 一次性快照（巡检报告用）
+// ---------------------------------------------------------------------------
+
+/// 巡检报告要的一整套现场数据。
+pub struct Snapshot {
+    pub static_info: StaticInfo,
+    pub metrics: Metrics,
+    pub services: ServiceInfo,
+    pub hardware: HardwareInfo,
+}
+
+/// 采一次完整快照，给报告用。
+///
+/// **走的是监控循环同一条采集与解析路径**，所以报告里的数字和面板不会打架。
+/// 代价是这里要采两次（CPU%、网速、磁盘 IO 都是两次读数之差，只有一次就没有基线），
+/// 中间隔 1.2 秒 —— 报告多花一秒，换的是"数字是真测出来的"。
+pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<Snapshot> {
+    let static_info = collect_static(handle).await?;
+
+    let raw1 = exec_capture(handle, COLLECT_SCRIPT).await?;
+    let mut prev = PrevSample::default();
+    let _ = parse_metrics(&raw1, &mut prev);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let raw2 = exec_capture(handle, COLLECT_SCRIPT).await?;
+    let metrics = parse_metrics(&raw2, &mut prev)
+        .ok_or_else(|| anyhow::anyhow!("指标解析失败（采集脚本输出异常）"))?;
+
+    // 服务/硬件失败不致命：报告少两节，总比整份出不来强。
+    let (services, hardware) = match exec_capture(handle, &slow_script()).await {
+        Ok(sraw) => {
+            let sec = sections(&sraw);
+            (parse_services(&sec), parse_hardware(&sec))
+        }
+        Err(e) => {
+            log::warn!("报告：服务/硬件采集失败: {:#}", e);
+            (
+                ServiceInfo {
+                    failed: Vec::new(),
+                    ports: Vec::new(),
+                    port_total: 0,
+                    containers: Vec::new(),
+                    docker_available: false,
+                },
+                HardwareInfo {
+                    temps: Vec::new(),
+                    fans: Vec::new(),
+                    gpus: Vec::new(),
+                },
+            )
+        }
+    };
+
+    Ok(Snapshot {
+        static_info,
+        metrics,
+        services,
+        hardware,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Task lifecycle
 // ---------------------------------------------------------------------------
 
