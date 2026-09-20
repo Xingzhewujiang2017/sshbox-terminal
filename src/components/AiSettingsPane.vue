@@ -28,6 +28,36 @@ const active = computed(() =>
   settings.value?.profiles.find((p) => p.id === settings.value?.active_profile_id) ?? null,
 )
 
+/**
+ * base_url 的示例随协议变。
+ *
+ * 写错的代价是一个 404，而 Anthropic 的 404 页面不告诉用户"你少了 /v1" ——
+ * 实测有人把 base_url 填成 https://api.anthropic.com，请求就打到了 /messages（正确是 /v1/messages）。
+ */
+const urlExample = computed(() =>
+  editing.value?.protocol === 'anthropic'
+    ? 'https://api.anthropic.com/v1'
+    : editing.value?.protocol === 'gemini'
+      ? 'https://generativelanguage.googleapis.com/v1beta'
+      : 'https://api.deepseek.com/v1',
+)
+
+const urlHint = computed(() =>
+  editing.value?.protocol === 'anthropic'
+    ? 'Anthropic：填到 /v1 为止（不要带 /messages），大陆直连通常需要代理'
+    : editing.value?.protocol === 'gemini'
+      ? 'Gemini：填到 /v1beta 为止（模型名会拼进路径），大陆直连通常需要代理'
+      : 'OpenAI 兼容：填到 /v1 为止（不要带 /chat/completions）',
+)
+
+const modelExample = computed(() =>
+  editing.value?.protocol === 'anthropic'
+    ? 'claude-3-5-sonnet-latest'
+    : editing.value?.protocol === 'gemini'
+      ? 'gemini-2.0-flash'
+      : 'deepseek-chat',
+)
+
 async function load() {
   try {
     settings.value = await api.aiSettings()
@@ -227,12 +257,13 @@ async function toggleSummary() {
       </div>
       <label>
         Base URL
-        <input v-model="editing.base_url" placeholder="https://api.example.com/v1" />
+        <input v-model="editing.base_url" :placeholder="urlExample" />
       </label>
+      <div class="hintline">{{ urlHint }}</div>
       <div class="grid2">
         <label>
           模型名
-          <input v-model="editing.model" placeholder="deepseek-chat / claude-3-5-sonnet-latest / gemini-2.0-flash" />
+          <input v-model="editing.model" :placeholder="modelExample" />
         </label>
         <label>
           API 密钥

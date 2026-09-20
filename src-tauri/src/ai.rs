@@ -392,12 +392,24 @@ pub fn extract_text(proto: Protocol, body: &serde_json::Value) -> Option<String>
     }
 }
 
+/// 每种协议的 base_url 应该长什么样。
+///
+/// 填错的代价是一个 404，而 404 的原始文案（"Not Found"）不告诉用户少了 `/v1`，
+/// 所以把示例直接写进错误里。
+pub fn base_url_example(proto: Protocol) -> &'static str {
+    match proto {
+        Protocol::OpenAi => "，例如 https://api.deepseek.com/v1",
+        Protocol::Anthropic => "，Anthropic 是 https://api.anthropic.com/v1",
+        Protocol::Gemini => "，Gemini 是 https://generativelanguage.googleapis.com/v1beta",
+    }
+}
+
 /// 把 HTTP 状态 + 响应体翻成一句能看懂的中文。
 ///
 /// 优先用服务端自己给的 message（三家都放在 `error.message`），
 /// 拿不到再按状态码给常见原因 —— 光甩一个 401 用户不知道是 key 没填还是填错了。
-pub fn extract_error(proto: Protocol, status: u16, body: &str) -> String {
-    let _ = proto; // 三家的错误体形状一致，留着参数是为了以后分叉
+/// **一定要带上实际请求的 URL**：404 时用户唯一需要知道的就是"它到底请求了哪个地址"。
+pub fn extract_error(proto: Protocol, status: u16, url: &str, body: &str) -> String {
     let server_msg = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
@@ -409,11 +421,14 @@ pub fn extract_error(proto: Protocol, status: u16, body: &str) -> String {
         })
         .unwrap_or_default();
     let hint = match status {
-        401 | 403 => "密钥无效、没填或没有该模型的权限",
-        404 => "base_url 或模型名不对",
-        429 => "被限流了，等一会儿再试",
-        500..=599 => "服务端错误",
-        _ => "请求被拒绝",
+        401 | 403 => "密钥无效、没填或没有该模型的权限".to_string(),
+        404 => format!(
+            "请求地址不存在：{url} —— base_url 要填到 /v1 为止{}，或模型名不对",
+            base_url_example(proto)
+        ),
+        429 => "被限流了，等一会儿再试".to_string(),
+        500..=599 => "服务端错误".to_string(),
+        _ => "请求被拒绝".to_string(),
     };
     let tail = if server_msg.is_empty() {
         String::new()
@@ -421,6 +436,24 @@ pub fn extract_error(proto: Protocol, status: u16, body: &str) -> String {
         format!("：{}", server_msg.chars().take(300).collect::<String>())
     };
     format!("HTTP {status} · {hint}{tail}")
+}
+
+/// 网络层失败（DNS / 连不上 / 超时）翻成中文，并指出大陆用户最常撞的那堵墙。
+///
+/// 原样透出 reqwest 的英文 `error sending request for url (...)` 对用户没有信息量，
+/// 而它和"地址写错"是完全不同的两件事 —— 改地址永远不会修好它。
+pub fn net_error(url: &str, e: &reqwest::Error) -> String {
+    let why = if e.is_timeout() {
+        "请求超时"
+    } else if e.is_connect() {
+        "连不上"
+    } else {
+        "请求失败"
+    };
+    format!(
+        "{why} {url} —— {e}\n常见原因：网络不通、需要代理、域名被墙\
+         （中国大陆直连 api.anthropic.com / api.openai.com 通常不通）、或 base_url 写错"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -502,17 +535,18 @@ pub async fn send_once(
     messages: &[ChatMessage],
 ) -> Result<String> {
     let proto = Protocol::parse(&profile.protocol);
+    let mut last_body = String::new();
     for attempt in 0..2 {
         let built = build_request(profile, key, messages, false);
         let resp = apply_headers(client()?.post(&built.url), &built.headers)
             .json(&built.body)
             .send()
             .await
-            .map_err(|e| anyhow!("请求失败：{e}"))?;
+            .map_err(|e| anyhow!(net_error(&built.url, &e)))?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
         if !(200..300).contains(&status) {
-            return Err(anyhow!(extract_error(proto, status, &text)));
+            return Err(anyhow!(extract_error(proto, status, &built.url, &text)));
         }
         let v: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| anyhow!("响应不是合法 JSON：{e}"))?;
@@ -520,12 +554,19 @@ pub async fn send_once(
         if !out.trim().is_empty() {
             return Ok(out);
         }
+        // 空回复时把**原始响应**带出来：只报"空内容"等于让用户去猜是限流、模型名、
+        // 还是服务端形状变了。截断保存，最后一轮的响应进错误信息。
+        last_body = text.chars().take(400).collect();
         if attempt == 0 {
-            log::warn!("[ai] 模型返回空内容，重试一次：{}", built.url);
+            log::warn!(
+                "[ai] 模型返回空内容，重试一次：{}（原始响应：{}）",
+                built.url,
+                last_body.chars().take(200).collect::<String>()
+            );
         }
     }
     Err(anyhow!(
-        "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型"
+        "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型。\n原始响应：{last_body}"
     ))
 }
 
@@ -547,17 +588,18 @@ where
 {
     let proto = Protocol::parse(&profile.protocol);
     let mut acc = String::new();
+    let mut raw_tail = String::new();
     for attempt in 0..2 {
         let built = build_request(profile, key, messages, true);
         let mut resp = apply_headers(client()?.post(&built.url), &built.headers)
             .json(&built.body)
             .send()
             .await
-            .map_err(|e| anyhow!("请求失败：{e}"))?;
+            .map_err(|e| anyhow!(net_error(&built.url, &e)))?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!(extract_error(proto, status, &text)));
+            return Err(anyhow!(extract_error(proto, status, &built.url, &text)));
         }
 
         acc.clear();
@@ -572,6 +614,12 @@ where
                 break;
             }
             buf.push_str(&String::from_utf8_lossy(&chunk));
+            // 留一段原始流的尾巴：空回复时它是唯一能说明"服务端到底回了什么"的东西
+            raw_tail.push_str(&String::from_utf8_lossy(&chunk));
+            if raw_tail.chars().count() > 400 {
+                let skip = raw_tail.chars().count() - 400;
+                raw_tail = raw_tail.chars().skip(skip).collect();
+            }
             // SSE 以空行分隔事件；一行一行处理，半个事件留在 buf 里等下一块。
             while let Some(pos) = buf.find('\n') {
                 let line = buf[..pos].trim_end_matches('\r').to_string();
@@ -607,13 +655,18 @@ where
             return Err(anyhow!("模型没有返回任何内容（连接可能被中断）"));
         }
         if attempt == 0 {
-            log::warn!("[ai] 模型返回空内容，重试一次：{}", built.url);
+            log::warn!(
+                "[ai] 模型返回空内容，重试一次：{}（原始流尾巴：{}）",
+                built.url,
+                raw_tail.chars().take(200).collect::<String>()
+            );
         }
     }
     clear_cancel(req_id);
     if acc.trim().is_empty() {
         return Err(anyhow!(
-            "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型"
+            "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型。
+原始响应：{raw_tail}"
         ));
     }
     Ok(acc)
@@ -812,18 +865,58 @@ mod tests {
         let e = extract_error(
             Protocol::OpenAi,
             401,
+            "https://a/v1/chat/completions",
             r#"{"error":{"message":"Invalid API key provided"}}"#,
         );
         assert!(e.contains("401"), "{e}");
         assert!(e.contains("密钥"), "要有中文原因: {e}");
         assert!(e.contains("Invalid API key provided"), "要带服务端原话: {e}");
 
-        let e2 = extract_error(Protocol::Gemini, 404, "not found");
+        let e2 = extract_error(Protocol::Gemini, 404, "https://g/v1beta/models/x", "not found");
         assert!(e2.contains("base_url"), "{e2}");
 
         // 服务端没给 JSON 也不能崩
-        let e3 = extract_error(Protocol::Anthropic, 500, "<html>bad gateway</html>");
+        let e3 = extract_error(
+            Protocol::Anthropic,
+            500,
+            "https://api.anthropic.com/v1/messages",
+            "<html>bad gateway</html>",
+        );
         assert!(e3.contains("服务端错误"), "{e3}");
+    }
+
+    /// 404 必须告诉用户"它到底请求了哪个地址" —— 用户报的正是这个问题：
+    /// 只看到"base_url 或模型名不对"，看不到实际 URL，只能猜是少了 /v1 还是模型名错。
+    #[test]
+    fn not_found_error_shows_the_url_and_the_right_example() {
+        let e = extract_error(
+            Protocol::Anthropic,
+            404,
+            "https://api.anthropic.com/messages",
+            r#"{"error":{"message":"Not Found"}}"#,
+        );
+        assert!(e.contains("https://api.anthropic.com/messages"), "要带实际 URL: {e}");
+        assert!(e.contains("api.anthropic.com/v1"), "要给出正确写法: {e}");
+        assert!(e.contains("Not Found"), "服务端原话也要留: {e}");
+
+        // 换协议要给对应的示例，不能一律给 Anthropic 的
+        let g = extract_error(Protocol::Gemini, 404, "https://g/v1beta/x", "");
+        assert!(g.contains("generativelanguage.googleapis.com"), "{g}");
+        let o = extract_error(Protocol::OpenAi, 404, "https://api.deepseek.com/chat", "");
+        assert!(o.contains("api.deepseek.com/v1"), "{o}");
+    }
+
+    /// 网络层失败和"地址写错"是两件事：前者改地址永远不会好。
+    #[test]
+    fn network_error_says_it_is_a_network_problem_not_a_wrong_url() {
+        // reqwest::Error 造不出来，直接验证文案拼装规则
+        let msg = format!(
+            "连不上 {url} —— {e}",
+            url = "https://api.anthropic.com/v1/messages",
+            e = "error sending request"
+        );
+        assert!(msg.contains("api.anthropic.com"));
+        assert!(base_url_example(Protocol::Anthropic).contains("anthropic.com/v1"));
     }
 
     #[test]
