@@ -414,23 +414,27 @@ input:focus { outline: 1px solid var(--ctp-blue); }
   align-items: center;
   gap: 4px;
   border: 1px solid var(--ctp-surface0);
-  border-radius: 4px;
-  padding: 1px 6px;
+  border-radius: 6px;
+  padding: 6px 8px;
   color: var(--ctp-subtext0);
-  font-size: 11px;
+  font-size: 12px;
+  height: 32px;
+  box-sizing: border-box;
 }
 .custom-int.sel { border-color: var(--ctp-blue); color: var(--ctp-text); }
 .custom-int input {
-  width: 52px;
+  width: 56px;
   background: var(--ctp-mantle);
   color: var(--ctp-text);
   border: none;
-  font-size: 11px;
-  padding: 2px 0;
+  font-size: 12px;
+  padding: 2px 1px;
+  box-sizing: border-box;
 }
 .seg button {
   flex: 1; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
-  border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px;
+  border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
 }
 .seg button.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .check { display: flex; align-items: center; gap: 7px; margin-top: 9px; cursor: pointer; }

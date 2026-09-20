@@ -8,7 +8,7 @@
  * a monitoring view that hides the age of its numbers is worse than no view.
  */
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
-import { api, type Alert, type HistoryHost, type HistoryRange, type HostsFile, type Metrics } from '../api'
+import { api, type Alert, type HistoryHost, type HistoryRange, type HostsFile, type Metrics, type PingRange } from '../api'
 import { alertFor, fleetNow, sampleFor } from '../fleet'
 
 const props = defineProps<{
@@ -29,7 +29,102 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'focus', sid: string): void
   (e: 'connect', hostId: string): void
+  (e: 'command', p: { sid: string; text: string }): void
 }>()
+
+// --- 故障注入（#12）--------------------------------------------------------
+// 只生成 tc netem 命令、按目标填入对应终端，回车由用户在终端里按（铁律：不自动执行）。
+const injectOpen = ref(false)
+const injectTarget = ref<'all' | 'group' | 'host'>('all')
+const injectGroup = ref('')
+const injectHost = ref('')
+const injectType = ref<'delay' | 'loss' | 'blip' | 'clear'>('delay')
+const injectMs = ref(200)
+const injectLoss = ref(5)
+const injectBlipEvery = ref(10)
+const injectBlipDur = ref(3)
+const injectBlipTimes = ref(3)
+const injectNic = ref('eth0')
+const injectRecover = ref(false)
+const injectRecoverSecs = ref(120)
+const injectMsg = ref('')
+
+const connectedTabs = computed(() => props.tabs.filter((t) => t.status === 'connected'))
+const connectedCount = computed(() => connectedTabs.value.length)
+const groupOptions = computed(() => props.hosts.groups.filter(Boolean))
+const injectGroupCount = computed(() => {
+  if (!injectGroup.value) return 0
+  return connectedTabs.value.filter((t) => t.hostId != null && groupOfHost(t.hostId) === injectGroup.value).length
+})
+const injectTargetCount = computed(() => {
+  if (injectTarget.value === 'all') return connectedCount.value
+  if (injectTarget.value === 'group') return injectGroupCount.value
+  return injectHost.value ? 1 : 0
+})
+const injectCanRun = computed(
+  () => injectTargetCount.value > 0 && (injectType.value !== 'blip' || (injectBlipDur.value > 0 && injectBlipTimes.value > 0)),
+)
+
+function injectCommand(): string {
+  const nic = injectNic.value.trim() || 'eth0'
+  const head =
+    '# 故障注入（SSHBox 生成）· 回车由你执行；需要 root；网卡名先用 `ip link` 确认'
+  if (injectType.value === 'clear') {
+    return [
+      head,
+      `tc qdisc del dev ${nic} root 2>/dev/null; echo '已清除（原本没有规则则无输出）'; tc qdisc show dev ${nic} || true`,
+    ].join('\n')
+  }
+  if (injectType.value === 'delay') {
+    const ms = Math.max(1, Math.round(injectMs.value || 1))
+    const rule = `delay ${ms}ms`
+    return [head, netemLine(nic, rule)].join('\n')
+  }
+  if (injectType.value === 'loss') {
+    const p = Math.min(100, Math.max(1, Math.round(injectLoss.value || 1)))
+    return [head, netemLine(nic, `loss ${p}%`)].join('\n')
+  }
+  const every = Math.max(1, Math.round(injectBlipEvery.value || 1))
+  const dur = Math.max(1, Math.round(injectBlipDur.value || 1))
+  const times = Math.max(1, Math.round(injectBlipTimes.value || 1))
+  return [
+    head,
+    `for i in $(seq 1 ${times}); do`,
+    `  tc qdisc replace dev ${nic} root netem loss 100%`,
+    `  sleep ${dur}`,
+    `  tc qdisc del dev ${nic} root 2>/dev/null`,
+    `  [ $i -lt ${times} ] && sleep ${every}`,
+    `done`,
+    `echo '闪断注入完成，网络已恢复'; tc qdisc show dev ${nic} || true`,
+  ].join('\n')
+}
+
+function netemLine(nic: string, rule: string): string {
+  if (injectRecover.value && injectRecoverSecs.value > 0) {
+    return `tc qdisc replace dev ${nic} root netem ${rule} && sleep ${injectRecoverSecs.value} && tc qdisc del dev ${nic} root && echo '已自动恢复'`
+  }
+  return `tc qdisc replace dev ${nic} root netem ${rule}`
+}
+
+function runInject() {
+  let targets = connectedTabs.value
+  if (injectTarget.value === 'group') {
+    const g = injectGroup.value || groupOptions.value[0] || ''
+    targets = connectedTabs.value.filter((t) => t.hostId != null && groupOfHost(t.hostId) === g)
+    injectGroup.value = g
+  } else if (injectTarget.value === 'host') {
+    targets = connectedTabs.value.filter((t) => t.sid === injectHost.value)
+  }
+  if (!targets.length) {
+    injectMsg.value = '失败：目标范围内没有已连接的会话'
+    return
+  }
+  const cmd = injectCommand()
+  for (const t of targets) {
+    emit('command', { sid: t.sid, text: cmd })
+  }
+  injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，回车由你按`
+}
 
 type Freshness = 'fresh' | 'stale' | 'dead' | 'unknown'
 
@@ -265,6 +360,10 @@ async function loadHistory() {
 // --- 组内历史对比（小多图矩阵，选组时出现） --------------------------------
 const histKey = ref<'1h' | '24h' | '7d'>('1h')
 const histData = ref<Record<string, HistoryRange>>({})
+/** 时延/丢包对比（ping 表）。只有网关可达时有值，15s 一档。 */
+const pingData = ref<Record<string, PingRange>>({})
+/** 矩阵画哪种指标：cpu/cpu+内存 · net · disk · load · ping */
+const matrixMetric = ref<'cpu' | 'net' | 'disk' | 'load' | 'ping'>('cpu')
 const histBusy = ref(false)
 const histError = ref('')
 const HIST_WINDOWS = {
@@ -276,23 +375,27 @@ const HIST_WINDOWS = {
 async function loadGroupHistory() {
   if (!groupFilter.value || groupFilter.value === '__none') {
     histData.value = {}
+    pingData.value = {}
     return
   }
   const ids = hostIdsInGroup.value
   if (!ids.length) {
     histData.value = {}
+    pingData.value = {}
     return
   }
   histBusy.value = true
   histError.value = ''
   const w = HIST_WINDOWS[histKey.value]
+  const now = Date.now() / 1000
   try {
-    histData.value = await api.historyRangeMulti(
-      ids,
-      Date.now() / 1000 - w.span,
-      Date.now() / 1000,
-      w.points,
-    )
+    // 指标与时延一起拉：本地库都在毫秒级，切指标不用再等
+    const [m, p] = await Promise.all([
+      api.historyRangeMulti(ids, now - w.span, now, w.points),
+      api.pingRangeMulti(ids, now - w.span, now, w.points).catch(() => ({})),
+    ])
+    histData.value = m
+    pingData.value = p
   } catch (e) {
     histError.value = String(e)
   } finally {
@@ -314,6 +417,19 @@ function sparkPath(vals: number[], w: number, h: number): string {
 }
 const cpuSeries = (r: HistoryRange) => r.buckets.map((b) => b.cpu_pct)
 const memSeries = (r: HistoryRange) => r.buckets.map((b) => b.mem_pct)
+const netSeries = (r: HistoryRange) => r.buckets.map((b) => b.net_rx)
+const netTxSeries = (r: HistoryRange) => r.buckets.map((b) => b.net_tx)
+const diskRSeries = (r: HistoryRange) => r.buckets.map((b) => b.disk_r)
+const diskWSeries = (r: HistoryRange) => r.buckets.map((b) => b.disk_w)
+const loadSeries = (r: HistoryRange) => r.buckets.map((b) => b.load1)
+/** 时延/丢包：没测到网关的桶是 NULL，整点丢弃 —— 不画 0 ms 骗人。 */
+const latSeries = (r?: PingRange) =>
+  r?.buckets.filter((b) => b.latency_ms != null).map((b) => b.latency_ms as number) ?? []
+const lossSeries = (r?: PingRange) =>
+  r?.buckets.filter((b) => b.loss_pct != null).map((b) => b.loss_pct as number) ?? []
+const histEmpty = computed(
+  () => (matrixMetric.value === 'ping' ? Object.keys(pingData.value) : Object.keys(histData.value)).length === 0,
+)
 
 // --- 导出 CSV（#4） ---
 const exportMsg = ref('')
@@ -435,6 +551,7 @@ onBeforeUnmount(() => {
                 <option value="status">按状态</option>
               </select>
               <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
+                      <button class="btn ghost" @click="injectOpen = !injectOpen" title="生成 tc netem 注入命令，填入各组终端（只填不执行）">故障注入</button>
                       <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前视图为 CSV（含分组）">导出 CSV</button>
                       <button
                         v-if="Object.keys(histData).length"
@@ -522,39 +639,110 @@ onBeforeUnmount(() => {
                       <span class="dim">· {{ hostIdsInGroup.length }} 台 · {{ HIST_WINDOWS[histKey].label }}</span>
                     </span>
                     <select v-model="histKey" class="sel">
-                      <option value="1h">1 小时</option>
-                      <option value="24h">24 小时</option>
-                      <option value="7d">7 天</option>
-                    </select>
-                    <button class="btn ghost" @click="loadGroupHistory">⟳</button>
+                                          <option value="1h">1 小时</option>
+                                          <option value="24h">24 小时</option>
+                                          <option value="7d">7 天</option>
+                                        </select>
+                                        <select v-model="matrixMetric" class="sel" title="矩阵对比的指标">
+                                          <option value="cpu">CPU / 内存</option>
+                                          <option value="net">网络</option>
+                                          <option value="disk">磁盘</option>
+                                          <option value="load">负载</option>
+                                          <option value="ping">时延 / 丢包</option>
+                                        </select>
+                                        <button class="btn ghost" @click="loadGroupHistory">⟳</button>
                   </div>
                   <div v-if="histBusy" class="dim">读取历史中…</div>
                   <div v-if="histError" class="err">历史读取失败：{{ histError }}</div>
-                  <div v-if="!histBusy && !Object.keys(histData).length" class="dim">
-                    组内还没有历史数据 —— 连接主机并开启历史后，这里会显示每台主机的 CPU / 内存曲线。
-                  </div>
-                  <div class="grid">
-                    <div v-for="(r, hid) in histData" :key="hid" class="cell">
-                      <div class="cell-name">{{ hostLabelOf(hid) }}</div>
-                      <svg viewBox="0 0 220 58" preserveAspectRatio="none" width="100%" height="58">
-                        <path :d="sparkPath(cpuSeries(r), 220, 58)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
-                        <path
-                          :d="sparkPath(memSeries(r), 220, 58)"
-                          fill="none"
-                          stroke="var(--ctp-green)"
-                          stroke-width="1.3"
-                          stroke-dasharray="3 2"
-                        />
-                      </svg>
-                      <div class="cell-legend"><span class="lg">─ CPU</span><span class="lg dim">┄ 内存</span></div>
-                    </div>
-                  </div>
+                  <div v-if="!histBusy && histEmpty" class="dim">
+                                      {{ matrixMetric === 'ping'
+                                        ? '组内还没有时延数据 —— 连接主机后每 15 秒自动记录一次（需测到默认网关）'
+                                        : '组内还没有历史数据 —— 连接主机并开启历史后，这里会显示每台主机的曲线。' }}
+                                    </div>
+                                    <div class="grid">
+                                      <div v-for="(r, hid) in histData" :key="hid" class="cell">
+                                        <div class="cell-name">{{ hostLabelOf(hid) }}</div>
+                                        <svg viewBox="0 0 220 58" preserveAspectRatio="none" width="100%" height="58">
+                                          <template v-if="matrixMetric === 'cpu'">
+                                            <path :d="sparkPath(cpuSeries(r), 220, 58)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
+                                            <path :d="sparkPath(memSeries(r), 220, 58)" fill="none" stroke="var(--ctp-green)" stroke-width="1.3" stroke-dasharray="3 2" />
+                                          </template>
+                                          <template v-else-if="matrixMetric === 'net'">
+                                            <path :d="sparkPath(netSeries(r), 220, 58)" fill="none" stroke="var(--ctp-yellow)" stroke-width="1.3" />
+                                            <path :d="sparkPath(netTxSeries(r), 220, 58)" fill="none" stroke="var(--ctp-peach)" stroke-width="1.3" stroke-dasharray="3 2" />
+                                          </template>
+                                          <template v-else-if="matrixMetric === 'disk'">
+                                            <path :d="sparkPath(diskRSeries(r), 220, 58)" fill="none" stroke="var(--ctp-mauve)" stroke-width="1.3" />
+                                            <path :d="sparkPath(diskWSeries(r), 220, 58)" fill="none" stroke="var(--ctp-maroon)" stroke-width="1.3" stroke-dasharray="3 2" />
+                                          </template>
+                                          <template v-else-if="matrixMetric === 'load'">
+                                            <path :d="sparkPath(loadSeries(r), 220, 58)" fill="none" stroke="var(--ctp-teal)" stroke-width="1.3" />
+                                          </template>
+                                          <template v-else>
+                                            <path :d="sparkPath(latSeries(pingData[hid]), 220, 58)" fill="none" stroke="var(--ctp-sky)" stroke-width="1.3" />
+                                            <path :d="sparkPath(lossSeries(pingData[hid]), 220, 58)" fill="none" stroke="var(--ctp-red)" stroke-width="1.3" stroke-dasharray="3 2" />
+                                          </template>
+                                        </svg>
+                                        <div class="cell-legend">
+                                          <template v-if="matrixMetric === 'cpu'"><span class="lg">─ CPU</span><span class="lg dim">┄ 内存</span></template>
+                                          <template v-else-if="matrixMetric === 'net'"><span class="lg">─ 收</span><span class="lg dim">┄ 发</span></template>
+                                          <template v-else-if="matrixMetric === 'disk'"><span class="lg">─ 读</span><span class="lg dim">┄ 写</span></template>
+                                          <template v-else-if="matrixMetric === 'load'"><span class="lg">─ 负载1</span></template>
+                                          <template v-else><span class="lg">─ 时延ms</span><span class="lg dim">┄ 丢包%</span></template>
+                                        </div>
+                                      </div>
+                                    </div>
                 </div>
+
+                          <!-- 故障注入（#12）：生成 tc netem 命令，只填入各自终端的命令行，绝不自动执行 -->
+                          <div v-if="injectOpen" class="inject">
+                            <div class="inject-head">
+                              <span class="hist-title">故障注入 <span class="dim">· 只生成命令填入终端，回车由你按；需要目标机 root</span></span>
+                            </div>
+                            <div class="inject-row">
+                              <span class="inj-label">目标</span>
+                              <label class="check"><input type="radio" value="all" v-model="injectTarget" /> 全部已连接（{{ connectedCount }}）</label>
+                              <label class="check"><input type="radio" value="group" v-model="injectTarget" /> 组</label>
+                              <select v-if="injectTarget === 'group'" v-model="injectGroup" class="sel" :disabled="!groupOptions.length">
+                                <option v-for="g in groupOptions" :key="g" :value="g">{{ g }}</option>
+                              </select>
+                              <label class="check"><input type="radio" value="host" v-model="injectTarget" /> 单台</label>
+                              <select v-if="injectTarget === 'host'" v-model="injectHost" class="sel" :disabled="!connectedTabs.length">
+                                <option v-for="t in connectedTabs" :key="t.sid" :value="t.sid">{{ t.label }}</option>
+                              </select>
+                            </div>
+                            <div class="inject-row">
+                              <span class="inj-label">类型</span>
+                              <label class="check"><input type="radio" value="delay" v-model="injectType" /> 时延</label>
+                              <input v-if="injectType === 'delay'" v-model.number="injectMs" type="number" min="1" class="num" /> ms
+                              <label class="check"><input type="radio" value="loss" v-model="injectType" /> 丢包</label>
+                              <input v-if="injectType === 'loss'" v-model.number="injectLoss" type="number" min="1" max="100" class="num" /> %
+                              <label class="check"><input type="radio" value="blip" v-model="injectType" /> 闪断</label>
+                              <template v-if="injectType === 'blip'">
+                                每 <input v-model.number="injectBlipEvery" type="number" min="1" class="num" /> 秒断
+                                <input v-model.number="injectBlipDur" type="number" min="1" class="num" /> 秒，共
+                                <input v-model.number="injectBlipTimes" type="number" min="1" class="num" /> 次
+                              </template>
+                              <label class="check"><input type="radio" value="clear" v-model="injectType" /> 清除规则</label>
+                            </div>
+                            <div class="inject-row">
+                              <span class="inj-label">网卡</span>
+                              <input v-model="injectNic" class="num" style="width: 96px" />
+                              <template v-if="injectType === 'delay' || injectType === 'loss'">
+                                <label class="check"><input type="checkbox" v-model="injectRecover" /> 到期自动恢复</label>
+                                <input v-if="injectRecover" v-model.number="injectRecoverSecs" type="number" min="1" class="num" /> 秒后清除
+                              </template>
+                            </div>
+                            <div class="inject-row">
+                              <button class="btn" :disabled="!injectCanRun" @click="runInject">生成并填入终端（{{ injectTargetCount }} 台）</button>
+                              <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
+                            </div>
+                          </div>
               </div>
             </div>
           </template>
 
-<style scoped>
+              <style scoped>
 .mask {
   position: fixed;
   inset: 0;
@@ -640,6 +828,11 @@ onBeforeUnmount(() => {
 .hist { border-top: 1px solid var(--ctp-surface0); margin-top: 10px; padding-top: 8px; }
 .hist-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .hist-title { font-weight: 600; }
+.inject { border-top: 1px solid var(--ctp-surface0); margin-top: 12px; padding-top: 8px; }
+.inject-head { margin-bottom: 4px; }
+.inject-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.inject-row .num { width: 64px; }
+.inj-label { color: var(--ctp-subtext0); font-size: 12px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
 .cell { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px 8px; }
 .cell-name { font-size: 11px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

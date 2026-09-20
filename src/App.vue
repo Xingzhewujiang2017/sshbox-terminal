@@ -1133,9 +1133,10 @@ function statusDot(t: Tab) {
       :interval="settings?.sample_interval_secs ?? 2"
       :active-sid="activeTab?.sid"
       @close="overviewOpen = false"
-      @focus="focusTab"
-      @connect="connectFromOverview"
-    />
+            @focus="focusTab"
+            @connect="connectFromOverview"
+            @command="insertToTerminal"
+          />
 
     <HistoryPanel
       v-if="historyOpen"

@@ -1500,6 +1500,16 @@ pub fn spawn(
                             "ssh://ping",
                             serde_json::json!({ "sid": sid, "ping": pg }),
                         );
+                        // 落库（独立 ping 表）：只有慢采集才有值，15s 一档。
+                        if settings.history_enabled {
+                            if let Some(pi) = &pg {
+                                crate::history::record_ping(crate::history::PingRow::from_ping(
+                                    &crate::history::host_key(&sid),
+                                    crate::history::now_unix(),
+                                    pi,
+                                ));
+                            }
+                        }
                     }
                     Err(e) => log::warn!("服务信息采集失败: {:#}", e),
                 }

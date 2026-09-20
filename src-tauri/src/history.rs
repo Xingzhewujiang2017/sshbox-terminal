@@ -48,10 +48,20 @@ CREATE TABLE IF NOT EXISTS metrics (
     proc_total  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_host_ts ON metrics(host_id, ts);
+-- 时延/丢包（到默认网关）单独一张表：慢采集（15s）才有值，且列可空，
+-- 塞进 metrics 的 NOT NULL 骨架只会制造 NULL 窟窿。旧库自动建表，无需迁移。
+CREATE TABLE IF NOT EXISTS ping (
+    host_id    TEXT NOT NULL,
+    ts         REAL NOT NULL,
+    latency_ms REAL,
+    jitter_ms  REAL,
+    loss_pct   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_ping_host_ts ON ping(host_id, ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 "#;
 
-fn now_unix() -> f64 {
+pub(crate) fn now_unix() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -133,6 +143,34 @@ pub struct Row {
     pub proc_total: i64,
 }
 
+/// 时延/丢包的历史行。三个值都可空：慢采集 15s 一次，且拿不到网关时整行不落。
+#[derive(Debug, Clone)]
+pub struct PingRow {
+    pub host_id: String,
+    pub ts: f64,
+    pub latency_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub loss_pct: Option<f64>,
+}
+
+impl PingRow {
+    pub fn from_ping(host_id: &str, ts: f64, pi: &crate::monitor::PingInfo) -> Self {
+        Self {
+            host_id: host_id.to_string(),
+            ts,
+            latency_ms: (pi.rtt_avg.is_finite() && pi.rtt_avg > 0.0).then_some(finite(pi.rtt_avg)),
+            jitter_ms: (pi.jitter.is_finite()).then_some(finite(pi.jitter)),
+            loss_pct: (pi.loss_pct.is_finite()).then_some(finite(pi.loss_pct)),
+        }
+    }
+}
+
+/// 写线程的消息：指标行和时延行共用一条队列（都是落盘前的小数据结构）。
+enum DbMsg {
+    Metric(Row),
+    Ping(PingRow),
+}
+
 impl Row {
     pub fn from_metrics(host_id: &str, m: &Metrics, ts: f64) -> Self {
         Self {
@@ -164,14 +202,14 @@ pub fn due(now: f64, last: f64, interval_secs: u64) -> bool {
 
 // --- writer thread ---------------------------------------------------------
 
-static SENDER: OnceLock<SyncSender<Row>> = OnceLock::new();
+static SENDER: OnceLock<SyncSender<DbMsg>> = OnceLock::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     if SENDER.get().is_some() {
         return;
     }
-    let (tx, rx) = sync_channel::<Row>(QUEUE);
+    let (tx, rx) = sync_channel::<DbMsg>(QUEUE);
     match std::thread::Builder::new()
         .name("history-writer".into())
         .spawn(move || writer_loop(rx))
@@ -188,7 +226,7 @@ pub fn init() {
 /// the live monitor is the product.
 pub fn record(row: Row) {
     let Some(tx) = SENDER.get() else { return };
-    match tx.try_send(row) {
+    match tx.try_send(DbMsg::Metric(row)) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -200,7 +238,22 @@ pub fn record(row: Row) {
     }
 }
 
-fn writer_loop(rx: Receiver<Row>) {
+/// 时延/丢包落库（慢采集 15s 一次，独立表）。同样 fire-and-forget。
+pub fn record_ping(row: PingRow) {
+    let Some(tx) = SENDER.get() else { return };
+    match tx.try_send(DbMsg::Ping(row)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            let n = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 100 == 0 {
+                log::warn!("历史落盘队列已满（磁盘跟不上采样），已丢弃 {} 个样本", n);
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
+
+fn writer_loop(rx: Receiver<DbMsg>) {
     let path = db_path();
     let mut conn = match open_at(&path) {
         Ok(c) => c,
@@ -209,7 +262,7 @@ fn writer_loop(rx: Receiver<Row>) {
             return;
         }
     };
-    let mut batch: Vec<Row> = Vec::with_capacity(BATCH_MAX);
+    let mut batch: Vec<DbMsg> = Vec::with_capacity(BATCH_MAX);
     let mut last_flush = Instant::now();
     // `None` → prune on the first pass, so a long-idle app cleans up at startup
     // instead of waiting six hours.
@@ -239,7 +292,7 @@ fn writer_loop(rx: Receiver<Row>) {
     }
 }
 
-fn flush(conn: &mut Connection, batch: &mut Vec<Row>, last_flush: &mut Instant) {
+fn flush(conn: &mut Connection, batch: &mut Vec<DbMsg>, last_flush: &mut Instant) {
     if batch.is_empty() {
         return;
     }
@@ -252,7 +305,10 @@ fn flush(conn: &mut Connection, batch: &mut Vec<Row>, last_flush: &mut Instant) 
                                       net_rx, net_tx, disk_r, disk_w, load1, proc_total)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
-            for r in batch.iter() {
+            for r in batch.iter().filter_map(|m| match m {
+                DbMsg::Metric(r) => Some(r),
+                DbMsg::Ping(_) => None,
+            }) {
                 st.execute(params![
                     r.host_id,
                     r.ts,
@@ -268,11 +324,23 @@ fn flush(conn: &mut Connection, batch: &mut Vec<Row>, last_flush: &mut Instant) 
                 ])?;
             }
         }
+        {
+            let mut st = tx.prepare(
+                "INSERT INTO ping (host_id, ts, latency_ms, jitter_ms, loss_pct)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for r in batch.iter().filter_map(|m| match m {
+                DbMsg::Ping(r) => Some(r),
+                DbMsg::Metric(_) => None,
+            }) {
+                st.execute(params![r.host_id, r.ts, r.latency_ms, r.jitter_ms, r.loss_pct])?;
+            }
+        }
         tx.commit()?;
         Ok(())
     })();
     if let Err(e) = written {
-        log::warn!("历史写入失败，丢弃 {} 行: {:#}", n, e);
+        log::warn!("历史写入失败，丢弃 {} 条消息: {:#}", n, e);
     }
     batch.clear();
     *last_flush = Instant::now();
@@ -291,6 +359,11 @@ fn prune(conn: &mut Connection) {
         Ok(0) => {}
         Ok(n) => log::info!("历史清理: 删除 {} 行（保留 {} 天）", n, days),
         Err(e) => log::warn!("历史清理失败: {:#}", e),
+    }
+    match conn.execute("DELETE FROM ping WHERE ts < ?1", params![cutoff]) {
+        Ok(0) => {}
+        Ok(n) => log::info!("时延历史清理: 删除 {} 行（保留 {} 天）", n, days),
+        Err(e) => log::warn!("时延历史清理失败: {:#}", e),
     }
 }
 
@@ -660,6 +733,103 @@ pub async fn history_range_multi(
     .await
 }
 
+// --- 时延/丢包历史（ping 表，慢采集 15s 一档） -------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PingBucket {
+    pub ts: f64,
+    /// AVG 会跳过 NULL（慢采样之间的快采样行没有 ping 值）。
+    pub latency_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub loss_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PingRange {
+    pub bucket_secs: f64,
+    pub buckets: Vec<PingBucket>,
+}
+
+/// 时延分桶。窗口和桶数与 `range_at` 完全一致（同 ts 边界），这样报告的
+/// 时延曲线和 CPU/网络曲线能共用同一套时间轴。
+fn ping_buckets_at(
+    conn: &Connection,
+    host_id: &str,
+    from: f64,
+    to: f64,
+    max_points: usize,
+) -> Result<PingRange> {
+    let max_points = max_points.clamp(50, 5000);
+    let span = (to - from).max(1.0);
+    let bucket = (span / max_points as f64).max(1.0);
+    let mut st = conn.prepare(
+        "SELECT CAST(ts / ?4 AS INTEGER) * ?4 AS b,
+                AVG(latency_ms), AVG(jitter_ms), AVG(loss_pct)
+         FROM ping
+         WHERE host_id = ?1 AND ts >= ?2 AND ts <= ?3
+         GROUP BY b
+         ORDER BY b",
+    )?;
+    let buckets: Vec<PingBucket> = st
+        .query_map(params![host_id, from, to, bucket], |r| {
+            Ok(PingBucket {
+                ts: r.get(0)?,
+                latency_ms: r.get::<_, Option<f64>>(1)?,
+                jitter_ms: r.get::<_, Option<f64>>(2)?,
+                loss_pct: r.get::<_, Option<f64>>(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+    Ok(PingRange { bucket_secs: bucket, buckets })
+}
+
+#[tauri::command]
+pub async fn ping_range(
+    host_id: String,
+    from: f64,
+    to: f64,
+    max_points: Option<usize>,
+) -> std::result::Result<PingRange, String> {
+    blocking(move || {
+        let path = db_path();
+        if !path.exists() {
+            anyhow::bail!("还没有历史数据（库文件尚未创建）");
+        }
+        let conn = open_at(&path)?;
+        ping_buckets_at(&conn, &host_id, from, to, max_points.unwrap_or(600))
+    })
+    .await
+}
+
+/// 多台主机的时延对比（组内矩阵用）。同一窗口同桶数，单台失败只跳过那台。
+#[tauri::command]
+pub async fn ping_range_multi(
+    host_ids: Vec<String>,
+    from: f64,
+    to: f64,
+    max_points: Option<usize>,
+) -> std::result::Result<std::collections::HashMap<String, PingRange>, String> {
+    let mut out = std::collections::HashMap::new();
+    if host_ids.is_empty() {
+        return Ok(out);
+    }
+    let points = max_points.unwrap_or(600);
+    blocking(move || {
+        let path = db_path();
+        if !path.exists() {
+            anyhow::bail!("还没有历史数据（库文件尚未创建）");
+        }
+        let conn = open_at(&path)?;
+        for hid in host_ids {
+            if let Ok(r) = ping_buckets_at(&conn, &hid, from, to, points) {
+                out.insert(hid, r);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn history_hosts() -> std::result::Result<Vec<HostStat>, String> {
     blocking(move || {
@@ -792,6 +962,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn ping_buckets_avg_skips_nulls_and_all_null_is_none() {
+        let dir = std::env::temp_dir().join(format!("sshbox-ping-{}", now_unix() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("h.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&SCHEMA).unwrap();
+        // 同桶的 3 行：一行 NULL（快采样无 ping），两行有值 → AVG 应跳过 NULL
+        conn.execute(
+            "INSERT INTO ping (host_id, ts, latency_ms, jitter_ms, loss_pct) VALUES (?1,?2,?3,?4,?5)",
+            params!["h1", 100.0, 10.0, 1.0, 0.0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ping (host_id, ts, latency_ms, jitter_ms, loss_pct) VALUES (?1,?2,?3,?4,?5)",
+            params!["h1", 100.9, None::<f64>, None::<f64>, None::<f64>],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ping (host_id, ts, latency_ms, jitter_ms, loss_pct) VALUES (?1,?2,?3,?4,?5)",
+            params!["h1", 101.5, 20.0, 3.0, 5.0],
+        )
+        .unwrap();
+        // 另一台主机整个桶都是 NULL（从未测到网关）→ 桶值全是 None，不是 0
+        conn.execute(
+            "INSERT INTO ping (host_id, ts, latency_ms, jitter_ms, loss_pct) VALUES (?1,?2,?3,?4,?5)",
+            params!["h2", 100.0, None::<f64>, None::<f64>, None::<f64>],
+        )
+        .unwrap();
+
+        let r = ping_buckets_at(&conn, "h1", 0.0, 200.0, 100).unwrap();
+        assert_eq!(r.buckets.len(), 1);
+        let b = &r.buckets[0];
+        assert!(b.latency_ms.is_some());
+        assert_eq!(b.latency_ms.unwrap(), 15.0, "AVG(10, NULL, 20) = 15");
+        assert_eq!(b.jitter_ms.unwrap(), 2.0);
+        assert_eq!(b.loss_pct.unwrap(), 2.5);
+
+        let r2 = ping_buckets_at(&conn, "h2", 0.0, 200.0, 100).unwrap();
+        assert_eq!(r2.buckets[0].latency_ms, None, "全 NULL 桶应为 None，不能假装 0ms");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn metrics(cpu: f64, mem: f64, net: Vec<NetIf>, io: Vec<DiskIo>) -> Metrics {
         Metrics {
             ts: 1_700_000_000.0,
@@ -828,7 +1043,7 @@ mod tests {
     }
 
     fn insert(conn: &mut Connection, rows: &[Row]) {
-        let mut b = rows.to_vec();
+        let mut b: Vec<DbMsg> = rows.iter().cloned().map(DbMsg::Metric).collect();
         let mut lf = Instant::now();
         flush(conn, &mut b, &mut lf);
     }

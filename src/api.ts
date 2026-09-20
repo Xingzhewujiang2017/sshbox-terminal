@@ -272,6 +272,19 @@ export interface HistoryBucket {
   load1: number
 }
 
+/** ping 表的时延/丢包桶：慢采集 15s 一档才有值，无网关时整桶 None。 */
+export interface PingBucket {
+  ts: number
+  latency_ms: number | null
+  jitter_ms: number | null
+  loss_pct: number | null
+}
+
+export interface PingRange {
+  bucket_secs: number
+  buckets: PingBucket[]
+}
+
 export interface HistoryRange {
   buckets: HistoryBucket[]
   raw_points: number
@@ -457,6 +470,11 @@ export const api = {
   /** 一次查多台主机（组内历史对比）。单台无数据就缺那一台，不报错。 */
   historyRangeMulti: (hostIds: string[], from: number, to: number, maxPoints?: number) =>
     call<Record<string, HistoryRange>>('history_range_multi', {
+      hostIds, from, to, maxPoints: maxPoints ?? null,
+    }),
+  /** 组内时延/丢包对比（ping 表，慢采集 15s 一档）。 */
+  pingRangeMulti: (hostIds: string[], from: number, to: number, maxPoints?: number) =>
+    call<Record<string, PingRange>>('ping_range_multi', {
       hostIds, from, to, maxPoints: maxPoints ?? null,
     }),
   historyHosts: () => call<HistoryHost[]>('history_hosts'),

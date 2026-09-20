@@ -89,6 +89,17 @@ pub struct ChartSeries {
     pub points: Vec<[f64; 8]>,
 }
 
+/// 时延/丢包趋势序列，独立于指标序列：慢采集 15s 一档，只有连通时才有值。
+/// 每个点：[ts, latency_ms, jitter_ms, loss_pct]；时延缺失（没测到网关）的
+/// 桶整点丢弃 —— 画 0 ms 是骗人。
+#[derive(Debug, Clone, Serialize)]
+pub struct PingChartSeries {
+    pub label: String,
+    pub hours: u64,
+    pub bucket_secs: f64,
+    pub points: Vec<[f64; 4]>,
+}
+
 pub struct ReportData {
     /// 「名称 · user@host:port」
     pub host_label: String,
@@ -100,6 +111,7 @@ pub struct ReportData {
     pub history: Option<HistorySummary>,
     /// 趋势图数据（1 小时 / 24 小时 / 7 天三档），HTML 报告内嵌后由前端重绘
     pub series: Vec<ChartSeries>,
+    pub ping_series: Vec<PingChartSeries>,
     /// 进程表（采集时已按 CPU 降序）。报告里只列 Top N。
     pub processes: Vec<ProcInfo>,
     /// 到默认网关的时延/丢包。拿不到就是 None —— 那一节整块不显示，不编数字。
@@ -515,6 +527,20 @@ pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
             "| 丢包 | {:.0}%（{}/{} 个包通） |\n",
             p.loss_pct, p.recv, p.sent
         ));
+        // 时延趋势（#10）：窗口内均值/峰值取自 24h 档序列（慢采样 15s 一档）。
+        if let Some(tier) = d.ping_series.iter().find(|s| s.hours == 24 && !s.points.is_empty()) {
+            let n = tier.points.len() as f64;
+            let avg = tier.points.iter().map(|p| p[1]).sum::<f64>() / n;
+            let max = tier.points.iter().map(|p| p[1]).fold(0.0, f64::max);
+            let loss_max = tier.points.iter().map(|p| p[3]).fold(0.0, f64::max);
+            o.push_str(&format!(
+                "| 时延趋势（最近 24h，{} 个采样） | 均值 {:.1} ms / 峰值 {:.1} ms |\n",
+                tier.points.len(),
+                avg,
+                max
+            ));
+            o.push_str(&format!("| 丢包峰值（最近 24h） | {:.0}% |\n", loss_max));
+        }
     }
     o.push('\n');
 
@@ -825,7 +851,7 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
     }
 
     // 趋势图：数据内嵌 + 时间范围在浏览器里切换（自包含 SVG，不依赖网络）
-    if !d.series.is_empty() {
+    if !d.series.is_empty() || !d.ping_series.is_empty() {
         o.push_str("<h2>趋势图</h2>");
         o.push_str(
             "<div class=\"meta\">默认最近 24 小时。切换范围或选自定义起止时间都不重新生成报告 —— 数据已内嵌在文件里。</div>",
@@ -846,6 +872,10 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
         o.push_str(&format!(
             "<script>const SERIES={};</script>",
             serde_json::to_string(&d.series).unwrap_or_else(|_| "[]".into())
+        ));
+        o.push_str(&format!(
+            "<script>const PINGERIES={};</script>",
+            serde_json::to_string(&d.ping_series).unwrap_or_else(|_| "[]".into())
         ));
         o.push_str(CHART_JS);
         o.push_str(PAGINATE_JS);
@@ -882,14 +912,37 @@ const METRICS = [
 ];
 function kb(v) { return v >= 1024 ? (v / 1024).toFixed(2) + ' MB/s' : (v || 0).toFixed(1) + ' KB/s'; }
 function val(v, pct) { return pct ? (v || 0).toFixed(1) + '%' : kb(v); }
+function msv(v, pct) { return pct ? (v || 0).toFixed(1) + '%' : (v || 0).toFixed(1) + ' ms'; }
 function hhmm(ts) {
   const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
   return p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
-function draw(points) {
+function appendChart(arr, i1, i2, name, c1, c2, fmt, pct) {
+  const a = arr.map(p => p[i1]);
+  const b = i2 != null ? arr.map(p => p[i2]) : null;
+  let max = Math.max.apply(null, a.concat(b || [0]));
+  if (!isFinite(max) || max <= 0) max = 1;
+  max *= 1.15;
+  const W = 760, H = 130, L = 34, R = 12;
+  const x = j => L + (W - L - R) * (j / Math.max(1, arr.length - 1));
+  const y = v => H - 20 - (H - 40) * (Math.max(0, v) / max);
+  const path = as => as.map((v, j) => (j ? 'L' : 'M') + x(j).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
+  let s = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '">';
+  s += '<line x1="' + L + '" y1="' + (H - 20) + '" x2="' + (W - R) + '" y2="' + (H - 20) + '" stroke="#45475a"/>';
+  s += '<text x="4" y="12" fill="#a6adc8" font-size="10">' + name + '</text>';
+  s += '<text x="' + (W - R) + '" y="12" fill="#6c7086" font-size="10" text-anchor="end">峰值 ' + fmt(max, pct) + '</text>';
+  s += '<path d="' + path(a) + '" fill="none" stroke="' + c1 + '" stroke-width="1.4"/>';
+  if (b) s += '<path d="' + path(b) + '" fill="none" stroke="' + c2 + '" stroke-width="1.4" stroke-dasharray="4 3"/>';
+  s += '<text x="' + L + '" y="' + (H - 6) + '" fill="#6c7086" font-size="9">' + hhmm(arr[0][0]) + '</text>';
+  s += '<text x="' + (W - R) + '" y="' + (H - 6) + '" fill="#6c7086" font-size="9" text-anchor="end">' + hhmm(arr[arr.length - 1][0]) + '</text>';
+  s += '</svg>';
+  box.insertAdjacentHTML('beforeend', '<div class="chart">' + s + '</div>');
+}
+function draw(points, pi) {
   const box = document.getElementById('charts');
   box.innerHTML = '';
-  if (!points.length) { box.textContent = '这段时间没有数据'; return; }
+  const pp = (pi && pi.points) || [];
+  if (!points.length && !pp.length) { box.textContent = '这段时间没有数据'; return; }
   for (const m of METRICS) {
     const a = points.map(p => p[m.idx]);
     const b = m.idx2 ? points.map(p => p[m.idx2]) : null;
@@ -911,30 +964,39 @@ function draw(points) {
     s += '</svg>';
     box.insertAdjacentHTML('beforeend', '<div class="chart">' + s + '</div>');
   }
+  // 时延/丢包趋势（#10）：同一时间轴、同一档分辨率，丢包/时延分两张图。
+  if (pp.length) {
+    appendChart(pp, 1, 2, '时延（实线） / 抖动（虚线）', '#89dceb', '#fab387', msv, false);
+    appendChart(pp, 3, null, '丢包率', '#f38ba8', null, msv, true);
+  } else if (PINGERIES.some(s => s.points.length)) {
+    box.insertAdjacentHTML('beforeend',
+      '<div class="chart" style="font-size:12px;color:#a6adc8">时延趋势：所选范围无数据（连通期间每 15 秒自动记录）</div>');
+  }
 }
 function pick(i) {
   const s = SERIES[i];
   if (!s) return;
   document.querySelectorAll('.rg[data-i]').forEach(b => b.classList.toggle('on', Number(b.dataset.i) === i));
-  draw(s.points);
+  draw(s.points, PINGERIES[i]);
 }
 function applyCustom() {
   const from = document.getElementById('t-from').value, to = document.getElementById('t-to').value;
   if (!from || !to) return;
   const f = new Date(from).getTime() / 1000, t = new Date(to).getTime() / 1000;
   // 用能覆盖这段范围、且分辨率最高的那一档（自定义范围不重新生成报告，只用已有数据）
-  let best = null;
-  for (const s of SERIES) {
-    const a = s.points[0][0], z = s.points[s.points.length - 1][0];
-    if (a <= f && z >= t) { if (!best || s.bucket_secs < best.bucket_secs) best = s; }
+  let best = null, bestI = -1;
+  for (const [i, s] of SERIES.entries()) {
+    let a = s.points[0][0], z = s.points[s.points.length - 1][0];
+    if (a <= f && z >= t) { if (!best || s.bucket_secs < best.bucket_secs) { best = s; bestI = i; } }
   }
   if (!best) { document.getElementById('charts').textContent = '所选范围超出了报告内嵌的数据范围（最多 7 天）'; return; }
   document.querySelectorAll('.rg[data-i]').forEach(b => b.classList.remove('on'));
-  draw(best.points.filter(p => p[0] >= f && p[0] <= t));
+  draw(best.points.filter(p => p[0] >= f && p[0] <= t), PINGERIES[bestI]);
 }
 (function () {
   const def = SERIES.findIndex(s => s.hours === 24);
   if (def >= 0) pick(def); else if (SERIES.length) pick(0);
+  else if (PINGERIES.length) draw([], PINGERIES[0]);
   document.querySelectorAll('.rg[data-i]').forEach(b => b.addEventListener('click', () => pick(Number(b.dataset.i))));
   document.getElementById('rg-custom').addEventListener('click', () => {
     const box = document.getElementById('custom-box');
@@ -1088,6 +1150,44 @@ async fn chart_series(host_id: &str, now: chrono::DateTime<chrono::Local>) -> Ve
     out
 }
 
+/// 时延/丢包趋势（#10）：与指标同窗口同桶数（ts 边界一致）。
+/// 桶里时延为 None（该窗口没测到网关）→ 整点丢弃，不画 0 ms。
+async fn chart_ping_series(
+    host_id: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<PingChartSeries> {
+    let mut out = Vec::new();
+    for (label, hours, buckets) in [
+        ("1 小时", 1u64, 60usize),
+        ("24 小时", 24, 288),
+        ("7 天", 168, 168),
+    ] {
+        let from = (now.timestamp() - (hours as i64) * 3600) as f64;
+        let to = now.timestamp() as f64;
+        let Ok(r) = history::ping_range(host_id.to_string(), from, to, Some(buckets)).await else {
+            continue;
+        };
+        let points: Vec<[f64; 4]> = r
+            .buckets
+            .iter()
+            .filter_map(|b| {
+                b.latency_ms
+                    .map(|lat| [b.ts, lat, b.jitter_ms.unwrap_or(0.0), b.loss_pct.unwrap_or(0.0)])
+            })
+            .collect();
+        if points.is_empty() {
+            continue;
+        }
+        out.push(PingChartSeries {
+            label: label.to_string(),
+            hours,
+            bucket_secs: r.bucket_secs,
+            points,
+        });
+    }
+    out
+}
+
 /// 让 AI 写一段结论。失败**不影响报告**：返回 Err 由调用方记进 ai_error。
 async fn ai_summary(d: &ReportData) -> Result<String> {
     let settings = crate::store::load_settings();
@@ -1196,7 +1296,7 @@ pub async fn report_generate(
     // 三档分辨率：HTML 里的时间切换直接在这些数据上重绘
     let series = chart_series(&host_id, now).await;
 
-    let hist = history::history_range(host_id, from, to, Some(600))
+    let hist = history::history_range(host_id.clone(), from, to, Some(600))
         .await
         .ok()
         .and_then(|r| HistorySummary::from_buckets(hours, &r));
@@ -1224,6 +1324,7 @@ pub async fn report_generate(
         hardware: snap.hardware,
         history: hist,
         series,
+        ping_series: chart_ping_series(&host_id, now).await,
         processes: snap.processes,
         ping: snap.ping,
     };
@@ -1364,6 +1465,7 @@ mod tests {
             },
             history: None,
             series: vec![],
+            ping_series: vec![],
             processes: vec![],
             ping: None,
         }
@@ -1556,6 +1658,40 @@ mod tests {
         d2.ping = None;
         assert!(!render_markdown(&d2, None).contains("链路质量"));
         assert!(!render_html(&d2, None).contains("链路质量"));
+    }
+
+    #[test]
+    fn report_embeds_ping_trend_in_md_and_html() {
+        let mut d = mk(10.0, 30.0, 0, 4);
+        d.ping = Some(PingInfo {
+            target: "192.168.1.1".into(),
+            sent: 3,
+            recv: 3,
+            loss_pct: 0.0,
+            rtt_min: 1.0,
+            rtt_avg: 17.3,
+            rtt_max: 50.2,
+            jitter: 23.3,
+        });
+        d.ping_series = vec![PingChartSeries {
+            label: "24 小时".into(),
+            hours: 24,
+            bucket_secs: 300.0,
+            points: vec![
+                [0.0, 10.0, 2.0, 0.0],
+                [300.0, 20.0, 5.0, 10.0],
+                [600.0, 5.0, 1.0, 0.0],
+            ],
+        }];
+        let md = render_markdown(&d, None);
+        assert!(md.contains("时延趋势（最近 24h，3 个采样）"), "{md}");
+        assert!(md.contains("均值 11.7 ms"), "（10+20+5）/3 = 11.7：{md}");
+        assert!(md.contains("丢包峰值（最近 24h） | 10%"), "{md}");
+        let html = render_html(&d, None);
+        assert!(html.contains("PINGERIES"), "HTML 要内嵌时延序列");
+        assert!(html.contains("时延（实线）"), "HTML 要有时延/抖动趋势图");
+        assert!(html.contains("丢包率"), "HTML 要有丢包趋势图");
+        assert!(!html.contains("cdn."), "依旧自包含，不引 CDN");
     }
 
     #[test]

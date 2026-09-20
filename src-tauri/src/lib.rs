@@ -86,7 +86,9 @@ pub fn run() {
             history::history_hosts,
             history::history_stats,
             history::history_export,
-            history::export_csv_text,
+                        history::export_csv_text,
+                        history::ping_range,
+                        history::ping_range_multi,
             // --- sftp / 本地文件 ---
             sftp::sftp_list,
             sftp::sftp_stat,
