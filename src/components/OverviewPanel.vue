@@ -7,8 +7,8 @@
  * Offline rows come from the history database, and they say how old they are:
  * a monitoring view that hides the age of its numbers is worse than no view.
  */
-import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
-import { api, type Alert, type HistoryHost, type HostsFile, type Metrics } from '../api'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { api, type Alert, type HistoryHost, type HistoryRange, type HostsFile, type Metrics } from '../api'
 import { alertFor, fleetNow, sampleFor } from '../fleet'
 
 const props = defineProps<{
@@ -50,9 +50,18 @@ interface Row {
 }
 
 const includeOffline = ref(false)
-const sortBy = ref<'name' | 'cpu' | 'mem' | 'status'>('name')
+const sortBy = ref<'name' | 'cpu' | 'mem' | 'disk' | 'load' | 'status'>('name')
 const historyHosts = ref<HistoryHost[]>([])
 const historyError = ref('')
+
+// --- 分组视角（集群测试） ---
+// '' = 全部主机；组名 = 只看该组；'__none' = 未分组（含临时连接）。
+const groupFilter = ref('')
+const groupOfHost = (id: string | null | undefined): string | null => {
+  if (!id) return null
+  const h = props.hosts.hosts.find((x) => x.id === id)
+  return h ? h.group || '' : null
+}
 
 // --- helpers ---------------------------------------------------------------
 
@@ -71,6 +80,8 @@ function fmtAge(sec: number): string {
   if (sec < 86400) return (sec / 3600).toFixed(1) + ' 小时前'
   return (sec / 86400).toFixed(1) + ' 天前'
 }
+const rowCpu = (r: Row) => r.metrics?.cpu_pct ?? r.lastCpu
+
 function hostLabelOf(id: string | null | undefined): string {
   if (!id) return '未保存的主机'
   const h = props.hosts.hosts.find((x) => x.id === id)
@@ -102,6 +113,22 @@ function freshnessOf(ageSec: number | undefined, sid: string | undefined): Fresh
 }
 
 // --- rows ------------------------------------------------------------------
+
+/** 分组筛选后的行。'' 显示全部；选组时只有组内行 + 组内离线历史行。 */
+const filteredRows = computed<Row[]>(() =>
+  groupFilter.value
+    ? rows.value.filter((r) =>
+        groupFilter.value === '__none'
+          ? !groupOfHost(r.hostId)
+          : groupOfHost(r.hostId) === groupFilter.value,
+      )
+    : rows.value,
+)
+
+/** 组内已保存主机 id（历史对比的数据范围）。 */
+const hostIdsInGroup = computed(() =>
+  props.hosts.hosts.filter((h) => (h.group || '') === groupFilter.value).map((h) => h.id),
+)
 
 const rows = computed<Row[]>(() => {
   const out: Row[] = []
@@ -151,28 +178,54 @@ const rows = computed<Row[]>(() => {
   const mem = (r: Row) => r.metrics?.mem_pct ?? r.lastMem ?? -1
   const rank = { connected: 0, connecting: 1, closed: 2, offline: 3 } as const
   return [...visible].sort((a, b) => {
-    switch (sortBy.value) {
-      case 'cpu':
-        return cpu(b) - cpu(a)
-      case 'mem':
-        return mem(b) - mem(a)
-      case 'status':
-        return rank[a.status] - rank[b.status] || a.title.localeCompare(b.title)
-      default:
-        return a.title.localeCompare(b.title)
-    }
-  })
+      switch (sortBy.value) {
+        case 'cpu':
+          return cpu(b) - cpu(a)
+        case 'mem':
+          return mem(b) - mem(a)
+        case 'disk':
+          return (worstDisk(b.metrics) ?? -1) - (worstDisk(a.metrics) ?? -1)
+        case 'load':
+          return (b.metrics?.load?.[0] ?? -1) - (a.metrics?.load?.[0] ?? -1)
+        case 'status':
+          return rank[a.status] - rank[b.status] || a.title.localeCompare(b.title)
+        default:
+          return a.title.localeCompare(b.title)
+      }
+    })
 })
 
 const summary = computed(() => {
-  const online = props.tabs.filter((t) => t.status === 'connected').length
-  const connecting = props.tabs.filter((t) => t.status === 'connecting').length
-  const stale = rows.value.filter((r) => r.status === 'connected' && r.freshness !== 'fresh').length
-  const alarmed = rows.value.filter((r) => r.alert).length
-  const offline = includeOffline.value
-    ? rows.value.filter((r) => r.status === 'offline').length
-    : historyHosts.value.filter((h) => !props.tabs.some((t) => t.hostId === h.host_id)).length
-  return { online, connecting, stale, alarmed, offline, hosts: props.tabs.length }
+  // 选了组就统计组内（报表跟着当前视角走，不混全局数字）
+  const list = groupFilter.value ? filteredRows.value : rows.value
+  const online = list.filter((r) => r.status === 'connected').length
+  const connecting = list.filter((r) => r.status === 'connecting').length
+  const stale = list.filter((r) => r.status === 'connected' && r.freshness !== 'fresh').length
+  const alarmed = list.filter((r) => r.alert).length
+  const offline = groupFilter.value
+    ? list.filter((r) => r.status === 'offline').length
+    : includeOffline.value
+      ? rows.value.filter((r) => r.status === 'offline').length
+      : historyHosts.value.filter((h) => !props.tabs.some((t) => t.hostId === h.host_id)).length
+  return {
+    online,
+    connecting,
+    stale,
+    alarmed,
+    offline,
+    hosts: groupFilter.value ? list.length : props.tabs.length,
+    group: !!groupFilter.value,
+  }
+})
+
+/** 选组时：组内最忙 / 最闲主机（按当前 CPU）。 */
+const groupLeaders = computed(() => {
+  if (!groupFilter.value || groupFilter.value === '__none') return null
+  const live = filteredRows.value.filter((r) => r.metrics || r.lastCpu != null)
+  if (live.length < 2) return null
+  const cpu = (r: Row) => r.metrics?.cpu_pct ?? r.lastCpu ?? -1
+  const sorted = [...live].sort((a, b) => cpu(b) - cpu(a))
+  return { busy: sorted[0], idle: sorted[sorted.length - 1] }
 })
 
 /** Highest disk usage across mounts — what "is this box filling up" means. */
@@ -209,6 +262,59 @@ async function loadHistory() {
   }
 }
 
+// --- 组内历史对比（小多图矩阵，选组时出现） --------------------------------
+const histKey = ref<'1h' | '24h' | '7d'>('1h')
+const histData = ref<Record<string, HistoryRange>>({})
+const histBusy = ref(false)
+const histError = ref('')
+const HIST_WINDOWS = {
+  '1h': { span: 3600, points: 60, label: '1 小时' },
+  '24h': { span: 86400, points: 288, label: '24 小时' },
+  '7d': { span: 7 * 86400, points: 168, label: '7 天' },
+} as const
+
+async function loadGroupHistory() {
+  if (!groupFilter.value || groupFilter.value === '__none') {
+    histData.value = {}
+    return
+  }
+  const ids = hostIdsInGroup.value
+  if (!ids.length) {
+    histData.value = {}
+    return
+  }
+  histBusy.value = true
+  histError.value = ''
+  const w = HIST_WINDOWS[histKey.value]
+  try {
+    histData.value = await api.historyRangeMulti(
+      ids,
+      Date.now() / 1000 - w.span,
+      Date.now() / 1000,
+      w.points,
+    )
+  } catch (e) {
+    histError.value = String(e)
+  } finally {
+    histBusy.value = false
+  }
+}
+
+watch(groupFilter, () => void loadGroupHistory())
+watch(histKey, () => void loadGroupHistory())
+
+/** 迷你折线 path —— 自绘 SVG，不引 ECharts，小多图矩阵要的就是轻。 */
+function sparkPath(vals: number[], w: number, h: number): string {
+  if (!vals.length) return ''
+  const max = Math.max(...vals, 1)
+  const step = w / Math.max(1, vals.length - 1)
+  return vals
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - 3 - (h - 8) * (v / max)).toFixed(1)}`)
+    .join(' ')
+}
+const cpuSeries = (r: HistoryRange) => r.buckets.map((b) => b.cpu_pct)
+const memSeries = (r: HistoryRange) => r.buckets.map((b) => b.mem_pct)
+
 let timer: ReturnType<typeof setInterval> | null = null
 onMounted(async () => {
   await loadHistory()
@@ -230,23 +336,37 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="bar">
-        <span class="stat">在线 <b>{{ summary.online }}</b> / {{ summary.hosts }} 个会话</span>
-        <span v-if="summary.connecting" class="stat warn">连接中 {{ summary.connecting }}</span>
-        <span v-if="summary.stale" class="stat warn">数据陈旧 {{ summary.stale }}</span>
-        <span v-if="summary.alarmed" class="stat hot">告警 {{ summary.alarmed }}</span>
-        <span class="stat dim">离线 {{ summary.offline }}</span>
-        <label class="chk">
-          <input v-model="includeOffline" type="checkbox" />
-          <span>包含离线（历史最后状态）</span>
-        </label>
-        <select v-model="sortBy" class="sel">
-          <option value="name">按名称</option>
-          <option value="cpu">按 CPU</option>
-          <option value="mem">按内存</option>
-          <option value="status">按状态</option>
-        </select>
-        <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
-      </div>
+              <select v-model="groupFilter" class="sel group-sel" title="按分组查看（集群测试视角）">
+                <option value="">全部主机</option>
+                <option v-for="g in props.hosts.groups.filter(Boolean)" :key="g" :value="g">{{ g }}</option>
+                <option value="__none">未分组</option>
+              </select>
+              <span class="stat">
+                <template v-if="summary.group">组内在线 <b>{{ summary.online }}</b> / {{ summary.hosts }} 台</template>
+                <template v-else>在线 <b>{{ summary.online }}</b> / {{ summary.hosts }} 个会话</template>
+              </span>
+              <template v-if="groupLeaders">
+                <span class="stat dim">最忙 {{ groupLeaders.busy.title }}（{{ fmtPct(rowCpu(groupLeaders.busy)) }}）</span>
+                <span class="stat dim">最闲 {{ groupLeaders.idle.title }}（{{ fmtPct(rowCpu(groupLeaders.idle)) }}）</span>
+              </template>
+              <span v-if="summary.connecting" class="stat warn">连接中 {{ summary.connecting }}</span>
+              <span v-if="summary.stale" class="stat warn">数据陈旧 {{ summary.stale }}</span>
+              <span v-if="summary.alarmed" class="stat hot">告警 {{ summary.alarmed }}</span>
+              <span class="stat dim">离线 {{ summary.offline }}</span>
+              <label class="chk">
+                <input v-model="includeOffline" type="checkbox" />
+                <span>包含离线（历史最后状态）</span>
+              </label>
+              <select v-model="sortBy" class="sel">
+                <option value="name">按名称</option>
+                <option value="cpu">按 CPU</option>
+                <option value="mem">按内存</option>
+                <option value="disk">按磁盘</option>
+                <option value="load">按负载</option>
+                <option value="status">按状态</option>
+              </select>
+              <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
+            </div>
 
       <div v-if="historyError" class="err">历史库读取失败：{{ historyError }}</div>
 
@@ -255,7 +375,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="rows">
-        <div v-for="r in rows" :key="r.key" class="row" :class="[r.status, r.freshness]">
+        <div v-for="r in filteredRows" :key="r.key" class="row" :class="[r.status, r.freshness]">
           <div class="left">
             <span class="dot" :class="[r.status, r.freshness]"></span>
             <div class="names">
@@ -309,14 +429,51 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="acts">
-            <button v-if="r.sid" class="btn" @click="emit('focus', r.sid!)">切到</button>
-            <button v-else-if="r.hostId" class="btn" @click="emit('connect', r.hostId!)">连接</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</template>
+                      <button v-if="r.sid" class="btn" @click="emit('focus', r.sid!)">切到</button>
+                      <button v-else-if="r.hostId" class="btn" @click="emit('connect', r.hostId!)">连接</button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 组内历史对比：选组时出现。小多图矩阵，每台一格，谁掉队一眼可见 -->
+                <div v-if="groupFilter && groupFilter !== '__none'" class="hist">
+                  <div class="hist-head">
+                    <span class="hist-title">
+                      组内历史对比
+                      <span class="dim">· {{ hostIdsInGroup.length }} 台 · {{ HIST_WINDOWS[histKey].label }}</span>
+                    </span>
+                    <select v-model="histKey" class="sel">
+                      <option value="1h">1 小时</option>
+                      <option value="24h">24 小时</option>
+                      <option value="7d">7 天</option>
+                    </select>
+                    <button class="btn ghost" @click="loadGroupHistory">⟳</button>
+                  </div>
+                  <div v-if="histBusy" class="dim">读取历史中…</div>
+                  <div v-if="histError" class="err">历史读取失败：{{ histError }}</div>
+                  <div v-if="!histBusy && !Object.keys(histData).length" class="dim">
+                    组内还没有历史数据 —— 连接主机并开启历史后，这里会显示每台主机的 CPU / 内存曲线。
+                  </div>
+                  <div class="grid">
+                    <div v-for="(r, hid) in histData" :key="hid" class="cell">
+                      <div class="cell-name">{{ hostLabelOf(hid) }}</div>
+                      <svg viewBox="0 0 220 58" preserveAspectRatio="none" width="100%" height="58">
+                        <path :d="sparkPath(cpuSeries(r), 220, 58)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
+                        <path
+                          :d="sparkPath(memSeries(r), 220, 58)"
+                          fill="none"
+                          stroke="var(--ctp-green)"
+                          stroke-width="1.3"
+                          stroke-dasharray="3 2"
+                        />
+                      </svg>
+                      <div class="cell-legend"><span class="lg">─ CPU</span><span class="lg dim">┄ 内存</span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
 
 <style scoped>
 .mask {
@@ -398,7 +555,18 @@ onBeforeUnmount(() => {
   border-radius: 4px;
   padding: 3px 6px;
   font-size: 11px;
+  max-width: 180px;
 }
+.group-sel { font-weight: 600; }
+.hist { border-top: 1px solid var(--ctp-surface0); margin-top: 10px; padding-top: 8px; }
+.hist-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.hist-title { font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.cell { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px 8px; }
+.cell-name { font-size: 11px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cell-legend { display: flex; gap: 10px; font-size: 10px; margin-top: 2px; }
+.lg { color: var(--ctp-blue); }
+.lg.dim { color: var(--ctp-overlay0); }
 .bar .btn {
   margin-left: auto;
 }

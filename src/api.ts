@@ -454,6 +454,11 @@ export const api = {
       to,
       maxPoints: maxPoints ?? null,
     }),
+  /** 一次查多台主机（组内历史对比）。单台无数据就缺那一台，不报错。 */
+  historyRangeMulti: (hostIds: string[], from: number, to: number, maxPoints?: number) =>
+    call<Record<string, HistoryRange>>('history_range_multi', {
+      hostIds, from, to, maxPoints: maxPoints ?? null,
+    }),
   historyHosts: () => call<HistoryHost[]>('history_hosts'),
   historyStats: () => call<HistoryStats>('history_stats'),
   historyExport: (hostId: string, from: number, to: number, destDir?: string | null) =>

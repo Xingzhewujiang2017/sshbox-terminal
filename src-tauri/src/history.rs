@@ -629,6 +629,37 @@ pub async fn history_range(
     .await
 }
 
+/// 一次查多台主机的历史（组内对比用）。同一时间窗、同一桶数，曲线才可比。
+/// 循环复用 `range_at`：库是本地 SQLite，一个组几台到几十台都在毫秒级。
+/// 单台失败只跳过那台，不拖垮整组 —— 集群视图里"一台没数据"不该让整屏白掉。
+#[tauri::command]
+pub async fn history_range_multi(
+    host_ids: Vec<String>,
+    from: f64,
+    to: f64,
+    max_points: Option<usize>,
+) -> std::result::Result<std::collections::HashMap<String, HistoryRange>, String> {
+    let mut out = std::collections::HashMap::new();
+    if host_ids.is_empty() {
+        return Ok(out);
+    }
+    let points = max_points.unwrap_or(600);
+    blocking(move || {
+        let path = db_path();
+        if !path.exists() {
+            anyhow::bail!("还没有历史数据（库文件尚未创建）");
+        }
+        let conn = open_at(&path)?;
+        for hid in host_ids {
+            if let Ok(r) = range_at(&conn, &hid, from, to, points) {
+                out.insert(hid, r);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn history_hosts() -> std::result::Result<Vec<HostStat>, String> {
     blocking(move || {

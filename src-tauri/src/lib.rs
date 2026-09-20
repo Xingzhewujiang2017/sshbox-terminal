@@ -82,6 +82,7 @@ pub fn run() {
             commands::ui_log,
             // --- history ---
             history::history_range,
+            history::history_range_multi,
             history::history_hosts,
             history::history_stats,
             history::history_export,
