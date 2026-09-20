@@ -177,7 +177,10 @@ function plainThink(s: string): string {
             <pre>{{ plainThink(t.reasoning) }}</pre>
           </details>
           <template v-for="(line, li) in (t.content || '').split('\n')" :key="li">
-            <div v-if="looksLikeCommand(line)" class="code-line">{{ line }}</div>
+            <div v-if="looksLikeCommand(line)" class="code-line">
+              <span class="cl-text">{{ line }}</span>
+              <button class="cl-insert" title="把这行填入终端（回车由你按）" @click="insertTurn({ content: line, sid: t.sid })">插入</button>
+            </div>
             <div v-else class="text-line">{{ line || '\u00a0' }}</div>
           </template>
           <span v-if="t.streaming" class="caret">▋</span>
@@ -312,7 +315,23 @@ function plainThink(s: string): string {
   margin: 2px 0;
   white-space: pre-wrap;
   word-break: break-all;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
+.code-line .cl-text { flex: 1; min-width: 0; }
+.code-line .cl-insert {
+  flex-shrink: 0;
+  background: var(--ctp-surface1);
+  color: var(--ctp-text);
+  border: none;
+  border-radius: 4px;
+  font-size: 10px;
+  padding: 2px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.code-line .cl-insert:hover { background: var(--ctp-blue); color: var(--on-accent); }
 .cmd-box {
   background: var(--ctp-crust);
   border: 1px solid var(--ctp-surface1);

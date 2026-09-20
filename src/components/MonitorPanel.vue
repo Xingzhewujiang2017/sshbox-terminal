@@ -92,6 +92,8 @@ const paused = ref(false)
 const services = ref<ServiceInfo | null>(null)
 const hardware = ref<HardwareInfo | null>(null)
 const ping = ref<PingInfo | null>(null)
+/** 时延/丢包迷你趋势（#1）：15s 一档，最多 48 点。 */
+const pingHist = ref<{ lat: number[]; loss: number[] }>({ lat: [], loss: [] })
 /** 传感器多起来（8 核 + 2 个 NVMe）会淹掉面板，默认只露最热的几个。 */
 const TEMP_SHOWN = 5
 const tempsExpanded = ref(false)
@@ -264,6 +266,16 @@ function fmtRateShort(b: number): string {
   return (b / 1024 / 1024).toFixed(1) + 'M'
 }
 
+/** 迷你折线 path（#1 时延趋势用）：自绘 SVG，归一化到各自最大值。 */
+function spark(vals: number[], w: number, h: number): string {
+  if (!vals.length) return ''
+  const max = Math.max(...vals, 1)
+  const step = w / Math.max(1, vals.length - 1)
+  return vals
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - 2 - (h - 6) * (v / max)).toFixed(1)}`)
+    .join(' ')
+}
+
 const netTotals = computed(() => {
   if (!metrics.value) return { rx: 0, tx: 0 }
   return metrics.value.net.reduce(
@@ -375,6 +387,17 @@ onMounted(async () => {
   }
   unlistenPing = await listen<{ sid: string; ping: PingInfo | null }>('ssh://ping', (e) => {
     if (e.payload.sid === props.sid) ping.value = e.payload.ping
+    // 时延/丢包迷你趋势（#1）：慢采集 15s 一档，最多留 48 点（约 12 分钟）。
+    // 没测到网关（null）时整次跳过 —— 不画 0ms 骗人。
+    if (e.payload.ping) {
+      const h = pingHist.value
+      h.lat.push(+e.payload.ping.rtt_avg.toFixed(2))
+      h.loss.push(+e.payload.ping.loss_pct.toFixed(1))
+      if (h.lat.length > 48) {
+        h.lat.shift()
+        h.loss.shift()
+      }
+    }
   })
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
@@ -486,6 +509,22 @@ onBeforeUnmount(() => {
           <span v-if="ping.jitter > 0">抖动 {{ ping.jitter.toFixed(2) }} ms</span>
           <span :class="{ bad: ping.loss_pct >= 5 }">丢包 {{ ping.loss_pct.toFixed(0) }}%</span>
           <span class="unit">到 {{ ping.target }}</span>
+        </div>
+        <svg
+          v-if="pingHist.lat.length >= 2"
+          viewBox="0 0 260 40"
+          preserveAspectRatio="none"
+          width="100%"
+          height="40"
+          class="ping-spark"
+        >
+          <path :d="spark(pingHist.lat, 260, 40)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
+          <path :d="spark(pingHist.loss, 260, 40)" fill="none" stroke="var(--ctp-red)" stroke-width="1.3" stroke-dasharray="3 2" />
+        </svg>
+        <div v-if="pingHist.lat.length >= 2" class="ping-legend">
+          时延<svg viewBox="0 0 20 6" width="20" height="6"><path d="M0 3 L20 3" stroke="var(--ctp-blue)" stroke-width="2" /></svg>
+          丢包%<svg viewBox="0 0 20 6" width="20" height="6"><path d="M0 3 L20 3" stroke="var(--ctp-red)" stroke-width="2" stroke-dasharray="3 2" /></svg>
+          · 近 {{ pingHist.lat.length }} 次（每 15 秒）
         </div>
         <div class="net-total">
           <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
@@ -718,6 +757,8 @@ onBeforeUnmount(() => {
 .net-total { display: flex; gap: 16px; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .net-quality { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .net-quality .bad { color: #e5484d; font-weight: 600; }
+.ping-spark { display: block; margin: 2px 0; background: var(--ctp-mantle); border-radius: 4px; }
+.ping-legend { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--ctp-overlay0); margin-bottom: 4px; }
 .down { color: var(--ctp-green); } .up { color: var(--ctp-blue); }
 .net-if, .io-row { display: flex; gap: 10px; color: var(--ctp-subtext0); padding: 1px 0; }
 .ifname { color: var(--ctp-overlay0); min-width: 56px; }

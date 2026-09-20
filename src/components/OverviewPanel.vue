@@ -152,6 +152,8 @@ const historyError = ref('')
 // --- 分组视角（集群测试） ---
 // '' = 全部主机；组名 = 只看该组；'__none' = 未分组（含临时连接）。
 const groupFilter = ref('')
+/** 总览主视图：表格（默认）/ 卡片网格（#3，组内状态一眼看）。 */
+const viewMode = ref<'table' | 'cards'>('table')
 const groupOfHost = (id: string | null | undefined): string | null => {
   if (!id) return null
   const h = props.hosts.hosts.find((x) => x.id === id)
@@ -543,13 +545,17 @@ onBeforeUnmount(() => {
                 <span>包含离线（历史最后状态）</span>
               </label>
               <select v-model="sortBy" class="sel">
-                <option value="name">按名称</option>
-                <option value="cpu">按 CPU</option>
-                <option value="mem">按内存</option>
-                <option value="disk">按磁盘</option>
-                <option value="load">按负载</option>
-                <option value="status">按状态</option>
-              </select>
+                              <option value="name">按名称</option>
+                              <option value="cpu">按 CPU</option>
+                              <option value="mem">按内存</option>
+                              <option value="disk">按磁盘</option>
+                              <option value="load">按负载</option>
+                              <option value="status">按状态</option>
+                            </select>
+                            <span class="view-seg">
+                              <button :class="{ on: viewMode === 'table' }" @click="viewMode = 'table'">表格</button>
+                              <button :class="{ on: viewMode === 'cards' }" @click="viewMode = 'cards'">卡片</button>
+                            </span>
               <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
                       <button class="btn ghost" @click="injectOpen = !injectOpen" title="生成 tc netem 注入命令，填入各组终端（只填不执行）">故障注入</button>
                       <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前视图为 CSV（含分组）">导出 CSV</button>
@@ -570,7 +576,45 @@ onBeforeUnmount(() => {
         当前没有已连接的会话。双击左侧主机连接，或勾选「包含离线」看历史最后状态。
       </div>
 
-      <div class="rows">
+      <!-- 卡片视图（#3）：每台一块卡片，CPU/内存/磁盘条 + 网络 + 状态灯 -->
+      <div v-if="viewMode === 'cards' && rows.length" class="grid ov-cards">
+        <div v-for="r in filteredRows" :key="r.key" class="ov-card" :class="[r.status, r.freshness]">
+          <div class="card-top">
+            <span class="dot" :class="[r.status, r.freshness]"></span>
+            <span class="card-name">{{ r.title }}</span>
+            <span v-if="r.alert" class="badge hot" :title="r.alert.body">⚠ {{ r.alert.title }}</span>
+            <span class="spacer"></span>
+            <span v-if="r.ageSec != null" class="dim" :class="{ warn: r.status === 'offline' || r.freshness !== 'fresh' }">{{ fmtAge(r.ageSec) }}</span>
+            <span v-else class="dim">等待采样</span>
+          </div>
+          <div class="sub2 dim">{{ r.subtitle }}<span v-if="r.status === 'offline'" class="dim"> · 历史最后状态</span></div>
+          <div class="m">
+            <span class="k">CPU</span>
+            <div class="track"><div class="fill" :class="barClass(r.metrics?.cpu_pct ?? r.lastCpu)" :style="{ width: Math.min(100, r.metrics?.cpu_pct ?? r.lastCpu ?? 0) + '%' }"></div></div>
+            <span class="v">{{ fmtPct(r.metrics?.cpu_pct ?? r.lastCpu) }}</span>
+          </div>
+          <div class="m">
+            <span class="k">内存</span>
+            <div class="track"><div class="fill" :class="barClass(r.metrics?.mem_pct ?? r.lastMem)" :style="{ width: Math.min(100, r.metrics?.mem_pct ?? r.lastMem ?? 0) + '%' }"></div></div>
+            <span class="v">{{ fmtPct(r.metrics?.mem_pct ?? r.lastMem) }}</span>
+          </div>
+          <div class="m">
+            <span class="k">磁盘</span>
+            <div class="track"><div class="fill" :class="barClass(worstDisk(r.metrics))" :style="{ width: Math.min(100, worstDisk(r.metrics) ?? 0) + '%' }"></div></div>
+            <span class="v">{{ fmtPct(worstDisk(r.metrics)) }}</span>
+          </div>
+          <div class="card-net dim">
+            <span v-if="r.metrics">↓ {{ fmtBytes(netTotals(r.metrics).rx) }} ↑ {{ fmtBytes(netTotals(r.metrics).tx) }} · 负载 {{ r.metrics.load?.[0]?.toFixed(2) ?? '—' }} · 进程 {{ r.metrics.proc_total }}</span>
+            <span v-else>—</span>
+          </div>
+          <div class="acts">
+            <button v-if="r.sid" class="btn" @click="emit('focus', r.sid!)">切到</button>
+            <button v-else-if="r.hostId" class="btn" @click="emit('connect', r.hostId!)">连接</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="viewMode === 'table'" class="rows">
         <div v-for="r in filteredRows" :key="r.key" class="row" :class="[r.status, r.freshness]">
           <div class="left">
             <span class="dot" :class="[r.status, r.freshness]"></span>
@@ -836,6 +880,23 @@ onBeforeUnmount(() => {
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
 .cell { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px 8px; }
 .cell-name { font-size: 11px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.view-seg { display: inline-flex; gap: 2px; }
+.view-seg button { background: none; border: 1px solid var(--ctp-surface0); color: var(--ctp-overlay0); border-radius: 4px; font-size: 11px; padding: 2px 8px; cursor: pointer; }
+.view-seg button.on { color: var(--ctp-blue); border-color: var(--ctp-blue); background: var(--ctp-surface0); }
+.ov-cards { margin-top: 10px; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+.ov-card { border: 1px solid var(--ctp-surface0); border-radius: 8px; padding: 8px 10px; }
+.ov-card.offline { opacity: 0.8; }
+.ov-card .card-top { display: flex; align-items: center; gap: 6px; }
+.ov-card .card-name { font-weight: 600; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ov-card .spacer { flex: 1; }
+.ov-card .sub2 { margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ov-card .m { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.ov-card .m .k { width: 30px; color: var(--ctp-overlay0); font-size: 10.5px; }
+.ov-card .m .track { flex: 1; height: 6px; background: var(--ctp-surface0); border-radius: 3px; overflow: hidden; }
+.ov-card .m .fill { height: 100%; border-radius: 3px; }
+.ov-card .m .v { width: 42px; text-align: right; font-size: 10.5px; color: var(--ctp-subtext0); }
+.ov-card .card-net { margin-top: 7px; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ov-card .acts { margin-top: 8px; display: flex; gap: 6px; }
 .cell-legend { display: flex; gap: 10px; font-size: 10px; margin-top: 2px; }
 .lg { color: var(--ctp-blue); }
 .lg.dim { color: var(--ctp-overlay0); }
