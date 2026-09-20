@@ -6,6 +6,7 @@
 use tauri::{AppHandle, Emitter};
 
 use crate::ai::{self, AiProfile, AiSettings, ChatMessage, Protocol};
+use crate::ssh::StaticInfo;
 use crate::store;
 
 /// 前端要的 profile 视图：带上 `has_key`，但不带密钥本身。
@@ -206,12 +207,28 @@ pub async fn ai_chat(
         if has_key { "有" } else { "无" },
         messages.len()
     );
-    let result = ai::send_stream(&p, key.as_deref(), &messages, &req_id, move |text| {
-        let _ = app2.emit(
-            "ssh://ai/delta",
-            serde_json::json!({ "req_id": rid, "text": text }),
-        );
-    })
+    // 思考过程和正文分两条事件推给前端：面板默认折叠思考，展开才看
+    // （deepseek 系模型正文前会先吐一大段 reasoning_content，混在一起很难读）
+    let rid_r = req_id.clone();
+    let app3 = app.clone();
+    let result = ai::send_stream(
+        &p,
+        key.as_deref(),
+        &messages,
+        &req_id,
+        move |text| {
+            let _ = app2.emit(
+                "ssh://ai/delta",
+                serde_json::json!({ "req_id": rid, "text": text }),
+            );
+        },
+        move |text| {
+            let _ = app3.emit(
+                "ssh://ai/reasoning",
+                serde_json::json!({ "req_id": rid_r, "text": text }),
+            );
+        },
+    )
     .await;
     match result {
         Ok(full) => {
@@ -264,9 +281,34 @@ pub fn ai_protocol_label(protocol: String) -> String {
 /// 终端输出最多带多少字符进上下文。太短 AI 看不到报错，太长既贵又容易被无关日志带偏。
 pub const TAIL_BUDGET: usize = 6000;
 
-/// 主机背景，让 AI 知道自己在看什么机器。
-pub fn host_brief(host: &str, port: u16, username: &str, os: &str, hostname: &str) -> String {
-    format!("目标主机：{username}@{host}:{port}，系统 {os}，主机名 {hostname}。")
+/// 给 AI 的主机背景。
+///
+/// 采集层早就有 arch / kernel / cpu_model / cores / mem（静态快照），这里以前只给
+/// 系统名和主机名 —— 于是用户问「看下显卡占用」时，AI 只能反问"你是什么系统、什么卡"。
+/// 把已知信息一次给全，命令才能一步到位（按发行版选 apt/dnf，按架构选 x86_64/aarch64 包）。
+pub fn host_brief(host: &str, port: u16, username: &str, st: Option<&StaticInfo>) -> String {
+    let mut s = format!("目标主机：{username}@{host}:{port}");
+    match st {
+        Some(i) => {
+            s.push_str(&format!(
+                "，主机名 {}，系统 {}，内核 {}，架构 {}",
+                i.hostname, i.os_pretty, i.kernel, i.arch
+            ));
+            if !i.cpu_model.is_empty() {
+                s.push_str(&format!("，CPU {}（{} 核）", i.cpu_model, i.cpu_cores));
+            }
+            s.push_str(&format!(
+                "，内存 {:.1} GB",
+                i.mem_total_kb as f64 / 1024.0 / 1024.0
+            ));
+            s.push_str("。以上是已采集到的信息，**不要反问用户系统/架构/CPU**；缺什么就直接给命令去查。");
+        }
+        None => s.push_str(
+            "。静态信息还没采到（会话刚建立或采集被关掉）：不要假设发行版和架构，\
+             给命令时优先用通用写法，需要就先让用户跑 `uname -a` / `cat /etc/os-release`。",
+        ),
+    }
+    s
 }
 
 /// 「解释这段」：贴选中的内容 + 终端尾部做背景。
@@ -363,22 +405,9 @@ pub async fn ai_ask(
         match sid.as_deref().and_then(|s| sessions.get(s)) {
             Some(sess) => {
                 let info = &sess.info;
+                // 静态信息（系统/内核/架构/CPU/内存）直接给 AI，省得它反问用户
                 let cached = crate::monitor::cached_static(&info.sid);
-                host_brief(
-                    &info.host,
-                    info.port,
-                    &info.username,
-                    cached
-                        .as_ref()
-                        .map(|c| c.os_pretty.clone())
-                        .unwrap_or_else(|| "未知".into())
-                        .as_str(),
-                    cached
-                        .as_ref()
-                        .map(|c| c.hostname.clone())
-                        .unwrap_or_default()
-                        .as_str(),
-                )
+                host_brief(&info.host, info.port, &info.username, cached.as_ref())
             }
             None => String::new(),
         }
@@ -399,8 +428,23 @@ pub async fn ai_ask(
 mod tests {
     use super::*;
 
+    /// 一份采集到的静态信息（字段和真机一致，用来钉住 host_brief 的内容）
+    fn statics() -> crate::ssh::StaticInfo {
+        crate::ssh::StaticInfo {
+            hostname: "r9000p".into(),
+            os_pretty: "Ubuntu 22.04.5 LTS".into(),
+            kernel: "5.15.153.1-microsoft-standard-WSL2".into(),
+            arch: "x86_64".into(),
+            cpu_model: "AMD Ryzen 7 5800H with Radeon Graphics".into(),
+            cpu_cores: 16,
+            mem_total_kb: 8_000_000,
+            uptime_secs: 3600,
+            disks: vec![],
+        }
+    }
+
     fn brief() -> String {
-        host_brief("127.0.0.1", 22, "root", "Ubuntu 22.04", "r9000p")
+        host_brief("127.0.0.1", 22, "root", Some(&statics()))
     }
 
     #[test]
@@ -456,8 +500,31 @@ mod tests {
     fn host_brief_carries_identity() {
         let b = brief();
         assert!(b.contains("root@127.0.0.1:22"), "{b}");
-        assert!(b.contains("Ubuntu 22.04"));
-        assert!(b.contains("r9000p"));
+        assert!(b.contains("Ubuntu 22.04"), "{b}");
+        assert!(b.contains("r9000p"), "{b}");
+    }
+
+    /// 用户的原话：「AI 助手能自动获取主机的基本信息，如 CPU、架构、系统等……
+    /// 而不是问用户什么系统、什么算力卡」。静态信息采集层早就有，这里钉住它确实进了 prompt。
+    #[test]
+    fn host_brief_tells_the_model_the_arch_and_cpu_so_it_does_not_ask() {
+        let b = brief();
+        assert!(b.contains("x86_64"), "架构要在: {b}");
+        assert!(b.contains("AMD Ryzen 7 5800H"), "CPU 型号要在: {b}");
+        assert!(b.contains("16 核"), "核数要在: {b}");
+        assert!(b.contains("7.6 GB"), "内存要在: {b}");
+        assert!(b.contains("5.15.153.1-microsoft-standard-WSL2"), "内核要在: {b}");
+        assert!(b.contains("不要反问用户"), "要明确告诉模型别再问: {b}");
+    }
+
+    /// 静态信息还没采到时不能瞎猜发行版和架构 —— 如实说明并给通用兜底。
+    #[test]
+    fn host_brief_without_statics_does_not_pretend() {
+        let b = host_brief("10.0.0.9", 2222, "deploy", None);
+        assert!(b.contains("deploy@10.0.0.9:2222"), "{b}");
+        assert!(b.contains("还没采到"), "{b}");
+        assert!(b.contains("uname"), "要给通用兜底命令: {b}");
+        assert!(!b.contains("x86_64"), "不能编造架构: {b}");
     }
 
     #[test]

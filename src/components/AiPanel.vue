@@ -6,6 +6,7 @@
  * 命令落进终端后仍由用户按回车。这是安全底线：模型可能给出 rm 之类的命令。
  */
 import { computed, nextTick, ref, watch } from 'vue'
+import { api } from '../api'
 import {
   ai,
   activeProfile,
@@ -15,6 +16,7 @@ import {
   cancelAi,
   cleanCommand,
   clearTurns,
+  loadAiSettings,
 } from '../ai'
 
 const props = defineProps<{ sid?: string | null }>()
@@ -32,6 +34,26 @@ const scroller = ref<HTMLElement | null>(null)
 const ready = computed(() => aiReady())
 const reason = computed(() => aiDisabledReason())
 const profile = computed(() => activeProfile())
+const profiles = computed(() => ai.settings?.profiles ?? [])
+
+/** 本地端点不需要密钥（判断口径与设置页一致）。 */
+function needsKey(p: { base_url: string }) {
+  return !/127\.0\.0\.1|localhost|\[::1\]/i.test(p.base_url)
+}
+function keyMissing(p: { base_url: string; has_key: boolean }) {
+  return needsKey(p) && !p.has_key
+}
+
+/** 面板里直接换模型：写回后端 → 重读设置，AI 入口的可用状态跟着变。 */
+async function switchModel(id: string) {
+  if (!id) return
+  try {
+    await api.aiSetActive(id)
+    await loadAiSettings()
+  } catch (e) {
+    ai.error = `切换模型失败：${(e as Error).message}`
+  }
+}
 
 function send() {
   const text = input.value.trim()
@@ -40,13 +62,12 @@ function send() {
   void ask(mode.value, { prompt: text, sid: props.sid ?? undefined })
 }
 
-function insertPending() {
-  if (!ai.pendingCommand) return
-  emit('insert', { text: ai.pendingCommand, sid: ai.pendingSid })
-  ai.pendingCommand = ''
-}
-
-/** 双击命令框里的命令 → 直接填进它对应的主机（不回车）。 */
+/** 双击命令框里的命令 → 直接填进它对应的主机（不回车）。
+ *
+ * **按钮和双击走同一条路**：都以"这一轮自己的内容"为准。
+ * 之前按钮用的是全局 pendingCommand 并在点击后清空，一旦 App 那边因为
+ * "没有会话"把这次插入丢掉（用户看到的是毫无反应），状态就已经被吃掉了，
+ * 按钮此后再也点不动 —— 实测复现过。 */
 function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
   if (t.streaming) return
   const text = cleanCommand(t.content)
@@ -54,9 +75,10 @@ function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
   emit('insert', { text, sid: t.sid ?? '' })
 }
 
-async function copyPending() {
+/** 复制这一轮的命令到剪贴板。 */
+async function copyTurn(t: { content: string }) {
   try {
-    await navigator.clipboard.writeText(ai.pendingCommand)
+    await navigator.clipboard.writeText(cleanCommand(t.content))
   } catch {
     /* 剪贴板不可用时用户还能手动选中 */
   }
@@ -83,15 +105,25 @@ function looksLikeCommand(line: string): boolean {
   <aside class="ai-drawer">
     <div class="head">
       <span class="title">AI 助手</span>
-      <span v-if="profile" class="badge" :title="`${profile.protocol} · ${profile.base_url}`">
-        {{ profile.name }} · {{ profile.model }}
-      </span>
+      <!-- 直接在下拉里换模型：以前每次换都要开设置 → AI 模型 → 使用，问一句换一次很烦 -->
+      <select
+        v-if="profiles.length"
+        class="picker"
+        :value="ai.settings?.active_profile_id ?? ''"
+        :title="profile ? `${profile.protocol} · ${profile.base_url}` : '选一个模型'"
+        @change="switchModel(($event.target as HTMLSelectElement).value)"
+      >
+        <option value="" disabled>未选择模型</option>
+        <option v-for="p in profiles" :key="p.id" :value="p.id">
+          {{ p.name }} · {{ p.model }}{{ keyMissing(p) ? '（缺密钥）' : '' }}
+        </option>
+      </select>
       <span v-else class="badge off">未配置</span>
+      <span class="spacer"></span>
       <span class="modes">
         <button class="mode" :class="{ on: mode === 'chat' }" @click="mode = 'chat'">对话</button>
         <button class="mode" :class="{ on: mode === 'command' }" @click="mode = 'command'">生成命令</button>
       </span>
-      <span class="spacer"></span>
       <button class="icon" title="清空对话" @click="clearTurns">🗑</button>
       <button class="icon" title="关闭" @click="emit('close')">×</button>
     </div>
@@ -123,13 +155,20 @@ function looksLikeCommand(line: string): boolean {
           @dblclick="insertTurn(t)"
         >
           <code>{{ t.content || '…' }}</code>
-          <div v-if="ai.pendingCommand && i === ai.turns.length - 1" class="cmd-actions">
-            <button class="mini primary" @click="insertPending">插入终端</button>
-            <button class="mini" @click="copyPending">复制</button>
+          <div class="cmd-actions">
+            <button class="mini primary" @click="insertTurn(t)">插入终端</button>
+            <button class="mini" @click="copyTurn(t)">复制</button>
             <span class="mini-hint">双击命令也能直接填入；不会自动执行，回车由你按</span>
           </div>
         </div>
         <div v-else class="body">
+          <!-- 思考过程：默认折叠（模型可能吐几千字），标题给字数，展开才看 -->
+          <details v-if="t.reasoning" class="think">
+            <summary>
+              思考过程（{{ t.reasoning.length }} 字）<span v-if="t.streaming" class="thinking">正在思考…</span>
+            </summary>
+            <pre>{{ t.reasoning }}</pre>
+          </details>
           <template v-for="(line, li) in (t.content || '').split('\n')" :key="li">
             <div v-if="looksLikeCommand(line)" class="code-line">{{ line }}</div>
             <div v-else class="text-line">{{ line || '\u00a0' }}</div>
@@ -178,6 +217,11 @@ function looksLikeCommand(line: string): boolean {
   padding: 8px 10px;
   border-bottom: 1px solid var(--ctp-surface0);
 }
+.picker {
+  background: var(--ctp-crust); color: var(--ctp-text); border: 1px solid var(--ctp-surface1);
+  border-radius: 4px; font-size: 11px; padding: 2px 4px; max-width: 220px; cursor: pointer;
+}
+.picker:hover { border-color: var(--ctp-blue); }
 .title { font-size: 12.5px; font-weight: 600; color: var(--ctp-text); }
 .badge {
   font-size: 10px;
@@ -266,6 +310,19 @@ function looksLikeCommand(line: string): boolean {
 }
 .mini.primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
 .mini-hint { font-size: 10px; color: var(--ctp-overlay0); }
+.think { margin: 0 0 6px; border-left: 2px solid var(--ctp-surface1); padding-left: 8px; }
+.think summary {
+  font-size: 11px; color: var(--ctp-overlay0); cursor: pointer; user-select: none; list-style: none;
+}
+.think summary:hover { color: var(--ctp-subtext0); }
+.think summary::-webkit-details-marker { display: none; }
+.think summary::before { content: '▸ '; }
+.think[open] summary::before { content: '▾ '; }
+.think pre {
+  margin: 6px 0 0; white-space: pre-wrap; word-break: break-word;
+  font-size: 11px; color: var(--ctp-overlay0); font-family: inherit; line-height: 1.5;
+}
+.thinking { color: var(--ctp-blue); margin-left: 6px; }
 .caret { color: var(--ctp-blue); animation: blink 1s steps(2) infinite; }
 @keyframes blink { to { opacity: 0; } }
 .turn-err { font-size: 11px; color: var(--ctp-red); margin-top: 4px; line-height: 1.5; }

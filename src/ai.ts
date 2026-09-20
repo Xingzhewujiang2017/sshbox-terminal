@@ -23,6 +23,8 @@ export interface AiTurn {
   kind?: AiKind
   /** 这一轮是为哪个会话生成的 —— 命令要填回同一台主机，别贴错机器 */
   sid?: string
+  /** 思考过程（deepseek 系模型会先吐一大段）。面板默认折叠，展开才看。 */
+  reasoning?: string
   at: number
 }
 
@@ -97,6 +99,12 @@ export async function initAi() {
     const t = ai.turns[ai.turns.length - 1]
     if (!t || t.role !== 'assistant' || !t.streaming) return
     t.content += e.payload.text
+  })
+  // 思考过程单独一条流：面板默认折叠，展开才看
+  await listen<{ req_id: string; text: string }>('ssh://ai/reasoning', (e) => {
+    const t = ai.turns[ai.turns.length - 1]
+    if (!t || t.role !== 'assistant' || !t.streaming) return
+    t.reasoning = (t.reasoning ?? '') + e.payload.text
   })
   await listen<{ req_id: string }>('ssh://ai/done', () => {
     const t = ai.turns[ai.turns.length - 1]

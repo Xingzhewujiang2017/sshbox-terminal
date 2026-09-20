@@ -392,6 +392,60 @@ pub fn extract_text(proto: Protocol, body: &serde_json::Value) -> Option<String>
     }
 }
 
+/// 从一条 SSE 事件里取「思考过程」增量（如果有）。
+///
+/// 三家放的地方都不一样，而且和正文是**两条并行的流**：
+/// - OpenAI 兼容 / DeepSeek：`choices[0].delta.reasoning_content`（OpenRouter 用 `reasoning`）
+/// - Anthropic：`content_block_delta` 且 `delta.type == "thinking_delta"` → `delta.thinking`
+/// - Gemini：`candidates[0].content.parts[*]` 里 `thought == true` 的那部分
+///
+/// 不接的话思考内容会被整个丢掉（实测 aiaaa.cc 的 deepseek-v4-flash-0731 就是
+/// 全程 `content:""` + `reasoning_content:"…"`，正文最后才出现）。
+pub fn parse_reasoning(proto: Protocol, data: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    match proto {
+        Protocol::OpenAi => {
+            let d = v.get("choices")?.get(0)?.get("delta")?;
+            for k in ["reasoning_content", "reasoning"] {
+                if let Some(s) = d.get(k).and_then(|x| x.as_str()) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+            None
+        }
+        Protocol::Anthropic => {
+            if v.get("type")?.as_str()? != "content_block_delta" {
+                return None;
+            }
+            let d = v.get("delta")?;
+            if d.get("type")?.as_str()? != "thinking_delta" {
+                return None;
+            }
+            let t = d.get("thinking")?.as_str()?;
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        Protocol::Gemini => {
+            let parts = v
+                .get("candidates")?
+                .get(0)?
+                .get("content")?
+                .get("parts")?
+                .as_array()?;
+            let mut out = String::new();
+            for p in parts {
+                if p.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                    if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
+                        out.push_str(t);
+                    }
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+    }
+}
+
 /// 每种协议的 base_url 应该长什么样。
 ///
 /// 填错的代价是一个 404，而 404 的原始文案（"Not Found"）不告诉用户少了 `/v1`，
@@ -576,15 +630,17 @@ pub async fn send_once(
 /// - 流中途断开**不丢已收到的内容** —— 部分回答也比一句「失败」有用；
 /// - 「干净地结束但一个字都没有」**重试一次**（提供方偶发空回复，见 `send_once`）；
 ///   只在还没有任何增量时重试，所以不会把文本吐两遍。
-pub async fn send_stream<F>(
+pub async fn send_stream<F, G>(
     profile: &AiProfile,
     key: Option<&str>,
     messages: &[ChatMessage],
     req_id: &str,
     mut on_delta: F,
+    mut on_reasoning: G,
 ) -> Result<String>
 where
     F: FnMut(&str),
+    G: FnMut(&str),
 {
     let proto = Protocol::parse(&profile.protocol);
     let mut acc = String::new();
@@ -631,6 +687,9 @@ where
                 if is_done(proto, data) {
                     finished = true;
                     break;
+                }
+                if let Some(r) = parse_reasoning(proto, data) {
+                    on_reasoning(&r);
                 }
                 if let Some(text) = parse_delta(proto, data) {
                     acc.push_str(&text);
@@ -743,6 +802,28 @@ mod tests {
         assert_eq!(r.body["messages"][0]["role"], "user");
         assert_eq!(r.body["system"], "be terse");
         assert!(r.body["max_tokens"].is_number(), "max_tokens 必填");
+    }
+
+    /// 真实抓到的形状（aiaaa.cc 的 deepseek-v4-flash-0731）：正文全程为空、
+    /// 思考在 `reasoning_content` 里，正文最后才出现。三家字段名都不同，逐个钉住。
+    #[test]
+    fn reasoning_is_parsed_for_each_protocol() {
+        let openai = r#"{"choices":[{"delta":{"content":"","reasoning_content":"We need","role":"assistant"}}]}"#;
+        assert_eq!(parse_reasoning(Protocol::OpenAi, openai).as_deref(), Some("We need"));
+        // 只有正文时不能被当成思考
+        let plain = r#"{"choices":[{"delta":{"content":"答案"}}]}"#;
+        assert_eq!(parse_reasoning(Protocol::OpenAi, plain), None);
+        // OpenRouter 用 reasoning
+        let or_ = r#"{"choices":[{"delta":{"reasoning":"hmm"}}]}"#;
+        assert_eq!(parse_reasoning(Protocol::OpenAi, or_).as_deref(), Some("hmm"));
+        // Anthropic 的 thinking_delta（text_delta 是正文，不能混）
+        let anth = r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"let me see"}}"#;
+        assert_eq!(parse_reasoning(Protocol::Anthropic, anth).as_deref(), Some("let me see"));
+        let anth_text = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"答案"}}"#;
+        assert_eq!(parse_reasoning(Protocol::Anthropic, anth_text), None);
+        // Gemini 用 thought:true 标记思考部分
+        let gem = r#"{"candidates":[{"content":{"parts":[{"text":"想一下","thought":true},{"text":"答案"}]}}]}"#;
+        assert_eq!(parse_reasoning(Protocol::Gemini, gem).as_deref(), Some("想一下"));
     }
 
     #[test]

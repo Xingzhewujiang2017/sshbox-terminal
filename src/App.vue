@@ -272,7 +272,11 @@ function insertToTerminal(p: { text: string; sid?: string }) {
     focusTab(want)
     tab = target
   }
-  if (!tab) return
+  if (!tab) {
+    // 之前这里静默 return：用户点了「插入终端」什么也没发生，看起来就是功能坏了。
+    toast('error', '还没有连接的主机 —— 先双击左侧主机建立会话，再插入命令')
+    return
+  }
   void api.termWrite(tab.sid, body)
   toast('info', `命令已填入 ${tab.label}，确认后按回车执行`)
 }
