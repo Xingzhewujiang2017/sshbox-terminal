@@ -25,7 +25,9 @@ fn default_temperature() -> f32 {
     0.2
 }
 fn default_max_tokens() -> u32 {
-    1024
+    // 4096 而不是 1024：推理模型的**思考过程也算在这份额度里**，1024 会被
+    // 思考吃光、正文一个字不剩（实测 deepseek-v4-flash-0731 就这样）。
+    4096
 }
 fn default_true() -> bool {
     true
@@ -117,7 +119,7 @@ pub fn presets() -> Vec<AiProfile> {
 /// - `finish_reason = length`：输出上限被吃光，重试必然同样截断。推理模型尤其常见 ——
 ///   思考过程把额度花完，正文一个字都没留下。要调「最大输出」或换模型，而不是重试。
 /// - 其它：提供方偶发空回复（HTTP 200 + 空正文），重试一次有意义。
-fn empty_reply_error(finish: &str, raw: &str, body: &str) -> String {
+fn empty_reply_error(finish: &str, raw: &str, body: &str, max_tokens: u32) -> String {
     if finish == "length" {
         let thought = raw.contains("reasoning_content") || raw.contains("\"thinking\"");
         let hint = if thought {
@@ -125,7 +127,11 @@ fn empty_reply_error(finish: &str, raw: &str, body: &str) -> String {
         } else {
             "输出被输出上限截断了，正文一个字都没留下"
         };
-        format!("{hint} —— 这不是网络或密钥问题：把「最大输出」调大，或换一个非推理模型。\n原始响应：{body}")
+        let suggested = (max_tokens * 4).clamp(4096, 32000);
+        format!(
+            "{hint} —— 这不是网络或密钥问题。当前「最大输出」是 {max_tokens} 个 token，\
+             建议改成 {suggested} 或更大（设置 → AI 模型 → 最大输出），或换一个非推理模型。\n原始响应：{body}"
+        )
     } else {
         format!(
             "模型返回了空内容（HTTP 200 但没有正文）—— 可能是限流或模型异常，可再试一次或换一个模型。\n原始响应：{body}"
@@ -639,7 +645,10 @@ pub async fn send_once(
         if finish == "length" {
             let body: String = text.chars().take(400).collect();
             log::warn!("[ai] 输出被截断且正文为空：{}", built.url);
-            return Err(anyhow!("{}", empty_reply_error(finish, &text, &body)));
+            return Err(anyhow!(
+                "{}",
+                empty_reply_error(finish, &text, &body, profile.max_tokens)
+            ));
         }
         // 其余空回复把**原始响应**带出来：只报"空内容"等于让用户去猜是限流、模型名、
         // 还是服务端形状变了。截断保存，最后一轮的响应进错误信息。
@@ -652,7 +661,10 @@ pub async fn send_once(
             );
         }
     }
-    Err(anyhow!("{}", empty_reply_error("", "", &last_body)))
+    Err(anyhow!(
+        "{}",
+        empty_reply_error("", "", &last_body, profile.max_tokens)
+    ))
 }
 
 /// 流式请求。每个增量通过 `on_delta` 交出去，返回完整文本。
@@ -1049,17 +1061,20 @@ mod tests {
     #[test]
     fn empty_reply_diagnosis_distinguishes_truncation_from_flakiness() {
         let raw = r#"{"choices":[{"finish_reason":"length","message":{"content":"","reasoning_content":"想了很久"}}]}"#;
-        let e = empty_reply_error("length", raw, raw);
+        let e = empty_reply_error("length", raw, raw, 1024);
         assert!(e.contains("思考过程写满了输出上限"), "{e}");
         assert!(e.contains("换一个非推理模型"), "{e}");
         assert!(!e.contains("可再试一次"), "截断重试没用，不能这么建议：{e}");
+        assert!(e.contains("1024"), "要说出当前值，用户才知道现在是多少：{e}");
+        assert!(e.contains("设置 → AI 模型"), "要指出在哪调，否则等于没说：{e}");
+        assert!(e.contains("4096"), "要给出建议值：{e}");
 
         // 普通模型输出上限太小（没有思考内容）
-        let e3 = empty_reply_error("length", "{}", "{}");
+        let e3 = empty_reply_error("length", "{}", "{}", 8192);
         assert!(e3.contains("输出被输出上限截断"), "{e3}");
 
         // 真·偶发空回复：保留重试建议，且必须带原始响应
-        let e2 = empty_reply_error("stop", "{}", "{}");
+        let e2 = empty_reply_error("stop", "{}", "{}", 4096);
         assert!(e2.contains("可再试一次"), "{e2}");
         assert!(e2.contains("原始响应"), "{e2}");
     }
@@ -1080,7 +1095,7 @@ mod tests {
         let j = r#"{"id":"x","name":"X","base_url":"https://a/v1","model":"m"}"#;
         let p: AiProfile = serde_json::from_str(j).unwrap();
         assert_eq!(p.protocol, "openai");
-        assert_eq!(p.max_tokens, 1024);
+        assert_eq!(p.max_tokens, 4096, "默认要给推理模型留够思考的额度");
         assert!(!p.has_key);
     }
 
