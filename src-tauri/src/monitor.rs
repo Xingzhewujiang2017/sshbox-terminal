@@ -216,6 +216,9 @@ GW=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
 [ -z "$GW" ] && GW=$(route -n 2>/dev/null | awk '$1=="0.0.0.0" {print $2; exit}')
 if [ -n "$GW" ] && command -v ping >/dev/null 2>&1; then
   # -c 3 -i 0.3 -W 1 ≈ 1 秒；外面再套 timeout，网关黑洞时也不会拖住 15 秒的慢采集。
+  # 目标必须**显式打出来**：下面 tail 只留 3 行统计，会把 ping 自己的
+  # "PING 192.168.1.1 (...)" 头部截掉，解析端就拿不到测的是谁。
+  echo "TARGET $GW"
   if command -v timeout >/dev/null 2>&1; then
     timeout 5 ping -c 3 -i 0.3 -W 1 "$GW" 2>&1 | tail -3
   else
@@ -609,6 +612,9 @@ fn parse_ping(sec: &HashMap<String, Vec<String>>) -> Option<PingInfo> {
         let t = l.trim();
         if t.is_empty() {
             continue;
+        }
+        if let Some(rest) = t.strip_prefix("TARGET ") {
+            info.target = rest.trim().to_string();
         }
         if t.starts_with("PING ") {
             if let Some(host) = t.split_whitespace().nth(1) {
@@ -1895,23 +1901,24 @@ mod tests {
     /// 只认一种的话，一类发行版上时延永远空白 —— 这种"功能静默失效"最难查。
     #[test]
     fn parse_ping_handles_iputils_and_busybox() {
+        // 真机（WSL Ubuntu → 网关 192.168.1.1）捕获的原样输出。手写夹具漏掉了
+        // `tail -3` 会把 ping 头部截掉这件事，结果发布验证才发现报告里没有链路质量。
         let mut sec = HashMap::new();
         sec.insert(
             "PING".to_string(),
             vec![
-                "PING 172.20.0.1 (172.20.0.1) 56(84) bytes of data.".to_string(),
-                "64 bytes from 172.20.0.1: icmp_seq=1 ttl=64 time=0.052 ms".to_string(),
-                "--- 172.20.0.1 ping statistics ---".to_string(),
-                "3 packets transmitted, 3 received, 0% packet loss, time 605ms".to_string(),
-                "rtt min/avg/max/mdev = 0.045/0.052/0.061/0.007 ms".to_string(),
+                "TARGET 192.168.1.1".to_string(),
+                "--- 192.168.1.1 ping statistics ---".to_string(),
+                "3 packets transmitted, 3 received, 0% packet loss, time 606ms".to_string(),
+                "rtt min/avg/max/mdev = 0.792/17.273/50.234/23.306 ms".to_string(),
             ],
         );
-        let p = parse_ping(&sec).expect("iputils 格式要能解析");
-        assert_eq!(p.target, "172.20.0.1");
+        let p = parse_ping(&sec).expect("真机（tail 后）格式要能解析");
+        assert_eq!(p.target, "192.168.1.1");
         assert_eq!((p.sent, p.recv), (3, 3));
         assert_eq!(p.loss_pct, 0.0);
-        assert!((p.rtt_avg - 0.052).abs() < 1e-9);
-        assert!((p.jitter - 0.007).abs() < 1e-9);
+        assert!((p.rtt_avg - 17.273).abs() < 1e-9);
+        assert!((p.jitter - 23.306).abs() < 1e-9);
 
         let mut b = HashMap::new();
         b.insert(
@@ -1927,6 +1934,21 @@ mod tests {
         assert_eq!((p2.sent, p2.recv), (3, 2));
         assert!((p2.rtt_max - 3.3).abs() < 1e-9);
         assert_eq!(p2.jitter, 0.0, "busybox 没有 mdev，留 0 而不是瞎猜");
+
+        // 直接喂 ping 的原始输出（未经 tail，头部有 "PING host (ip)"）也要认
+        let mut h = HashMap::new();
+        h.insert(
+            "PING".to_string(),
+            vec![
+                "PING 172.20.0.1 (172.20.0.1) 56(84) bytes of data.".to_string(),
+                "--- 172.20.0.1 ping statistics ---".to_string(),
+                "3 packets transmitted, 3 received, 0% packet loss, time 605ms".to_string(),
+                "rtt min/avg/max/mdev = 0.045/0.052/0.061/0.007 ms".to_string(),
+            ],
+        );
+        let p3 = parse_ping(&h).expect("iputils 原始输出要能解析");
+        assert_eq!(p3.target, "172.20.0.1");
+        assert!((p3.rtt_avg - 0.052).abs() < 1e-9);
 
         // 没网关 / 没装 ping / 目标不可达时整段跳过 → None，报告里那一节不显示
         assert!(parse_ping(&HashMap::new()).is_none());
