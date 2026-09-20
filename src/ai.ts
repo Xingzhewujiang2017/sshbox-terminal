@@ -21,6 +21,8 @@ export interface AiTurn {
   /** 这一轮出错（错误也留在对话里，方便回看） */
   error?: string
   kind?: AiKind
+  /** 这一轮是为哪个会话生成的 —— 命令要填回同一台主机，别贴错机器 */
+  sid?: string
   at: number
 }
 
@@ -138,8 +140,8 @@ export async function ask(
         ? `生成命令：${opts.prompt ?? ''}`
         : (opts.prompt ?? '')
 
-  ai.turns.push({ role: 'user', content: label, kind, at: Date.now() })
-  ai.turns.push({ role: 'assistant', content: '', streaming: true, kind, at: Date.now() })
+  ai.turns.push({ role: 'user', content: label, kind, sid: opts.sid, at: Date.now() })
+  ai.turns.push({ role: 'assistant', content: '', streaming: true, kind, sid: opts.sid, at: Date.now() })
   ai.streaming = true
 
   const history: ChatMessage[] = ai.turns

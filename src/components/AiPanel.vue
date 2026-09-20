@@ -13,12 +13,14 @@ import {
   aiReady,
   ask,
   cancelAi,
+  cleanCommand,
   clearTurns,
 } from '../ai'
 
 const props = defineProps<{ sid?: string | null }>()
 const emit = defineEmits<{
-  (e: 'insert', text: string): void
+  /** 把命令填进终端；sid = 这条命令是为哪个会话生成的（填回同一台主机） */
+  (e: 'insert', payload: { text: string; sid: string }): void
   (e: 'close'): void
 }>()
 
@@ -40,8 +42,16 @@ function send() {
 
 function insertPending() {
   if (!ai.pendingCommand) return
-  emit('insert', ai.pendingCommand)
+  emit('insert', { text: ai.pendingCommand, sid: ai.pendingSid })
   ai.pendingCommand = ''
+}
+
+/** 双击命令框里的命令 → 直接填进它对应的主机（不回车）。 */
+function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
+  if (t.streaming) return
+  const text = cleanCommand(t.content)
+  if (!text.trim()) return
+  emit('insert', { text, sid: t.sid ?? '' })
 }
 
 async function copyPending() {
@@ -106,12 +116,17 @@ function looksLikeCommand(line: string): boolean {
 
       <div v-for="(t, i) in ai.turns" :key="i" class="turn" :class="t.role">
         <div class="who">{{ t.role === 'user' ? '你' : (profile?.name ?? 'AI') }}</div>
-        <div v-if="t.role === 'assistant' && t.kind === 'command'" class="cmd-box">
+        <div
+          v-if="t.role === 'assistant' && t.kind === 'command'"
+          class="cmd-box"
+          :title="t.streaming ? '正在生成…' : '双击命令直接填入终端（不会自动执行）'"
+          @dblclick="insertTurn(t)"
+        >
           <code>{{ t.content || '…' }}</code>
           <div v-if="ai.pendingCommand && i === ai.turns.length - 1" class="cmd-actions">
             <button class="mini primary" @click="insertPending">插入终端</button>
             <button class="mini" @click="copyPending">复制</button>
-            <span class="mini-hint">不会自动执行，回车由你按</span>
+            <span class="mini-hint">双击命令也能直接填入；不会自动执行，回车由你按</span>
           </div>
         </div>
         <div v-else class="body">
@@ -228,7 +243,9 @@ function looksLikeCommand(line: string): boolean {
   border: 1px solid var(--ctp-surface1);
   border-radius: 6px;
   padding: 8px;
+  cursor: pointer;
 }
+.cmd-box:hover { border-color: var(--ctp-green); }
 .cmd-box code {
   display: block;
   font-family: ui-monospace, monospace;

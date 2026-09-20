@@ -254,12 +254,27 @@ function askCommandFromSelection() {
   void ask('command', { prompt: sel.trim() || '', sid: activeTab.value?.sid ?? undefined })
 }
 
-/** 把 AI 生成的命令填进终端 —— **不自动回车**，由用户确认。 */
-function insertToTerminal(text: string) {
-  const tab = activeTab.value
-  if (!tab || !text.trim()) return
-  void api.termWrite(tab.sid, text.trim())
-  toast('info', '命令已填入终端，确认后按回车执行')
+/** 把 AI 生成的命令填进终端 —— **不自动回车**，由用户确认。
+ *
+ * 命令是给某一台主机生成的（`sid`），所以优先填回那个会话并切到它的标签：
+ * 用户在别的标签上双击历史里的命令时，不该把 A 机的命令贴到 B 机。 */
+function insertToTerminal(p: { text: string; sid?: string }) {
+  const body = (p.text ?? '').trim()
+  if (!body) return
+  const want = (p.sid ?? '').trim()
+  let tab = activeTab.value
+  if (want && tab?.sid !== want) {
+    const target = tabs.value.find((t) => t.sid === want)
+    if (!target) {
+      toast('error', '生成这条命令的会话已关闭，没有填入终端')
+      return
+    }
+    focusTab(want)
+    tab = target
+  }
+  if (!tab) return
+  void api.termWrite(tab.sid, body)
+  toast('info', `命令已填入 ${tab.label}，确认后按回车执行`)
 }
 
 /** 一键巡检报告。 */
