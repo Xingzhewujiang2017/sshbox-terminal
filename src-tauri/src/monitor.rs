@@ -1210,6 +1210,8 @@ pub struct Snapshot {
     pub metrics: Metrics,
     pub services: ServiceInfo,
     pub hardware: HardwareInfo,
+    /// 进程表（报告里的「进程」小节用）。`parse_procs` 顺带按 CPU 降序排好。
+    pub processes: Vec<ProcInfo>,
 }
 
 /// 采一次完整快照，给报告用。
@@ -1225,6 +1227,15 @@ pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<
     let _ = parse_metrics(&raw1, &mut prev);
     tokio::time::sleep(Duration::from_millis(1200)).await;
     let raw2 = exec_capture(handle, COLLECT_SCRIPT).await?;
+    // 进程表要在 parse_metrics 之前解析：两者共用 prev 里的增量基线，
+    // 而进程用的是 prev.procs（pid → jiffies）。放在后面会拿 raw2 和自己比，CPU% 全 0。
+    let processes = {
+        let s2 = sections(&raw2);
+        let (hz2, page2) = parse_sys(&s2);
+        let (rows, _total) = parse_procs(s2.get("PROC"), &mut prev, 1.2, hz2, page2, 0);
+        rows
+    };
+
     let metrics = parse_metrics(&raw2, &mut prev)
         .ok_or_else(|| anyhow::anyhow!("指标解析失败（采集脚本输出异常）"))?;
 
@@ -1258,6 +1269,7 @@ pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<
         metrics,
         services,
         hardware,
+        processes,
     })
 }
 

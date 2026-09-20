@@ -14,7 +14,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::history;
-use crate::monitor::{self, HardwareInfo, Metrics, ServiceInfo};
+use crate::monitor::{self, HardwareInfo, Metrics, ProcInfo, ServiceInfo};
 use crate::ssh::{SessionManager, StaticInfo};
 
 // ---------------------------------------------------------------------------
@@ -100,6 +100,8 @@ pub struct ReportData {
     pub history: Option<HistorySummary>,
     /// 趋势图数据（1 小时 / 24 小时 / 7 天三档），HTML 报告内嵌后由前端重绘
     pub series: Vec<ChartSeries>,
+    /// 进程表（采集时已按 CPU 降序）。报告里只列 Top N。
+    pub processes: Vec<ProcInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +446,31 @@ pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
     }
     o.push('\n');
 
+    if !d.processes.is_empty() {
+        o.push_str("## 进程\n\n");
+        o.push_str(&format!(
+            "共 {} 个进程。下面按 CPU 和内存各取前 8（同一份采集数据，排序规则一致）。\n\n",
+            d.metrics.proc_total
+        ));
+        for (title, by_mem) in [("CPU 占用最高", false), ("内存占用最高", true)] {
+            o.push_str(&format!(
+                "**{}**\n\n| PID | 进程 | 状态 | CPU | 内存 |\n|---|---|---|---|---|\n",
+                title
+            ));
+            for p in top_procs(&d.processes, by_mem, 8) {
+                o.push_str(&format!(
+                    "| {} | {} | {} | {:.1}% | {} |\n",
+                    p.pid,
+                    p.name,
+                    p.state,
+                    p.cpu_pct,
+                    mb(p.rss_kb)
+                ));
+            }
+            o.push('\n');
+        }
+    }
+
     o.push_str("## 网络\n\n");
     o.push_str("| 项 | ↓ 接收 | ↑ 发送 |\n|---|---|---|\n");
     {
@@ -687,6 +714,31 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
         ));
     }
 
+    if !d.processes.is_empty() {
+        o.push_str("<h2>进程</h2>");
+        o.push_str(&format!(
+            "<div class=\"meta\">共 {} 个进程，下面按 CPU 和内存各取前 8</div>",
+            d.metrics.proc_total
+        ));
+        for (title, by_mem) in [("CPU 占用最高", false), ("内存占用最高", true)] {
+            o.push_str(&format!(
+                "<h3>{}</h3><table><tr><th>PID</th><th>进程</th><th>状态</th><th>CPU</th><th>内存</th></tr>",
+                title
+            ));
+            for p in top_procs(&d.processes, by_mem, 8) {
+                o.push_str(&format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td><td>{}</td></tr>",
+                    p.pid,
+                    esc(&p.name),
+                    esc(&p.state),
+                    p.cpu_pct,
+                    mb(p.rss_kb)
+                ));
+            }
+            o.push_str("</table>");
+        }
+    }
+
     // 网络：当前速率 + 窗口内均值/峰值（历史里存了 net_rx/net_tx）
     // 注意：速率要按网卡求和，不能取单个 m.net_rx —— 多网卡机器上会少算。
     let rx: f64 = m.net.iter().map(|n| n.rx_bps).sum();
@@ -861,6 +913,35 @@ function applyCustom() {
 })();
 </script>
 "##;
+
+/// 按某个指标取前 N 个进程。
+///
+/// 纯函数：报告里的「进程」小节和单测都走它，排序规则只有一处。
+/// 并列时按 pid 兜底，保证同一份数据渲染两次结果一致。
+fn top_procs<'a>(procs: &'a [ProcInfo], by_mem: bool, n: usize) -> Vec<&'a ProcInfo> {
+    let mut v: Vec<&ProcInfo> = procs.iter().collect();
+    v.sort_by(|a, b| {
+        let (x, y) = if by_mem {
+            (a.rss_kb as f64, b.rss_kb as f64)
+        } else {
+            (a.cpu_pct, b.cpu_pct)
+        };
+        y.partial_cmp(&x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.pid.cmp(&b.pid))
+    });
+    v.truncate(n);
+    v
+}
+
+fn mb(kb: u64) -> String {
+    if kb >= 1024 * 1024 {
+        format!("{:.1} GB", kb as f64 / 1024.0 / 1024.0)
+    } else {
+        format!("{:.1} MB", kb as f64 / 1024.0)
+    }
+}
+
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -1070,6 +1151,7 @@ pub async fn report_generate(
         hardware: snap.hardware,
         history: hist,
         series,
+        processes: snap.processes,
     };
 
     let mut ai_used = false;
@@ -1208,6 +1290,7 @@ mod tests {
             },
             history: None,
             series: vec![],
+            processes: vec![],
         }
     }
 
@@ -1342,6 +1425,35 @@ mod tests {
         assert!(md.contains("网卡合计"), "要说清是合计: {md}");
     }
 
+
+    /// 进程小节：按 CPU 与内存各取前 8，排序规则只有一处（top_procs）。
+    #[test]
+    fn process_section_lists_top_by_cpu_and_by_memory() {
+        let mut d = mk(10.0, 10.0, 0, 0);
+        d.metrics.proc_total = 3;
+        d.processes = vec![
+            ProcInfo { pid: 1, name: "cpu-hog".into(), state: "R".into(), cpu_pct: 88.0, rss_kb: 1024 },
+            ProcInfo { pid: 2, name: "mem-hog".into(), state: "S".into(), cpu_pct: 1.0, rss_kb: 3 * 1024 * 1024 },
+            ProcInfo { pid: 3, name: "idle".into(), state: "S".into(), cpu_pct: 0.0, rss_kb: 512 },
+        ];
+        let md = render_markdown(&d, None);
+        assert!(md.contains("## 进程"), "{md}");
+        assert!(md.contains("共 3 个进程"));
+        assert!(md.contains("cpu-hog") && md.contains("mem-hog"));
+        assert!(md.contains("3.0 GB"), "内存要按 GB 显示: {md}");
+        // 排序：CPU 榜第一位必须是 cpu-hog，内存榜第一位必须是 mem-hog
+        let cpu_part = md.split("CPU 占用最高").nth(1).unwrap_or("");
+        assert!(cpu_part.find("cpu-hog").unwrap_or(9999) < cpu_part.find("mem-hog").unwrap_or(9999));
+        let mem_part = md.split("内存占用最高").nth(1).unwrap_or("");
+        assert!(mem_part.find("mem-hog").unwrap_or(9999) < mem_part.find("cpu-hog").unwrap_or(9999));
+
+        let html = render_html(&d, None);
+        assert!(html.contains("<h2>进程</h2>"));
+        assert!(html.contains("cpu-hog"));
+        // 进程名为空也不能渲染出破表
+        assert!(top_procs(&d.processes, false, 2).len() == 2);
+        assert!(top_procs(&d.processes, true, 1)[0].pid == 2);
+    }
 
     #[test]
     fn html_is_self_contained_and_escapes_input() {
