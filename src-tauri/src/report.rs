@@ -34,6 +34,11 @@ pub struct HistorySummary {
     pub load_max: f64,
     pub net_rx_avg: f64,
     pub net_tx_avg: f64,
+    pub net_rx_max: f64,
+    pub net_tx_max: f64,
+    pub disk_r_max: f64,
+    pub disk_w_max: f64,
+    pub proc_max: i64,
 }
 
 impl HistorySummary {
@@ -61,8 +66,27 @@ impl HistorySummary {
             load_max: max(|b| b.load1),
             net_rx_avg: sum(|b| b.net_rx) / n,
             net_tx_avg: sum(|b| b.net_tx) / n,
+            net_rx_max: max(|b| b.net_rx),
+            net_tx_max: max(|b| b.net_tx),
+            disk_r_max: max(|b| b.disk_r),
+            disk_w_max: max(|b| b.disk_w),
+            proc_max: 0,
         })
     }
+}
+
+/// HTML 报告里的趋势图数据。
+///
+/// 三档分辨率各带自己的窗口和桶数，前端按用户选的时间范围切换 —— 这样"改时间范围"
+/// 是纯前端重绘，不用重新生成报告，也不用在 HTML 里塞几万个点。
+/// `points` 用数组而不是对象：同样 500 个点，JSON 体积能小一半。
+#[derive(Debug, Clone, Serialize)]
+pub struct ChartSeries {
+    pub label: String,
+    pub hours: u64,
+    pub bucket_secs: f64,
+    /// 每个点：[ts, cpu%, mem%, net_rx, net_tx, disk_r, disk_w, load1]
+    pub points: Vec<[f64; 8]>,
 }
 
 pub struct ReportData {
@@ -74,6 +98,8 @@ pub struct ReportData {
     pub services: ServiceInfo,
     pub hardware: HardwareInfo,
     pub history: Option<HistorySummary>,
+    /// 趋势图数据（1 小时 / 24 小时 / 7 天三档），HTML 报告内嵌后由前端重绘
+    pub series: Vec<ChartSeries>,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +444,34 @@ pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
     }
     o.push('\n');
 
+    o.push_str("## 网络\n\n");
+    o.push_str("| 项 | ↓ 接收 | ↑ 发送 |\n|---|---|---|\n");
+    {
+        let rx: f64 = m.net.iter().map(|n| n.rx_bps).sum();
+        let tx: f64 = m.net.iter().map(|n| n.tx_bps).sum();
+        o.push_str(&format!(
+            "| 当前（{} 个网卡合计） | {} | {} |\n",
+            m.net.len(),
+            fmt_rate(rx),
+            fmt_rate(tx)
+        ));
+        if let Some(h) = &d.history {
+            o.push_str(&format!(
+                "| {} 小时平均 | {} | {} |\n",
+                h.hours,
+                fmt_rate(h.net_rx_avg * 1024.0),
+                fmt_rate(h.net_tx_avg * 1024.0)
+            ));
+            o.push_str(&format!(
+                "| {} 小时峰值 | {} | {} |\n",
+                h.hours,
+                fmt_rate(h.net_rx_max * 1024.0),
+                fmt_rate(h.net_tx_max * 1024.0)
+            ));
+        }
+    }
+    o.push('\n');
+
     o.push_str("## 磁盘\n\n");
     o.push_str("| 挂载点 | 已用 | 总量 | 使用率 |\n|---|---|---|---|\n");
     for disk in &m.disks {
@@ -633,6 +687,33 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
         ));
     }
 
+    // 网络：当前速率 + 窗口内均值/峰值（历史里存了 net_rx/net_tx）
+    // 注意：速率要按网卡求和，不能取单个 m.net_rx —— 多网卡机器上会少算。
+    let rx: f64 = m.net.iter().map(|n| n.rx_bps).sum();
+    let tx: f64 = m.net.iter().map(|n| n.tx_bps).sum();
+    o.push_str("<h2>网络</h2><table><tr><th>项</th><th>↓ 接收</th><th>↑ 发送</th></tr>");
+    o.push_str(&format!(
+        "<tr><td>当前速率（{} 个网卡合计）</td><td>{}</td><td>{}</td></tr>",
+        m.net.len(),
+        fmt_rate(rx),
+        fmt_rate(tx)
+    ));
+    if let Some(h) = &d.history {
+        o.push_str(&format!(
+            "<tr><td>{} 小时平均</td><td>{}</td><td>{}</td></tr>",
+            h.hours,
+            fmt_rate(h.net_rx_avg * 1024.0),
+            fmt_rate(h.net_tx_avg * 1024.0)
+        ));
+        o.push_str(&format!(
+            "<tr><td>{} 小时峰值</td><td>{}</td><td>{}</td></tr>",
+            h.hours,
+            fmt_rate(h.net_rx_max * 1024.0),
+            fmt_rate(h.net_tx_max * 1024.0)
+        ));
+    }
+    o.push_str("</table>");
+
     if let Some(h) = &d.history {
         o.push_str(&format!("<h2>最近 {} 小时趋势</h2>", h.hours));
         o.push_str(&format!(
@@ -655,9 +736,131 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
         o.push_str("</table>");
     }
 
+    // 趋势图：数据内嵌 + 时间范围在浏览器里切换（自包含 SVG，不依赖网络）
+    if !d.series.is_empty() {
+        o.push_str("<h2>趋势图</h2>");
+        o.push_str(
+            "<div class=\"meta\">默认最近 24 小时。切换范围或选自定义起止时间都不重新生成报告 —— 数据已内嵌在文件里。</div>",
+        );
+        o.push_str("<div class=\"ranges\">");
+        for (i, s) in d.series.iter().enumerate() {
+            let on = if s.hours == 24 { " on" } else { "" };
+            o.push_str(&format!(
+                "<button class=\"rg{}\" data-i=\"{}\">{}</button>",
+                on, i, s.label
+            ));
+        }
+        o.push_str("<button class=\"rg\" id=\"rg-custom\">自定义…</button>");
+        o.push_str(
+            "<span id=\"custom-box\" style=\"display:none\"> <input type=\"datetime-local\" id=\"t-from\"> 至 <input type=\"datetime-local\" id=\"t-to\"> <button class=\"rg\" id=\"t-apply\">应用</button></span>",
+        );
+        o.push_str("</div><div id=\"charts\"></div>");
+        o.push_str(&format!(
+            "<script>const SERIES={};</script>",
+            serde_json::to_string(&d.series).unwrap_or_else(|_| "[]".into())
+        ));
+        o.push_str(CHART_JS);
+    }
+
     o.push_str("<hr><div class=\"meta\">由 SSHBox 生成 · 数值来自对目标机的实时采集</div></body></html>");
     o
 }
+
+/// 报告里的趋势图脚本。
+///
+/// **自包含**：不引 CDN、不内联 ECharts（那会让文件从几十 KB 涨到近 1 MB），
+/// 用 SVG 手绘折线。数据已经内嵌，所以切换时间范围是纯前端重绘，
+/// 不用重新生成报告，也不依赖网络 —— 报告当附件发出去照样能看。
+const CHART_JS: &str = r##"
+<style>
+.ranges { margin: 6px 0 10px; }
+.rg { background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px;
+      font-size: 12px; padding: 3px 10px; margin-right: 6px; cursor: pointer; }
+.rg.on { background: #89b4fa; color: #1e1e2e; border-color: #89b4fa; font-weight: 600; }
+.chart { margin: 0 0 10px; }
+.chart svg { display: block; }
+#custom-box { font-size: 12px; color: #a6adc8; }
+#custom-box input { background: #313244; color: #cdd6f4; border: 1px solid #45475a;
+                    border-radius: 4px; font-size: 12px; padding: 2px 4px; }
+</style>
+<script>
+const METRICS = [
+  { name: 'CPU 使用率', idx: 1, color: '#89b4fa', pct: true },
+  { name: '内存使用率', idx: 2, color: '#a6e3a1', pct: true },
+  { name: '网络（实线 接收 / 虚线 发送）', idx: 3, idx2: 4, color: '#f9e2af', color2: '#fab387' },
+  { name: '磁盘 IO（实线 读 / 虚线 写）', idx: 5, idx2: 6, color: '#cba6f7', color2: '#f38ba8' },
+  { name: '负载（1 分钟）', idx: 7, color: '#94e2d5' },
+];
+function kb(v) { return v >= 1024 ? (v / 1024).toFixed(2) + ' MB/s' : (v || 0).toFixed(1) + ' KB/s'; }
+function val(v, pct) { return pct ? (v || 0).toFixed(1) + '%' : kb(v); }
+function hhmm(ts) {
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
+  return p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function draw(points) {
+  const box = document.getElementById('charts');
+  box.innerHTML = '';
+  if (!points.length) { box.textContent = '这段时间没有数据'; return; }
+  for (const m of METRICS) {
+    const a = points.map(p => p[m.idx]);
+    const b = m.idx2 ? points.map(p => p[m.idx2]) : null;
+    let max = Math.max.apply(null, a.concat(b || [0]));
+    if (!isFinite(max) || max <= 0) max = 1;
+    max *= 1.15;
+    const W = 760, H = 130, L = 34, R = 12;
+    const x = i => L + (W - L - R) * (i / Math.max(1, points.length - 1));
+    const y = v => H - 20 - (H - 40) * (Math.max(0, v) / max);
+    const path = arr => arr.map((v, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(v).toFixed(1)).join(' ');
+    let s = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H + '">';
+    s += '<line x1="' + L + '" y1="' + (H - 20) + '" x2="' + (W - R) + '" y2="' + (H - 20) + '" stroke="#45475a"/>';
+    s += '<text x="4" y="12" fill="#a6adc8" font-size="10">' + m.name + '</text>';
+    s += '<text x="' + (W - R) + '" y="12" fill="#6c7086" font-size="10" text-anchor="end">峰值 ' + val(max, m.pct) + '</text>';
+    s += '<path d="' + path(a) + '" fill="none" stroke="' + m.color + '" stroke-width="1.4"/>';
+    if (b) s += '<path d="' + path(b) + '" fill="none" stroke="' + m.color2 + '" stroke-width="1.4" stroke-dasharray="4 3"/>';
+    s += '<text x="' + L + '" y="' + (H - 6) + '" fill="#6c7086" font-size="9">' + hhmm(points[0][0]) + '</text>';
+    s += '<text x="' + (W - R) + '" y="' + (H - 6) + '" fill="#6c7086" font-size="9" text-anchor="end">' + hhmm(points[points.length - 1][0]) + '</text>';
+    s += '</svg>';
+    box.insertAdjacentHTML('beforeend', '<div class="chart">' + s + '</div>');
+  }
+}
+function pick(i) {
+  const s = SERIES[i];
+  if (!s) return;
+  document.querySelectorAll('.rg[data-i]').forEach(b => b.classList.toggle('on', Number(b.dataset.i) === i));
+  draw(s.points);
+}
+function applyCustom() {
+  const from = document.getElementById('t-from').value, to = document.getElementById('t-to').value;
+  if (!from || !to) return;
+  const f = new Date(from).getTime() / 1000, t = new Date(to).getTime() / 1000;
+  // 用能覆盖这段范围、且分辨率最高的那一档（自定义范围不重新生成报告，只用已有数据）
+  let best = null;
+  for (const s of SERIES) {
+    const a = s.points[0][0], z = s.points[s.points.length - 1][0];
+    if (a <= f && z >= t) { if (!best || s.bucket_secs < best.bucket_secs) best = s; }
+  }
+  if (!best) { document.getElementById('charts').textContent = '所选范围超出了报告内嵌的数据范围（最多 7 天）'; return; }
+  document.querySelectorAll('.rg[data-i]').forEach(b => b.classList.remove('on'));
+  draw(best.points.filter(p => p[0] >= f && p[0] <= t));
+}
+(function () {
+  const def = SERIES.findIndex(s => s.hours === 24);
+  if (def >= 0) pick(def); else if (SERIES.length) pick(0);
+  document.querySelectorAll('.rg[data-i]').forEach(b => b.addEventListener('click', () => pick(Number(b.dataset.i))));
+  document.getElementById('rg-custom').addEventListener('click', () => {
+    const box = document.getElementById('custom-box');
+    box.style.display = box.style.display === 'none' ? 'inline' : 'none';
+    const s = SERIES[SERIES.length - 1];
+    if (s) {
+      const f = v => { const d = new Date(v * 1000); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+      document.getElementById('t-from').value = f(s.points[0][0]);
+      document.getElementById('t-to').value = f(s.points[s.points.length - 1][0]);
+    }
+  });
+  document.getElementById('t-apply').addEventListener('click', applyCustom);
+})();
+</script>
+"##;
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -700,6 +903,45 @@ fn safe_name(s: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// 给 HTML 报告准备三档趋势数据。
+///
+/// 每档都是"自己的窗口 + 合适的桶数"：1 小时用 1 分钟桶、24 小时用 5 分钟桶、
+/// 7 天用 1 小时桶。这样前端切换时间范围时看到的曲线疏密一致，而内嵌的数据量
+/// 始终在几百点级别（2 秒一条原始数据的话 24 小时就是 4 万多点，直接内嵌会爆）。
+async fn chart_series(host_id: &str, now: chrono::DateTime<chrono::Local>) -> Vec<ChartSeries> {
+    let mut out = Vec::new();
+    for (label, hours, buckets) in [
+        ("1 小时", 1u64, 60usize),
+        ("24 小时", 24, 288),
+        ("7 天", 168, 168),
+    ] {
+        let from = (now.timestamp() - (hours as i64) * 3600) as f64;
+        let to = now.timestamp() as f64;
+        let Ok(r) = history::history_range(host_id.to_string(), from, to, Some(buckets)).await
+        else {
+            continue;
+        };
+        if r.buckets.is_empty() {
+            continue;
+        }
+        out.push(ChartSeries {
+            label: label.to_string(),
+            hours,
+            bucket_secs: r.bucket_secs,
+            points: r
+                .buckets
+                .iter()
+                .map(|b| {
+                    [
+                        b.ts, b.cpu_pct, b.mem_pct, b.net_rx, b.net_tx, b.disk_r, b.disk_w, b.load1,
+                    ]
+                })
+                .collect(),
+        });
+    }
+    out
 }
 
 /// 让 AI 写一段结论。失败**不影响报告**：返回 Err 由调用方记进 ai_error。
@@ -797,6 +1039,9 @@ pub async fn report_generate(
     let host_id = history::host_key(&sid);
     let from = (now.timestamp() - (hours as i64) * 3600) as f64;
     let to = now.timestamp() as f64;
+    // 三档分辨率：HTML 里的时间切换直接在这些数据上重绘
+    let series = chart_series(&host_id, now).await;
+
     let hist = history::history_range(host_id, from, to, Some(600))
         .await
         .ok()
@@ -824,6 +1069,7 @@ pub async fn report_generate(
         services: snap.services,
         hardware: snap.hardware,
         history: hist,
+        series,
     };
 
     let mut ai_used = false;
@@ -961,6 +1207,7 @@ mod tests {
                 gpus: vec![],
             },
             history: None,
+            series: vec![],
         }
     }
 
@@ -1057,6 +1304,44 @@ mod tests {
         assert!(md.contains("41"), "进程数要出现");
         assert!(md.contains("2 小时"), "运行时长要可读: {md}");
     }
+
+    /// 报告的趋势图必须**自包含**：数据内嵌、脚本内嵌、不引任何 CDN。
+    /// 报告是要能当附件发出去、断网也能看的 —— 引 CDN 就等于白屏。
+    #[test]
+    fn html_embeds_chart_series_and_stays_self_contained() {
+        let mut d = mk(40.0, 30.0, 0, 1);
+        d.series = vec![ChartSeries {
+            label: "24 小时".into(),
+            hours: 24,
+            bucket_secs: 300.0,
+            points: vec![
+                [1000.0, 12.5, 30.0, 1.0, 2.0, 0.0, 0.0, 0.5],
+                [1300.0, 20.0, 31.0, 2.0, 3.0, 0.0, 0.0, 0.6],
+            ],
+        }];
+        let html = render_html(&d, None);
+        assert!(html.contains("const SERIES="), "趋势数据要内嵌");
+        assert!(html.contains("12.5"), "数据点要真的在文件里");
+        assert!(html.contains("id=\"charts\""), "要有图表容器");
+        assert!(html.contains("function draw"), "画图脚本要在");
+        assert!(html.contains("data-i=\"0\""), "要有时间范围按钮");
+        assert!(html.contains("自定义"), "要能自定义时间");
+        assert!(!html.contains("cdn.") && !html.contains("https://"), "不能引外部资源");
+        // 没有历史数据时不该出现空的图表区
+        let mut d2 = mk(10.0, 10.0, 0, 0);
+        d2.series = vec![];
+        assert!(!render_html(&d2, None).contains("id=\"charts\""));
+    }
+
+    /// 网络速率要按网卡求和（多网卡机器取单个字段会少算）。
+    #[test]
+    fn network_section_sums_interfaces() {
+        let d = mk(10.0, 10.0, 0, 1);
+        let md = render_markdown(&d, None);
+        assert!(md.contains("## 网络"), "{md}");
+        assert!(md.contains("网卡合计"), "要说清是合计: {md}");
+    }
+
 
     #[test]
     fn html_is_self_contained_and_escapes_input() {
