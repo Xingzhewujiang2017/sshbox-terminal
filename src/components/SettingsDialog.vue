@@ -437,9 +437,9 @@ input:focus { outline: 1px solid var(--ctp-blue); }
 }
 .custom-int.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .custom-int input {
-  width: 44px;
-  min-width: 0;
-  flex: 0 1 auto;
+  flex: 1 1 auto; /* 吃满自定义格剩余空间，多位数也完整可见 */
+  width: auto;
+  min-width: 8px;
   background: transparent;
   color: inherit;
   border: none;
@@ -450,8 +450,9 @@ input:focus { outline: 1px solid var(--ctp-blue); }
 }
 .custom-int span { white-space: nowrap; }
 .seg button {
-  flex: 1 1 0; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
-  border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px; height: 32px;
+  flex: 0 0 auto; /* 预设按钮按内容宽（1s/2s/5s/10s 很窄），把空间让给自定义格 */
+  background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
+  border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; height: 32px;
   display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
   min-width: 0; white-space: nowrap;
 }
