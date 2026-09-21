@@ -50,6 +50,7 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'enter'): void
   (e: 'command', p: { sid: string; text: string; execute?: boolean }): void
+  (e: 'connect', hostId: string): void
 }>()
 
 const props = defineProps<{ tabs: LabTab[]; hosts: HostsLike }>()
@@ -79,6 +80,79 @@ const shownTabs = computed(() =>
     const g = groupOfHost(t.hostId) ?? ''
     return groupSel.value === '__none' ? g === '' : g === groupSel.value
   })
+)
+
+// --- 离线主机：勾选/双击即建立会话，连接成功后自动进入已选 --------------------
+interface LabRow {
+  key: string
+  sid?: string
+  hostId?: string | null
+  label: string
+  ip: string
+  status: string
+}
+const offlineRows = computed<LabRow[]>(() => {
+  const connIds = new Set<string>()
+  connectedTabs.value.forEach((t) => {
+    if (t.hostId) connIds.add(t.hostId)
+  })
+  return props.hosts.hosts
+    .filter((h) => !connIds.has(h.id))
+    .map((h) => ({
+      key: `h-${h.id}`,
+      hostId: h.id,
+      label: h.name || h.host || h.id,
+      ip: h.host ?? '',
+      status: 'offline',
+    }))
+    .filter((r) => {
+      if (groupSel.value === '') return true
+      const g = props.hosts.hosts.find((x) => x.id === r.hostId)?.group || ''
+      return groupSel.value === '__none' ? g === '' : g === groupSel.value
+    })
+})
+const allRows = computed<LabRow[]>(() => {
+  const conn = shownTabs.value.map((t) => ({
+    key: `s-${t.sid}`,
+    sid: t.sid,
+    hostId: t.hostId,
+    label: t.label,
+    ip: hostIp(t),
+    status: 'connected',
+  }))
+  return [...conn, ...offlineRows.value]
+})
+/** 等待连接的离线主机（hostId）。 */
+const pendingConnect = ref<Set<string>>(new Set())
+function connectOffline(r: LabRow) {
+  if (!r.hostId) return
+  emit('connect', r.hostId)
+  pendingConnect.value = new Set([...pendingConnect.value, r.hostId])
+}
+function toggleRow(r: LabRow) {
+  if (r.status === 'connected') toggle(r.sid!)
+  else connectOffline(r)
+}
+// 连接成功 → 自动勾选该主机（趋势图随之出现）
+watch(
+  () => connectedTabs.value.map((t) => t.sid).join(','),
+  () => {
+    if (!pendingConnect.value.size) return
+    const s = new Set(selected.value)
+    const pend = new Set(pendingConnect.value)
+    let changed = false
+    for (const t of connectedTabs.value) {
+      if (t.hostId && pend.has(t.hostId)) {
+        s.add(t.sid)
+        pend.delete(t.hostId)
+        changed = true
+      }
+    }
+    if (changed) {
+      selected.value = s
+      pendingConnect.value = pend
+    }
+  }
 )
 
 // --- 目标勾选 ---------------------------------------------------------------
@@ -158,6 +232,13 @@ function axisStyle(p: ReturnType<typeof chartPalette>) {
 }
 const chartEls = ref<Record<string, { cpu?: HTMLDivElement; ping?: HTMLDivElement }>>({})
 const charts = ref<Record<string, { cpu?: echarts.ECharts; ping?: echarts.ECharts }>>({})
+/** 跟踪 chart 容器尺寸：透明布局后才 init 的 0×0 画布靠它救回来。 */
+const resizeObs: ResizeObserver[] = []
+function attachResize(el: HTMLDivElement, c: echarts.ECharts) {
+  const ro = new ResizeObserver(() => c.resize())
+  ro.observe(el)
+  resizeObs.push(ro)
+}
 
 function initCpu(el: HTMLDivElement): echarts.ECharts {
   const p = chartPalette()
@@ -214,8 +295,21 @@ function ensureCharts(tabs: LabTab[]) {
   for (const t of tabs) {
     if (!charts.value[t.sid]) charts.value[t.sid] = {}
     const el = chartEls.value[t.sid]
-    if (el?.cpu && !charts.value[t.sid].cpu) charts.value[t.sid].cpu = initCpu(el.cpu)
-    if (el?.ping && !charts.value[t.sid].ping) charts.value[t.sid].ping = initPing(el.ping)
+    // v-for ref 回调在元素刚挂载时触发，此时很可能还没布局（容器 0×0），
+    // echarts.init 会得到 0×0 画布 —— 所以 init 必须推到 nextTick 之后，
+    // 并再用 ResizeObserver 保尺寸（容器真正落地后自动 resize 重绘）。
+    if (el?.cpu && !charts.value[t.sid].cpu) {
+      const c = initCpu(el.cpu)
+      charts.value[t.sid].cpu = c
+      attachResize(el.cpu, c)
+      void nextTick(() => c.resize())
+    }
+    if (el?.ping && !charts.value[t.sid].ping) {
+      const c = initPing(el.ping)
+      charts.value[t.sid].ping = c
+      attachResize(el.ping, c)
+      void nextTick(() => c.resize())
+    }
   }
 }
 
@@ -437,12 +531,18 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   if (pollTimer) clearInterval(pollTimer)
+  resizeObs.forEach((ro) => ro.disconnect())
+  resizeObs.length = 0
+  Object.values(charts.value).forEach((c) => {
+    c.cpu?.dispose()
+    c.ping?.dispose()
+  })
 })
 </script>
 
 <template>
-  <div class="mask" @click.self="emit('close')">
-    <div class="lab panel">
+  <div class="lab-page">
+    <div class="lab">
       <div class="head">
         <span class="title">故障演练台</span>
         <select v-model="groupSel" class="sel" @change="onGroupChange" title="分组">
@@ -456,42 +556,37 @@ onBeforeUnmount(() => {
         <button class="btn ghost" @click="emit('close')">关闭</button>
       </div>
 
-      <!-- 主机列表：名称 + IP，双击展开/收起该主机终端 -->
+      <!-- 主机列表：在线会话 + 离线主机（勾选/双击即连接），双击名称展开该主机终端 -->
       <div class="host-list">
-        <div v-for="t in shownTabs" :key="t.sid" class="h-row" :class="{ on: selected.has(t.sid) }">
-          <label class="check"><input type="checkbox" :checked="selected.has(t.sid)" @change="toggle(t.sid)" /></label>
-          <span class="h-name" :title="t.sid" @dblclick="toggleTerm(t.sid)">{{ t.label }}</span>
-          <span class="h-ip dim">{{ hostIp(t) || '临时连接' }}</span>
-          <span class="h-stat" :class="{ conn: t.status === 'connected' }">{{ t.status === 'connected' ? '● 在线' : '—' }}</span>
-          <button class="btn ghost mini" @click="toggleTerm(t.sid)" :title="openTerm.has(t.sid) ? '收起终端' : '展开该主机终端（双击名称也行）'">
-            {{ openTerm.has(t.sid) ? '收起终端' : '终端 ▸' }}
+        <div v-for="r in allRows" :key="r.key" class="h-row" :class="{ on: r.status === 'connected' ? selected.has(r.sid!) : pendingConnect.has(r.hostId!) }">
+          <label class="check" :title="r.status === 'offline' ? '勾选=连接该主机' : ''">
+            <input
+              type="checkbox"
+              :checked="r.status === 'connected' ? selected.has(r.sid!) : pendingConnect.has(r.hostId!)"
+              @change="toggleRow(r)"
+            />
+          </label>
+          <span class="h-name" :title="r.sid ?? r.hostId ?? ''" @dblclick="r.status === 'connected' ? toggleTerm(r.sid!) : connectOffline(r)">{{ r.label }}</span>
+          <span class="h-ip dim">{{ r.ip || '临时连接' }}</span>
+          <span class="h-stat" :class="{ conn: r.status === 'connected' }">{{ r.status === 'connected' ? '● 在线' : '离线' }}</span>
+          <button v-if="r.status === 'connected'" class="btn ghost mini" @click="toggleTerm(r.sid!)" :title="openTerm.has(r.sid!) ? '收起终端' : '展开该主机终端（双击名称也行）'">
+            {{ openTerm.has(r.sid!) ? '收起终端' : '终端 ▸' }}
+          </button>
+          <button v-else class="btn ghost mini" :disabled="pendingConnect.has(r.hostId!)" @click="connectOffline(r)">
+            {{ pendingConnect.has(r.hostId!) ? '连接中…' : '连接' }}
           </button>
         </div>
-        <div v-if="!shownTabs.length" class="dim empty">该分组下没有已连接的主机 —— 先双击左侧主机建立会话</div>
+        <div v-if="!allRows.length" class="dim empty">该分组下没有主机 —— 先在左侧添加主机</div>
         <div v-if="openTerm.size" class="term-zone">
-          <TerminalPane v-for="sid in [...openTerm]" :key="sid" :sid="sid" :active="true" />
+          <TerminalPane
+            v-for="sid in [...openTerm]"
+            :key="sid"
+            :sid="sid"
+            :active="true"
+            @data="(d) => api.termWrite(sid, d)"
+          />
         </div>
       </div>
-
-      <!-- 底部趋势图：每台两块 ECharts -->
-      <template v-if="selTabs.length">
-        <div class="sec-title">
-          实时趋势 <span class="dim">· 3s 采样 | 注入在图中画黄虚线标记</span>
-          <span class="seg">
-            <button :class="{ on: windowMode === '3m' }" @click="windowMode = '3m'">近3分</button>
-            <button :class="{ on: windowMode === '15m' }" @click="windowMode = '15m'">近15分</button>
-            <button :class="{ on: windowMode === 'all' }" @click="windowMode = 'all'">本次</button>
-          </span>
-        </div>
-        <div class="charts">
-          <div v-for="t in selTabs" :key="t.sid" class="chart-card">
-            <div class="chart-title">{{ t.label }} <span class="dim">{{ hostIp(t) }}</span></div>
-            <div class="chart-box" :ref="(el) => setChartRef(t.sid, 'cpu', el as HTMLDivElement | null)"></div>
-            <div class="chart-box" :ref="(el) => setChartRef(t.sid, 'ping', el as HTMLDivElement | null)"></div>
-          </div>
-        </div>
-      </template>
-      <div v-else class="dim empty">勾选主机后，这里显示每台的 CPU/内存 与 时延/丢包 趋势图</div>
 
       <!-- 故障注入 -->
       <div class="section">
@@ -530,6 +625,26 @@ onBeforeUnmount(() => {
           <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
         </div>
       </div>
+
+      <!-- 底部趋势图：每台两块 ECharts -->
+      <template v-if="selTabs.length">
+        <div class="sec-title">
+          主机趋势图 <span class="dim">· 3s 采样 | 注入在图中画黄虚线标记</span>
+          <span class="seg">
+            <button :class="{ on: windowMode === '3m' }" @click="windowMode = '3m'">近3分</button>
+            <button :class="{ on: windowMode === '15m' }" @click="windowMode = '15m'">近15分</button>
+            <button :class="{ on: windowMode === 'all' }" @click="windowMode = 'all'">本次</button>
+          </span>
+        </div>
+        <div class="charts">
+          <div v-for="t in selTabs" :key="t.sid" class="chart-card">
+            <div class="chart-title">{{ t.label }} <span class="dim">{{ hostIp(t) }}</span></div>
+            <div class="chart-box" :ref="(el) => setChartRef(t.sid, 'cpu', el as HTMLDivElement | null)"></div>
+            <div class="chart-box" :ref="(el) => setChartRef(t.sid, 'ping', el as HTMLDivElement | null)"></div>
+          </div>
+        </div>
+      </template>
+      <div v-else class="dim empty">勾选主机后，这里显示每台的 CPU/内存 与 时延/丢包 趋势图</div>
 
       <!-- 命令/脚本就地执行 -->
       <div class="section">
@@ -571,7 +686,8 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.lab { width: min(1240px, 95vw); max-height: 94vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.lab-page { position: fixed; inset: 0; z-index: 40; background: var(--ctp-base); display: flex; }
+.lab { width: 100%; height: 100%; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 12px 16px; box-sizing: border-box; }
 .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .head .spacer { flex: 1; }
 .title { font-weight: 700; font-size: 15px; }

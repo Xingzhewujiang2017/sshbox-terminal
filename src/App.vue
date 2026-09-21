@@ -1027,7 +1027,7 @@ function statusDot(t: Tab) {
         <button @click="banner = null">×</button>
       </div>
 
-      <div class="content">
+      <div v-if="!labOpen" class="content">
         <div class="term-area">
           <QuickCommands
             v-if="activeTab"
@@ -1084,7 +1084,18 @@ function statusDot(t: Tab) {
       </div>
     </main>
 
-    <div v-if="reportResult" class="report-card">
+        <LabPanel
+              v-if="labOpen"
+              class="lab-page"
+              :tabs="tabs"
+              :hosts="hosts"
+              @close="labOpen = false"
+              @enter="monitorVisible = false"
+              @command="insertToTerminal"
+              @connect="connectFromOverview"
+            />
+
+        <div v-if="reportResult" class="report-card">
       <div class="rc-title">
         巡检报告已生成
         <span class="rc-sub">{{ reportResult.findings }} 项结论<template v-if="reportResult.critical">，{{ reportResult.critical }} 项严重</template></span>
@@ -1125,42 +1136,33 @@ function statusDot(t: Tab) {
     </div>
 
     <SftpPanel
-      v-if="sftpOpen && activeTab"
+      v-if="!labOpen && sftpOpen && activeTab"
       :sid="activeTab.sid"
       :label="`${activeTab.label} · ${activeTab.host ? activeTab.host.username + '@' + activeTab.host.host : ''}`"
       @close="sftpOpen = false"
     />
 
     <ForwardPanel
-      v-if="forwardOpen && activeTab"
+      v-if="!labOpen && forwardOpen && activeTab"
       :sid="activeTab.sid"
       :label="`${activeTab.label} · ${activeTab.host ? activeTab.host.username + '@' + activeTab.host.host : ''}`"
       @close="forwardOpen = false"
     />
 
     <OverviewPanel
-          v-if="overviewOpen"
+          v-if="!labOpen && overviewOpen"
           :tabs="tabs"
           :hosts="hosts"
           :interval="settings?.sample_interval_secs ?? 2"
           :active-sid="activeTab?.sid"
           @close="overviewOpen = false"
-          @focus="focusTab"
-          @connect="connectFromOverview"
-          @command="insertToTerminal"
-        />
-
-        <LabPanel
-              v-if="labOpen"
-              :tabs="tabs"
-              :hosts="hosts"
-              @close="labOpen = false"
-              @enter="monitorVisible = false"
-              @command="insertToTerminal"
-            />
+                    @focus="focusTab"
+                    @connect="connectFromOverview"
+                    @command="insertToTerminal"
+                  />
 
     <HistoryPanel
-      v-if="historyOpen"
+      v-if="!labOpen && historyOpen"
       :hosts="hosts"
       :initial-host-id="activeTab?.hostId"
       @close="historyOpen = false"
@@ -1194,7 +1196,7 @@ function statusDot(t: Tab) {
     />
 
     <SettingsDialog
-      v-if="settingsOpen && settings"
+      v-if="!labOpen && settingsOpen && settings"
       ref="settingsRef"
       :settings="settings"
       :paths="paths"
