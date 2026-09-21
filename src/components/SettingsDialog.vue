@@ -408,13 +408,24 @@ input:not([type='checkbox']) {
   color: var(--ctp-text); padding: 7px 9px; font-size: 12.5px; width: 100%; box-sizing: border-box;
 }
 input:focus { outline: 1px solid var(--ctp-blue); }
-.seg { display: flex; gap: 6px; }
+.seg {
+  display: flex;
+  gap: 6px;
+  /* 统一规划整行宽度：4 预设 + 自定义 等宽平分，塞进面板不让它被挤到换行 */
+  width: 100%;
+  min-width: 260px;
+  max-width: 340px;
+  flex-wrap: nowrap;
+}
 .custom-int {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
-  flex: 1; /* 与预设按钮等宽平分 */
+  flex: 1 1 0; /* 与预设按钮等宽平分 */
+  min-width: 0;
+  margin: 0; /* 覆盖全局 label{margin-top:6px}，否则比按钮矮 6px 不水平对齐 */
+  white-space: nowrap; /* 断折行：input+文字永远一行 */
   background: var(--ctp-crust); /* 与预设按钮同底，视觉统一 */
   border: 1px solid var(--ctp-surface0);
   border-radius: 6px;
@@ -426,18 +437,23 @@ input:focus { outline: 1px solid var(--ctp-blue); }
 }
 .custom-int.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .custom-int input {
-  width: 56px;
-  background: var(--ctp-mantle);
-  color: var(--ctp-text);
+  width: 44px;
+  min-width: 0;
+  flex: 0 1 auto;
+  background: transparent;
+  color: inherit;
   border: none;
   font-size: 12px;
-  padding: 2px 1px;
+  padding: 0;
   box-sizing: border-box;
+  text-align: center;
 }
+.custom-int span { white-space: nowrap; }
 .seg button {
-  flex: 1; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
+  flex: 1 1 0; background: var(--ctp-crust); border: 1px solid var(--ctp-surface0); color: var(--ctp-subtext0);
   border-radius: 6px; padding: 6px; cursor: pointer; font-size: 12px; height: 32px;
   display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
+  min-width: 0; white-space: nowrap;
 }
 .seg button.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .check { display: flex; align-items: center; gap: 7px; margin-top: 9px; cursor: pointer; }
