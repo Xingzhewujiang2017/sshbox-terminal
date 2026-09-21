@@ -412,7 +412,10 @@ input:focus { outline: 1px solid var(--ctp-blue); }
 .custom-int {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
+  flex: 1; /* 与预设按钮等宽平分 */
+  background: var(--ctp-crust); /* 与预设按钮同底，视觉统一 */
   border: 1px solid var(--ctp-surface0);
   border-radius: 6px;
   padding: 6px 8px;
@@ -421,7 +424,7 @@ input:focus { outline: 1px solid var(--ctp-blue); }
   height: 32px;
   box-sizing: border-box;
 }
-.custom-int.sel { border-color: var(--ctp-blue); color: var(--ctp-text); }
+.custom-int.sel { border-color: var(--ctp-blue); color: var(--ctp-blue); }
 .custom-int input {
   width: 56px;
   background: var(--ctp-mantle);
