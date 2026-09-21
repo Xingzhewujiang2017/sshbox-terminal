@@ -93,7 +93,7 @@ const services = ref<ServiceInfo | null>(null)
 const hardware = ref<HardwareInfo | null>(null)
 const ping = ref<PingInfo | null>(null)
 /** 时延/丢包迷你趋势（#1）：15s 一档，最多 48 点。 */
-const pingHist = ref<{ lat: number[]; loss: number[] }>({ lat: [], loss: [] })
+const pingHist = ref<{ lat: number[]; loss: number[]; t: string[] }>({ lat: [], loss: [], t: [] })
 /** 传感器多起来（8 核 + 2 个 NVMe）会淹掉面板，默认只露最热的几个。 */
 const TEMP_SHOWN = 5
 const tempsExpanded = ref(false)
@@ -146,9 +146,11 @@ let unlistenPing: (() => void) | null = null
 const rootEl = ref<HTMLDivElement>()
 const cpuEl = ref<HTMLDivElement>()
 const netEl = ref<HTMLDivElement>()
+const pingEl = ref<HTMLDivElement>()
 const ioEl = ref<HTMLDivElement>()
 let cpuChart: echarts.ECharts | null = null
 let netChart: echarts.ECharts | null = null
+let pingChart: echarts.ECharts | null = null
 let ioChart: echarts.ECharts | null = null
 let ro: ResizeObserver | null = null
 
@@ -205,8 +207,9 @@ function repaint() {
   const p = chartPalette()
   const cols = seriesColors()
   cpuChart?.setOption(colorOption(p, cols[0]))
-  netChart?.setOption(colorOption(p, cols[1]))
-  ioChart?.setOption(colorOption(p, cols[2]))
+    netChart?.setOption(colorOption(p, cols[1]))
+    pingChart?.setOption(colorOption(p, [p.blue, p.red]))
+    ioChart?.setOption(colorOption(p, cols[2]))
 }
 
 /** 温度分档：<60 正常，60-79 偏热，>=80 该看一眼了。 */
@@ -267,14 +270,7 @@ function fmtRateShort(b: number): string {
 }
 
 /** 迷你折线 path（#1 时延趋势用）：自绘 SVG，归一化到各自最大值。 */
-function spark(vals: number[], w: number, h: number): string {
-  if (!vals.length) return ''
-  const max = Math.max(...vals, 1)
-  const step = w / Math.max(1, vals.length - 1)
-  return vals
-    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - 2 - (h - 6) * (v / max)).toFixed(1)}`)
-    .join(' ')
-}
+/** spark() 已无调用者，删除。 */
 
 const netTotals = computed(() => {
   if (!metrics.value) return { rx: 0, tx: 0 }
@@ -334,6 +330,40 @@ function initRate(el: HTMLDivElement, names: string[], colors: string[]): echart
   return c
 }
 
+/** Ping chart：时延 ms（左轴）/ 丢包 %（右轴），跟网络趋势图同一套坐标轴、时间刻度、hover 提示。 */
+function initPing(el: HTMLDivElement): echarts.ECharts {
+  const p = chartPalette()
+  const c = echarts.init(el)
+  c.setOption({
+    backgroundColor: 'transparent',
+    ...colorOption(p, [p.blue, p.red]),
+    grid: { left: 42, right: 42, top: 24, bottom: 20 },
+    legend: { ...LEGEND, data: ['时延 ms', '丢包 %'] },
+    tooltip: {
+      trigger: 'axis',
+      formatter: (ps: unknown) => {
+        const a = ps as { marker: string; seriesName: string; value: number; axisValue: string }[]
+        const rows = a.map((x) =>
+          x.seriesName === '时延 ms'
+            ? `${x.marker}时延：${(+x.value).toFixed(2)} ms`
+            : `${x.marker}丢包：${(+x.value).toFixed(1)} %`
+        )
+        return (a[0]?.axisValue ?? '') + '<br/>' + rows.join('<br/>')
+      },
+    },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: [
+      { type: 'value', name: 'ms', min: 0, ...axisStyle(p), axisLabel: AXIS },
+      { type: 'value', name: '%', min: 0, max: 100, ...axisStyle(p), splitLine: { show: false }, axisLabel: AXIS },
+    ],
+    series: [
+      { name: '时延 ms', type: 'line', data: [], yAxisIndex: 0, smooth: true, showSymbol: false, lineStyle: { width: 1.5, color: p.blue }, itemStyle: { color: p.blue }, areaStyle: { opacity: 0.12, color: p.blue } },
+      { name: '丢包 %', type: 'line', data: [], yAxisIndex: 1, smooth: true, showSymbol: false, lineStyle: { width: 1.5, color: p.red, type: 'dashed' }, itemStyle: { color: p.red }, areaStyle: { opacity: 0.1, color: p.red } },
+    ],
+  })
+  return c
+}
+
 /**
  * Charts live inside `v-if="metrics"`, so the container elements do not exist
  * until the first sample arrives — init must happen after that render, never
@@ -343,6 +373,7 @@ function ensureCharts() {
   const cols = seriesColors()
   if (!cpuChart && cpuEl.value) cpuChart = initPct(cpuEl.value)
   if (!netChart && netEl.value) netChart = initRate(netEl.value, ['↓ 下行', '↑ 上行'], cols[1])
+  if (!pingChart && pingEl.value) pingChart = initPing(pingEl.value)
   if (!ioChart && ioEl.value) ioChart = initRate(ioEl.value, ['读', '写'], cols[2])
 }
 
@@ -353,6 +384,7 @@ function updateCharts() {
   const h = history.value
   cpuChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.cpu }, { data: h.mem }] })
   netChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.rx }, { data: h.tx }] })
+  pingChart?.setOption({ xAxis: { data: pingHist.value.t }, series: [{ data: pingHist.value.lat }, { data: pingHist.value.loss }] })
   ioChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.dread }, { data: h.dwrite }] })
 }
 
@@ -390,14 +422,17 @@ onMounted(async () => {
     // 时延/丢包迷你趋势（#1）：慢采集 15s 一档，最多留 48 点（约 12 分钟）。
     // 没测到网关（null）时整次跳过 —— 不画 0ms 骗人。
     if (e.payload.ping) {
-      const h = pingHist.value
-      h.lat.push(+e.payload.ping.rtt_avg.toFixed(2))
-      h.loss.push(+e.payload.ping.loss_pct.toFixed(1))
-      if (h.lat.length > 48) {
-        h.lat.shift()
-        h.loss.shift()
-      }
-    }
+          const h = pingHist.value
+          h.lat.push(+e.payload.ping.rtt_avg.toFixed(2))
+          h.loss.push(+e.payload.ping.loss_pct.toFixed(1))
+          h.t.push(new Date().toTimeString().slice(0, 8))
+          if (h.lat.length > 48) {
+            h.lat.shift()
+            h.loss.shift()
+            h.t.shift()
+          }
+          void refresh()
+        }
   })
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
@@ -505,28 +540,11 @@ onBeforeUnmount(() => {
       <div class="net-box">
         <div class="section-title">网络 <span class="unit">{{ windowLabel }}</span></div>
         <div v-if="ping" class="net-quality">
-          <span>时延 {{ ping.rtt_avg.toFixed(2) }} ms</span>
-          <span v-if="ping.jitter > 0">抖动 {{ ping.jitter.toFixed(2) }} ms</span>
-          <span :class="{ bad: ping.loss_pct >= 5 }">丢包 {{ ping.loss_pct.toFixed(0) }}%</span>
-          <span class="unit">到 {{ ping.target }}</span>
-        </div>
-        <svg
-          v-if="pingHist.lat.length >= 2"
-          viewBox="0 0 260 40"
-          preserveAspectRatio="none"
-          width="100%"
-          height="40"
-          class="ping-spark"
-        >
-          <path :d="spark(pingHist.lat, 260, 40)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
-          <path :d="spark(pingHist.loss, 260, 40)" fill="none" stroke="var(--ctp-red)" stroke-width="1.3" stroke-dasharray="3 2" />
-        </svg>
-        <div v-if="pingHist.lat.length >= 2" class="ping-legend">
-          时延<svg viewBox="0 0 20 6" width="20" height="6"><path d="M0 3 L20 3" stroke="var(--ctp-blue)" stroke-width="2" /></svg>
-          丢包%<svg viewBox="0 0 20 6" width="20" height="6"><path d="M0 3 L20 3" stroke="var(--ctp-red)" stroke-width="2" stroke-dasharray="3 2" /></svg>
-          · 近 {{ pingHist.lat.length }} 次（每 15 秒）
-        </div>
-        <div class="net-total">
+                  <span class="unit">到 {{ ping.target }}</span>
+                </div>
+                <div class="chart-box" ref="pingEl"></div>
+                <div class="ping-hint dim">时延 / 丢包 · 每 15 秒一档 · 指针悬停看图例数值 · 采到默认网关才有曲线</div>
+                <div class="net-total">
           <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
           <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
         </div>
@@ -757,8 +775,7 @@ onBeforeUnmount(() => {
 .net-total { display: flex; gap: 16px; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .net-quality { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .net-quality .bad { color: #e5484d; font-weight: 600; }
-.ping-spark { display: block; margin: 2px 0; background: var(--ctp-mantle); border-radius: 4px; }
-.ping-legend { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--ctp-overlay0); margin-bottom: 4px; }
+.ping-hint { font-size: 10px; color: var(--ctp-overlay0); margin: 4px 0 2px; }
 .down { color: var(--ctp-green); } .up { color: var(--ctp-blue); }
 .net-if, .io-row { display: flex; gap: 10px; color: var(--ctp-subtext0); padding: 1px 0; }
 .ifname { color: var(--ctp-overlay0); min-width: 56px; }
