@@ -251,6 +251,16 @@ function fmtBytes(b: number): string {
   if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB/s'
   return (b / 1024 / 1024).toFixed(1) + ' MB/s'
 }
+
+/** 超长挂载点中间省略：保留开头（盘符/根路径）+ 结尾（最后的目录名），
+ *   hover（title）看全路径 —— 中间省略比尾部省略更有信息量。 */
+function shortMount(m: string, max = 22): string {
+  if (m.length <= max) return m
+  const head = Math.ceil(max * 0.55)
+  const tail = max - head - 1
+  return m.slice(0, head) + '…' + m.slice(-tail)
+}
+
 function fmtKB(kb: number): string {
   if (kb < 1024 * 1024) return (kb / 1024).toFixed(1) + ' MB'
   return (kb / 1024 / 1024).toFixed(1) + ' GB'
@@ -568,9 +578,9 @@ onBeforeUnmount(() => {
         <div class="section-title">磁盘</div>
         <div v-for="d in paged('disk', metrics.disks)" :key="d.mount" class="disk-row">
           <div class="disk-head">
-            <span>{{ d.mount }}</span>
-            <span>{{ fmtKB(d.used_kb) }} / {{ fmtKB(d.total_kb) }}</span>
-          </div>
+                      <span class="mount" :title="d.mount">{{ shortMount(d.mount) }}</span>
+                      <span class="size">{{ fmtKB(d.used_kb) }} / {{ fmtKB(d.total_kb) }}</span>
+                    </div>
           <div class="bar"><div class="bar-fill" :class="{ warn: d.use_pct > 85 }" :style="{ width: d.use_pct + '%' }"></div></div>
         </div>
         <Pager
@@ -780,7 +790,9 @@ onBeforeUnmount(() => {
 .net-if, .io-row { display: flex; gap: 10px; color: var(--ctp-subtext0); padding: 1px 0; }
 .ifname { color: var(--ctp-overlay0); min-width: 56px; }
 .disk-row { margin-bottom: 6px; }
-.disk-head { display: flex; justify-content: space-between; margin-bottom: 2px; }
+.disk-head { display: flex; justify-content: space-between; margin-bottom: 2px; gap: 8px; }
+.disk-head .mount { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.disk-head .size { white-space: nowrap; flex-shrink: 0; }
 .bar { height: 6px; background: var(--ctp-surface0); border-radius: 3px; overflow: hidden; }
 .bar-fill { height: 100%; background: var(--ctp-blue); border-radius: 3px; transition: width 0.5s; }
 .bar-fill.warn { background: var(--ctp-red); }
