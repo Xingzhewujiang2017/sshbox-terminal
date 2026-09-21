@@ -96,8 +96,17 @@ const offlineRows = computed<LabRow[]>(() => {
   connectedTabs.value.forEach((t) => {
     if (t.hostId) connIds.add(t.hostId)
   })
+  // 同名同 IP 的重复条目只显示一条（hosts.json 可能有多份），避免
+  // "点连接只成功一台 / 演练台出现两个同名主机"的错觉。
+  const seen = new Set<string>()
   return props.hosts.hosts
     .filter((h) => !connIds.has(h.id))
+    .filter((h) => {
+      const key = `${h.name ?? ''}|${h.host ?? ''}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
     .map((h) => ({
       key: `h-${h.id}`,
       hostId: h.id,
@@ -155,6 +164,13 @@ watch(
   }
 )
 
+function rowLabel(sid: string): string {
+  return allRows.value.find((r) => r.sid === sid)?.label ?? sid
+}
+function rowIp(sid: string): string {
+  return allRows.value.find((r) => r.sid === sid)?.ip ?? ''
+}
+
 // --- 目标勾选 ---------------------------------------------------------------
 const selected = ref<Set<string>>(new Set())
 function toggle(sid: string) {
@@ -187,7 +203,9 @@ function pushSample(sid: string, p: { lat: number | null; loss: number | null },
   s.mem.push(+(m?.mem_pct ?? 0).toFixed(1))
   s.lat.push(p.lat != null ? +(p.lat.toFixed(2)) : 0)
   s.loss.push(p.loss != null ? +(p.loss.toFixed(1)) : 0)
-  const cap = WINDOW_CAP[windowMode.value]
+  // 数据永远保留「本次」全量（上限 2h ≈ 2400 点）；窗口切换只裁剪显示，
+  // 不丢历史 —— 从 15分 切回 3分 再切回 15分，数据还在。
+  const cap = 2400
   if (s.t.length > cap) {
     s.t.shift(); s.cpu.shift(); s.mem.shift(); s.lat.shift(); s.loss.shift()
   }
@@ -319,9 +337,16 @@ function updateCharts() {
     const s = series.value[t.sid]
     if (!s) continue
     const c = charts.value[t.sid]
-    c?.cpu?.setOption({ xAxis: { data: s.t }, series: [{ data: s.cpu }, { data: s.mem }] })
-    const mark = s.inject.map((mk) => ({ xAxis: mk.atIdx }))
-    c?.ping?.setOption({ xAxis: { data: s.t }, series: [{ data: s.lat }, { data: s.loss }, { markLine: { data: mark } }] })
+    // 窗口=显示裁剪（slice），原始数据不动
+    const cap = WINDOW_CAP[windowMode.value]
+    const tt = s.t.slice(-cap)
+    const cpu = s.cpu.slice(-cap)
+    const mem = s.mem.slice(-cap)
+    const lat = s.lat.slice(-cap)
+    const loss = s.loss.slice(-cap)
+    const mark = s.inject.filter((mk) => mk.atIdx < tt.length).map((mk) => ({ xAxis: mk.atIdx }))
+    c?.cpu?.setOption({ xAxis: { data: tt }, series: [{ data: cpu }, { data: mem }] })
+    c?.ping?.setOption({ xAxis: { data: tt }, series: [{ data: lat }, { data: loss }, { markLine: { data: mark } }] })
   }
 }
 
@@ -447,8 +472,16 @@ function runInject() {
   }
   const cmd = injectCommand()
   for (const t of targets) emit('command', { sid: t.sid, text: cmd })
-  for (const t of targets) markInject(t.sid, injectType.value, injectRecover.value ? injectRecoverSecs.value : 0)
-  armInjectWatch(targets.map((t) => ({ sid: t.sid, label: t.label })))
+  if (injectType.value === 'clear') {
+    // 清除：移除该主机的注入标记（黄线）与效果检测，不画新标记。
+    for (const t of targets) {
+      const s = series.value[t.sid]
+      if (s) s.inject = []
+    }
+  } else {
+    for (const t of targets) markInject(t.sid, injectType.value, injectRecover.value ? injectRecoverSecs.value : 0)
+    armInjectWatch(targets.map((t) => ({ sid: t.sid, label: t.label })))
+  }
   const preview = (cmd.split('\n').find((l) => l.startsWith('tc qdisc')) || cmd.split('\n').pop() || '').slice(0, 60)
   injectConfirm.value = { n: targets.length, cmd, preview, targets: targets.map((t) => ({ sid: t.sid, label: t.label })) }
   injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，选择是否立即执行`
@@ -558,15 +591,28 @@ watch(themeVersion, () => {
 })
 
 watch(windowMode, () => {
-  for (const sid of Object.keys(series.value)) {
-    const s = series.value[sid]
-    const cap = WINDOW_CAP[windowMode.value]
-    while (s.t.length > cap) {
-      s.t.shift(); s.cpu.shift(); s.mem.shift(); s.lat.shift(); s.loss.shift()
-    }
-  }
+  // 窗口切换只是显示裁剪（updateCharts 内 slice），数据不动。
   void nextTick(() => updateCharts())
 })
+
+// 取消勾选（或清空）→ 释放该主机的图表实例与数据，
+// 重新勾选时重新 init —— 否则图表 DOM 重建而 echarts 实例残留，
+// 新容器永远不会被初始化，趋势图表现为"没有数据"。
+watch(
+  () => selTabs.value.map((t) => t.sid).join(','),
+  (cur, old) => {
+    if (!old) return
+    const curSet = new Set(cur ? cur.split(',') : [])
+    for (const sid of old.split(',')) {
+      if (!sid || curSet.has(sid)) continue
+      charts.value[sid]?.cpu?.dispose()
+      charts.value[sid]?.ping?.dispose()
+      delete charts.value[sid]
+      delete chartEls.value[sid]
+      delete series.value[sid]
+    }
+  }
+)
 
 onMounted(() => {
   emit('enter')
@@ -622,13 +668,19 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="!allRows.length" class="dim empty">该分组下没有主机 —— 先在左侧添加主机</div>
         <div v-if="openTerm.size" class="term-zone">
-          <TerminalPane
-            v-for="sid in [...openTerm]"
-            :key="sid"
-            :sid="sid"
-            :active="true"
-            @data="(d) => api.termWrite(sid, d)"
-          />
+          <div v-for="sid in [...openTerm]" :key="sid" class="lab-term-block">
+            <div class="lt-head">
+              <span class="lt-name">{{ rowLabel(sid) }}</span>
+              <span class="dim lt-ip">{{ rowIp(sid) }}</span>
+              <span class="spacer"></span>
+              <button class="btn ghost mini" @click="toggleTerm(sid)" title="收起该终端">收起 ✕</button>
+            </div>
+            <TerminalPane
+              :sid="sid"
+              :active="true"
+              @data="(d) => api.termWrite(sid, d)"
+            />
+          </div>
         </div>
       </div>
 
@@ -668,7 +720,7 @@ onBeforeUnmount(() => {
           </template>
           <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
           <div v-if="injInert.length" class="err inj-inert">
-            ⚠ 注入疑似未生效（{{ injInert.join('、') }}）：25 秒内时延/丢包曲线无变化 —— 目标机可能缺少 sch_netem 内核模块（WSL2 微软内核常见），请检查终端里的命令输出；可用「清除」恢复。
+            ⚠ 注入疑似未生效（{{ injInert.join('、') }}）：25 秒内时延/丢包曲线无变化 —— 目标机可能缺少 sch_netem 内核模块（受限内核/容器环境常见），请检查终端里的命令输出；可用「清除」恢复。
           </div>
         </div>
       </div>
@@ -747,7 +799,11 @@ onBeforeUnmount(() => {
 .h-stat { font-size: 11px; color: var(--ctp-overlay0); }
 .h-stat.conn { color: var(--ctp-green); }
 .btn.mini { padding: 1px 8px; font-size: 11px; }
-.term-zone { margin-top: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 8px; }
+.term-zone { margin-top: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 8px; }
+.lab-term-block { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px; }
+.lt-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.lt-name { font-weight: 600; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lt-ip { font-size: 11px; }
 .term-zone :deep(.term-wrap) { border: 1px solid var(--ctp-surface0); border-radius: 6px; height: 260px; }
 .empty { padding: 8px 4px; }
 .sec-title { font-weight: 600; display: flex; align-items: center; gap: 10px; margin: 4px 0 6px; }
