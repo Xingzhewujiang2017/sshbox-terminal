@@ -208,6 +208,7 @@ async function tickPing() {
       }
     })
   )
+  checkInjectEffect()
   await nextTick()
   updateCharts()
 }
@@ -337,6 +338,47 @@ function markInject(sid: string, kind: string, recoverSecs: number) {
   s.inject.push({ atIdx: Math.max(0, s.lat.length - 1), recAt: recoverSecs > 0 ? Date.now() + recoverSecs * 1000 : 0, kind })
 }
 
+/** 注入效果检测：注入后 25s 内时延/丢包毫无变化 → 判定注入疑似未生效
+ *  （目标机缺 sch_netem 等），如实提示而不是让用户对着平线猜。 */
+const injWatch = ref<Record<string, { baseLat: number; baseLoss: number; at: number }>>({})
+const injInert = ref<string[]>([])
+function armInjectWatch(targets: { sid: string; label: string }[]) {
+  const w: Record<string, { baseLat: number; baseLoss: number; at: number }> = {}
+  for (const t of targets) {
+    const s = series.value[t.sid]
+    w[t.sid] = {
+      baseLat: s && s.lat.length ? s.lat[s.lat.length - 1] : NaN,
+      baseLoss: s && s.loss.length ? s.loss[s.loss.length - 1] : NaN,
+      at: Date.now(),
+    }
+  }
+  injWatch.value = w
+  injInert.value = []
+}
+function checkInjectEffect() {
+  const w = injWatch.value
+  if (!Object.keys(w).length) return
+  const inert: string[] = []
+  const now = Date.now()
+  for (const sid of Object.keys(w)) {
+    const meta = w[sid]
+    if (now - meta.at < 25000) continue // 还在观察期，留着下次判
+    const s = series.value[sid]
+    if (!s || !s.lat.length) {
+      delete injWatch.value[sid]
+      continue
+    }
+    const latMax = Math.max(...s.lat)
+    const latChanged = Math.abs(latMax - meta.baseLat) >= 8
+    const lossChanged = s.loss.some((l) => l > 0)
+    if (!latChanged && !lossChanged) inert.push(sid)
+    delete injWatch.value[sid]
+  }
+  if (inert.length) {
+    injInert.value = inert.map((sid) => selTabs.value.find((t) => t.sid === sid)?.label ?? sid)
+  }
+}
+
 // --- 故障注入（目标=勾选，逻辑同 v1） -----------------------------------------
 const injectType = ref<'delay' | 'loss' | 'blip' | 'clear'>('delay')
 const injectDelayMs = ref(200)
@@ -406,6 +448,7 @@ function runInject() {
   const cmd = injectCommand()
   for (const t of targets) emit('command', { sid: t.sid, text: cmd })
   for (const t of targets) markInject(t.sid, injectType.value, injectRecover.value ? injectRecoverSecs.value : 0)
+  armInjectWatch(targets.map((t) => ({ sid: t.sid, label: t.label })))
   const preview = (cmd.split('\n').find((l) => l.startsWith('tc qdisc')) || cmd.split('\n').pop() || '').slice(0, 60)
   injectConfirm.value = { n: targets.length, cmd, preview, targets: targets.map((t) => ({ sid: t.sid, label: t.label })) }
   injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，选择是否立即执行`
@@ -417,6 +460,7 @@ function confirmInjectExecute() {
   if (!c) return
   for (const t of c.targets) emit('command', { sid: t.sid, text: c.cmd, execute: true })
   injectConfirm.value = null
+  armInjectWatch(c.targets)
   injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 观察底部趋势图`
 }
 
@@ -623,6 +667,9 @@ onBeforeUnmount(() => {
             </div>
           </template>
           <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
+          <div v-if="injInert.length" class="err inj-inert">
+            ⚠ 注入疑似未生效（{{ injInert.join('、') }}）：25 秒内时延/丢包曲线无变化 —— 目标机可能缺少 sch_netem 内核模块（WSL2 微软内核常见），请检查终端里的命令输出；可用「清除」恢复。
+          </div>
         </div>
       </div>
 
@@ -718,6 +765,7 @@ onBeforeUnmount(() => {
 .inj-confirm code, .exec-confirm code { background: var(--ctp-mantle); padding: 1px 6px; border-radius: 4px; font-size: 11px; }
 .inj-confirm .danger, .exec-confirm .danger { background: var(--ctp-red); color: var(--on-accent); border: none; font-weight: 600; }
 .err { color: var(--ctp-red); }
+.inj-inert { margin-top: 4px; font-size: 11.5px; background: var(--ctp-mantle); padding: 4px 8px; border-radius: 6px; }
 .exec-input { width: 100%; background: var(--ctp-mantle); border: 1px solid var(--ctp-surface0); border-radius: 6px; color: var(--ctp-text); font-family: Consolas, monospace; font-size: 12px; padding: 8px; resize: vertical; }
 .exec-confirm { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .exec-outs { margin-top: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 8px; }
