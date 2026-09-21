@@ -50,6 +50,7 @@ const props = defineProps<{ sid: string; active: boolean; interval: number; topN
 const emit = defineEmits<{
   (e: 'setInterval', secs: number): void
   (e: 'setTopN', n: number): void
+  (e: 'close'): void
 }>()
 
 // --- 列表分页 ---------------------------------------------------------------
@@ -489,6 +490,11 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="monitor" ref="rootEl">
+    <div class="mon-bar-head">
+      <span class="mon-bar-title">监控</span>
+      <span class="bar-spacer"></span>
+      <button class="chip" title="收起监控面板（工具栏 ◧ 可恢复）" @click="emit('close')">收起 ✕</button>
+    </div>
     <div class="bar">
       <span class="bar-label">采样</span>
       <button
@@ -744,6 +750,8 @@ onBeforeUnmount(() => {
   padding: 10px;
   box-sizing: border-box;
 }
+.mon-bar-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.mon-bar-title { font-weight: 700; font-size: 12.5px; }
 .bar { display: flex; align-items: center; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; }
 .bar-label { color: var(--ctp-overlay0); font-size: 11px; margin-right: 2px; }
 .bar-spacer { flex: 1; }

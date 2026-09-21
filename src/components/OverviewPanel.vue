@@ -33,28 +33,8 @@ const emit = defineEmits<{
   (e: 'command', p: { sid: string; text: string; execute?: boolean }): void
 }>()
 
-// --- 故障注入（#12）--------------------------------------------------------
-// 只生成 tc netem 命令、按目标填入对应终端，回车由用户在终端里按（铁律：不自动执行）。
-const injectOpen = ref(false)
-const injectTarget = ref<'all' | 'group' | 'host'>('all')
-const injectGroup = ref('')
-const injectHost = ref('')
-const injectType = ref<'delay' | 'loss' | 'blip' | 'clear'>('delay')
-const injectMs = ref(200)
-const injectLoss = ref(5)
-const injectBlipEvery = ref(10)
-const injectBlipDur = ref(3)
-const injectBlipTimes = ref(3)
-const injectNic = ref('eth0')
-/** 网卡来源：auto=各台自动探测默认路由出口接口（多台网卡名不同也兼容）；manual=统一手动指定。 */
-const injectNicMode = ref<'auto' | 'manual'>('auto')
-const injectRecover = ref(false)
-const injectRecoverSecs = ref(120)
-const injectMsg = ref('')
-/** 已填入后的确认状态：null=无；非 null=在等用户选「立即执行」还是「仅等待」。 */
-const injectConfirm = ref<{ n: number; cmd: string; preview: string; targets: { sid: string; label: string }[] } | null>(null)
-/** 实时趋势窗口（按 sid，60 点上限）：CPU/内存来自 ssh://metrics（约 1s 一档），
- *  时延/丢包来自 ssh://ping（15s 一档，采不到网关整次跳过，不画 0 骗人）。 */
+// --- 实时趋势窗口（按 sid，60 点上限）：CPU/内存来自 ssh://metrics（约 1s 一档），
+// 时延/丢包来自 ssh://ping（15s 一档，采不到网关整次跳过，不画 0 骗人）。
 interface LiveTrend { cpu: number[]; mem: number[]; lat: number[]; loss: number[] }
 const liveTrend = ref<Record<string, LiveTrend>>({})
 let unLiveMet: (() => void) | null = null
@@ -68,118 +48,6 @@ function pushLive(sid: string, k: keyof LiveTrend, v: number) {
 function liveFor(sid?: string): LiveTrend | undefined {
   return sid ? liveTrend.value[sid] : undefined
 }
-
-const connectedTabs = computed(() => props.tabs.filter((t) => t.status === 'connected'))
-const connectedCount = computed(() => connectedTabs.value.length)
-const groupOptions = computed(() => props.hosts.groups.filter(Boolean))
-const injectGroupCount = computed(() => {
-  if (!injectGroup.value) return 0
-  return connectedTabs.value.filter((t) => t.hostId != null && groupOfHost(t.hostId) === injectGroup.value).length
-})
-const injectTargetCount = computed(() => {
-  if (injectTarget.value === 'all') return connectedCount.value
-  if (injectTarget.value === 'group') return injectGroupCount.value
-  return injectHost.value ? 1 : 0
-})
-const injectCanRun = computed(
-  () => injectTargetCount.value > 0 && (injectType.value !== 'blip' || (injectBlipDur.value > 0 && injectBlipTimes.value > 0)),
-)
-
-function injectCommand(): string {
-  const setup = ifaceSetup()
-  const head =
-    '# 故障注入（SSHBox 生成）· 回车由你执行；需要 root' +
-    (injectNicMode.value === 'auto'
-      ? '；网卡自动探测（各台默认路由出口，多台网卡不同也兼容）'
-      : '；网卡手动指定')
-  if (injectType.value === 'clear') {
-    return [
-      head,
-      ...setup,
-      `tc qdisc del dev "$IFACE" root 2>/dev/null; echo '已清除（原本没有规则则无输出）'; tc qdisc show dev "$IFACE" || true`,
-    ].join('\n')
-  }
-  if (injectType.value === 'delay') {
-    const ms = Math.max(1, Math.round(injectMs.value || 1))
-    return [head, ...setup, netemLine(`"$IFACE"`, `delay ${ms}ms`)].join('\n')
-  }
-  if (injectType.value === 'loss') {
-    const p = Math.min(100, Math.max(1, Math.round(injectLoss.value || 1)))
-    return [head, ...setup, netemLine(`"$IFACE"`, `loss ${p}%`)].join('\n')
-  }
-  const every = Math.max(1, Math.round(injectBlipEvery.value || 1))
-  const dur = Math.max(1, Math.round(injectBlipDur.value || 1))
-  const times = Math.max(1, Math.round(injectBlipTimes.value || 1))
-  return [
-    head,
-    ...setup,
-    `for i in $(seq 1 ${times}); do`,
-    `  tc qdisc replace dev "$IFACE" root netem loss 100%`,
-    `  sleep ${dur}`,
-    `  tc qdisc del dev "$IFACE" root 2>/dev/null`,
-    `  [ $i -lt ${times} ] && sleep ${every}`,
-    `done`,
-    `echo '闪断注入完成，网络已恢复'; tc qdisc show dev "$IFACE" || true`,
-  ].join('\n')
-}
-
-/** 网卡变量的初始化：自动=探测默认路由出口（`ip route` 的第一条 default 的 dev 字段）；
- *  手动=固定值并先验证网卡存在。多台主机各跑各的探测，网卡不同也各自正确。 */
-function ifaceSetup(): string[] {
-  const manual = injectNicMode.value === 'manual' ? injectNic.value.trim() : ''
-  if (manual) {
-    return [
-      `IFACE=${manual}`,
-      `ip link show "$IFACE" >/dev/null 2>&1 || { echo "网卡不存在（${manual}），中止"; exit 1; }`,
-      `echo "注入接口: $IFACE"`,
-    ]
-  }
-  return [
-    `IFACE=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')`,
-    `[ -n "$IFACE" ] || { echo "未找到默认路由出接口（该主机没有默认路由？），中止"; exit 1; }`,
-    `echo "注入接口: $IFACE"`,
-  ]
-}
-
-function netemLine(nic: string, rule: string): string {
-  if (injectRecover.value && injectRecoverSecs.value > 0) {
-    return `tc qdisc replace dev ${nic} root netem ${rule} && sleep ${injectRecoverSecs.value} && tc qdisc del dev ${nic} root && echo '已自动恢复'`
-  }
-  return `tc qdisc replace dev ${nic} root netem ${rule}`
-}
-
-function runInject() {
-  let targets = connectedTabs.value
-  if (injectTarget.value === 'group') {
-    const g = injectGroup.value || groupOptions.value[0] || ''
-    targets = connectedTabs.value.filter((t) => t.hostId != null && groupOfHost(t.hostId) === g)
-    injectGroup.value = g
-  } else if (injectTarget.value === 'host') {
-    targets = connectedTabs.value.filter((t) => t.sid === injectHost.value)
-  }
-  if (!targets.length) {
-    injectMsg.value = '失败：目标范围内没有已连接的会话'
-    return
-  }
-  const cmd = injectCommand()
-    for (const t of targets) {
-      emit('command', { sid: t.sid, text: cmd })
-    }
-    const preview = (cmd.split('\n').find((l) => l.startsWith('tc qdisc')) || cmd.split('\n').pop() || '').slice(0, 60)
-    injectConfirm.value = { n: targets.length, cmd, preview, targets: targets.map((t) => ({ sid: t.sid, label: t.label })) }
-    injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，选择是否立即执行`
-  }
-
-  /** 「立即执行」：向每台目标终端写命令+回车自动执行；不切标签，总览停留。 */
-  function confirmExecute() {
-    const c = injectConfirm.value
-    if (!c) return
-    for (const t of c.targets) {
-      emit('command', { sid: t.sid, text: c.cmd, execute: true })
-    }
-    injectConfirm.value = null
-    injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 切「卡片」视图看实时趋势观察效果`
-  }
 
 type Freshness = 'fresh' | 'stale' | 'dead' | 'unknown'
 
@@ -627,8 +495,7 @@ onBeforeUnmount(() => {
                               <button :class="{ on: viewMode === 'cards' }" @click="viewMode = 'cards'">卡片</button>
                             </span>
               <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
-                      <button class="btn ghost" @click="injectOpen = !injectOpen" title="生成 tc netem 注入命令，填入各组终端（只填不执行）">故障注入</button>
-                      <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前视图为 CSV（含分组）">导出 CSV</button>
+                                    <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前视图为 CSV（含分组）">导出 CSV</button>
                       <button
                         v-if="Object.keys(histData).length"
                         class="btn ghost"
@@ -817,62 +684,9 @@ onBeforeUnmount(() => {
                                     </div>
                 </div>
 
-                          <!-- 故障注入（#12）：生成 tc netem 命令，只填入各自终端的命令行，绝不自动执行 -->
-                          <div v-if="injectOpen" class="inject">
-                            <div class="inject-head">
-                              <span class="hist-title">故障注入 <span class="dim">· 只生成命令填入终端，回车由你按；需要目标机 root</span></span>
+                              </div>
                             </div>
-                            <div class="inject-row">
-                              <span class="inj-label">目标</span>
-                              <label class="check"><input type="radio" value="all" v-model="injectTarget" /> 全部已连接（{{ connectedCount }}）</label>
-                              <label class="check"><input type="radio" value="group" v-model="injectTarget" /> 组</label>
-                              <select v-if="injectTarget === 'group'" v-model="injectGroup" class="sel" :disabled="!groupOptions.length">
-                                <option v-for="g in groupOptions" :key="g" :value="g">{{ g }}</option>
-                              </select>
-                              <label class="check"><input type="radio" value="host" v-model="injectTarget" /> 单台</label>
-                              <select v-if="injectTarget === 'host'" v-model="injectHost" class="sel" :disabled="!connectedTabs.length">
-                                <option v-for="t in connectedTabs" :key="t.sid" :value="t.sid">{{ t.label }}</option>
-                              </select>
-                            </div>
-                            <div class="inject-row">
-                              <span class="inj-label">类型</span>
-                              <label class="check"><input type="radio" value="delay" v-model="injectType" /> 时延</label>
-                              <input v-if="injectType === 'delay'" v-model.number="injectMs" type="number" min="1" class="num" /> ms
-                              <label class="check"><input type="radio" value="loss" v-model="injectType" /> 丢包</label>
-                              <input v-if="injectType === 'loss'" v-model.number="injectLoss" type="number" min="1" max="100" class="num" /> %
-                              <label class="check"><input type="radio" value="blip" v-model="injectType" /> 闪断</label>
-                              <template v-if="injectType === 'blip'">
-                                每 <input v-model.number="injectBlipEvery" type="number" min="1" class="num" /> 秒断
-                                <input v-model.number="injectBlipDur" type="number" min="1" class="num" /> 秒，共
-                                <input v-model.number="injectBlipTimes" type="number" min="1" class="num" /> 次
-                              </template>
-                              <label class="check"><input type="radio" value="clear" v-model="injectType" /> 清除规则</label>
-                            </div>
-                            <div class="inject-row">
-                                            <span class="inj-label">网卡</span>
-                                            <label class="check"><input type="radio" value="auto" v-model="injectNicMode" /> 自动（各台探测默认路由出口）</label>
-                                            <label class="check"><input type="radio" value="manual" v-model="injectNicMode" /> 手动</label>
-                                            <input v-if="injectNicMode === 'manual'" v-model="injectNic" class="num" style="width: 96px" />
-                              <template v-if="injectType === 'delay' || injectType === 'loss'">
-                                <label class="check"><input type="checkbox" v-model="injectRecover" /> 到期自动恢复</label>
-                                <input v-if="injectRecover" v-model.number="injectRecoverSecs" type="number" min="1" class="num" /> 秒后清除
-                              </template>
-                            </div>
-                            <div class="inject-row">
-                              <button class="btn" :disabled="!injectCanRun" @click="runInject">生成并填入终端（{{ injectTargetCount }} 台）</button>
-                                                            <template v-if="injectConfirm">
-                                                              <div class="inject-confirm">
-                                                                <div class="dim">将执行：<code>{{ injectConfirm.preview }}</code></div>
-                                                                <button class="btn danger" @click="confirmExecute">⚠ 立即执行（{{ injectConfirm.n }} 台）</button>
-                                                                <button class="btn ghost" style="margin-left:6px" @click="injectConfirm = null">仅等待，我自己回车</button>
-                                                              </div>
-                                                            </template>
-                                                            <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
-                            </div>
-                          </div>
-              </div>
-            </div>
-          </template>
+                          </template>
 
               <style scoped>
 .mask {
@@ -960,17 +774,9 @@ onBeforeUnmount(() => {
 .hist { border-top: 1px solid var(--ctp-surface0); margin-top: 10px; padding-top: 8px; }
 .hist-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .hist-title { font-weight: 600; }
-.inject { border-top: 1px solid var(--ctp-surface0); margin-top: 12px; padding-top: 8px; }
-.inject-confirm { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.inject-confirm code { background: var(--ctp-mantle); padding: 1px 6px; border-radius: 4px; font-size: 11px; }
-.inject-confirm .danger { background: var(--ctp-red); color: var(--on-accent); border: none; font-weight: 600; }
 .card-spark { margin-top: 6px; }
 .card-spark svg { display: block; background: var(--ctp-mantle); border-radius: 6px; }
 .card-legend { font-size: 10px; margin-top: 2px; }
-.inject-head { margin-bottom: 4px; }
-.inject-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
-.inject-row .num { width: 64px; }
-.inj-label { color: var(--ctp-subtext0); font-size: 12px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
 .cell { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px 8px; }
 .cell-name { font-size: 11px; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

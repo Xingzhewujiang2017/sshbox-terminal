@@ -1071,14 +1071,15 @@ function statusDot(t: Tab) {
                静态信息（主机名等一次性事件）和图表历史都还是上一台主机的，
                看起来就是「监控没跟着切」。 -->
           <MonitorPanel
-            :key="activeTab.sid"
-            :sid="activeTab.sid"
-            :active="true"
-            :interval="settings?.sample_interval_secs ?? 2"
-            :top-n="settings?.process_top_n ?? 12"
-            @set-interval="setSampleInterval"
-            @set-top-n="setProcessTopN"
-          />
+                      :key="activeTab.sid"
+                      :sid="activeTab.sid"
+                      :active="true"
+                      :interval="settings?.sample_interval_secs ?? 2"
+                      :top-n="settings?.process_top_n ?? 12"
+                      @set-interval="setSampleInterval"
+                      @set-top-n="setProcessTopN"
+                      @close="monitorVisible = false"
+                    />
         </div>
       </div>
     </main>
@@ -1150,11 +1151,13 @@ function statusDot(t: Tab) {
         />
 
         <LabPanel
-          v-if="labOpen"
-          :tabs="tabs"
-          @close="labOpen = false"
-          @command="insertToTerminal"
-        />
+              v-if="labOpen"
+              :tabs="tabs"
+              :hosts="hosts"
+              @close="labOpen = false"
+              @enter="monitorVisible = false"
+              @command="insertToTerminal"
+            />
 
     <HistoryPanel
       v-if="historyOpen"

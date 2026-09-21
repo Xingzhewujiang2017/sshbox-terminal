@@ -883,12 +883,21 @@ pub async fn export_csv_text(
     dest_dir: Option<String>,
 ) -> std::result::Result<ExportResult, String> {
     blocking(move || {
+        let base = db_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("exports");
         let dir = match dest_dir {
-            Some(d) => PathBuf::from(d),
-            None => db_path()
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("exports"),
+            // 相对子目录（如 "lab"）归位到 exports/ 下，不落到进程 cwd。
+            Some(d) => {
+                let p = PathBuf::from(&d);
+                if p.is_absolute() {
+                    p
+                } else {
+                    base.join(p)
+                }
+            }
+            None => base,
         };
         export_csv_text_at(&filename, &content, &dir)
     })
@@ -896,8 +905,6 @@ pub async fn export_csv_text(
 }
 
 fn export_csv_text_at(filename: &str, content: &str, dir: &Path) -> Result<ExportResult> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("创建导出目录失败: {}", dir.display()))?;
     // 只拦 Windows 文件名非法字符，中文分组名要原样保留
     let safe: String = filename
         .chars()
@@ -907,6 +914,11 @@ fn export_csv_text_at(filename: &str, content: &str, dir: &Path) -> Result<Expor
         })
         .collect();
     let path = dir.join(safe);
+    // 嵌套子目录（exports/lab 之类）也要建出来。
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建导出目录失败: {}", parent.display()))?;
+    }
     let bytes = content.as_bytes().len() as u64;
     std::fs::write(&path, content.as_bytes())
         .with_context(|| format!("写入失败: {}", path.display()))?;

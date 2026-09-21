@@ -1,20 +1,22 @@
 <script setup lang="ts">
 /**
- * 故障演练台（Fault Lab）—— v0.6.1
+ * 故障演练台 v2（Fault Lab）—— 单机/集群故障测试工作台，全程不跳页。
  *
- * 场景：单机/集群故障测试，全程不跳页：
- *  1. 目标多选（已连接会话）；
- *  2. 每台一张实时卡：CPU/内存（fleet 事件流 ~1s）+ 时延/丢包（3s 高采快 ping），
- *     丢包 >0 / 时延突变红闪告警，注入时刻在曲线上画标记线；
- *  3. 故障注入（复用现有 tc netem 逻辑，目标=勾选，命令可「立即执行」）；
- *  4. 命令/脚本就地组播执行（后端 exec_batch：只读通道、带超时、返 exit code），
- *     执行前弹一次确认；不占用终端 pty，交互式命令仍去终端页。
+ * v2 变化（按用户拍板）：
+ *  1. 顶栏分组下拉（全部/组），主机列表只显示 名称 + IP，双击展开该主机终端（不关演练台）；
+ *  2. 底部每台两块 ECharts 大图（CPU/内存、时延/丢包，同监控平台），窗口可切 3分/15分/本次；
+ *  3. 趋势数据 = 3s 采样（ping_now 快 ping + fleet 最新 CPU/内存合成一行），注入画时间线标记；
+ *  4. 导出两份 CSV（采样数据 + 注入事件），落盘 exports/；
+ *  5. 打开演练台时 App 折叠监控面板（emit 'enter'）。
  *
- * 安全边界：本面板的所有执行动作都需用户手动点确认；AI/agent 流程不自动触发。
+ * 安全：注入/执行的每个动作都需用户手动确认；AI/agent 不自动触发。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import * as echarts from 'echarts'
+import { chartPalette, themeVersion } from '../theme'
 import { api, type LabExec, type Metrics } from '../api'
 import { sampleFor } from '../fleet'
+import TerminalPane from './TerminalPane.vue'
 
 interface LabTab {
   sid: string
@@ -23,23 +25,64 @@ interface LabTab {
   status: string
 }
 
-interface PingTick {
+interface HostItem {
+  id: string
+  group?: string
+  name?: string
+  host?: string
+}
+
+interface HostsLike {
+  groups: string[]
+  hosts: HostItem[]
+}
+
+interface Series {
+  t: string[]
+  cpu: number[]
+  mem: number[]
   lat: number[]
   loss: number[]
-  t: string[]
+  inject: { atIdx: number; recAt: number; kind: string }[]
 }
 
 const emit = defineEmits<{
   (e: 'close'): void
+  (e: 'enter'): void
   (e: 'command', p: { sid: string; text: string; execute?: boolean }): void
 }>()
 
-const props = defineProps<{ tabs: LabTab[] }>()
+const props = defineProps<{ tabs: LabTab[]; hosts: HostsLike }>()
 
 const connectedTabs = computed(() => props.tabs.filter((t) => t.status === 'connected'))
 
-// --- 目标多选 ---------------------------------------------------------------
-const selected = ref<Set<string>>(new Set(connectedTabs.value.map((t) => t.sid)))
+// --- 分组与主机列表 ----------------------------------------------------------
+/** '' = 全部；组名 = 该组；'__none' = 未分组/临时连接。 */
+const groupSel = ref('')
+const groupOptions = computed(() => {
+  const g = props.hosts.groups.filter(Boolean)
+  return ['', ...g, '__none']
+})
+const groupLabel = (g: string) => (g === '' ? '全部' : g === '__none' ? '未分组' : g)
+const groupOfHost = (id: string | null | undefined): string | null => {
+  if (!id) return null
+  const h = props.hosts.hosts.find((x) => x.id === id)
+  return h ? h.group || '' : null
+}
+const hostIp = (t: LabTab): string => {
+  const h = props.hosts.hosts.find((x) => x.id === t.hostId)
+  return h?.host ?? ''
+}
+const shownTabs = computed(() =>
+  connectedTabs.value.filter((t) => {
+    if (groupSel.value === '') return true
+    const g = groupOfHost(t.hostId) ?? ''
+    return groupSel.value === '__none' ? g === '' : g === groupSel.value
+  })
+)
+
+// --- 目标勾选 ---------------------------------------------------------------
+const selected = ref<Set<string>>(new Set())
 function toggle(sid: string) {
   const s = new Set(selected.value)
   if (s.has(sid)) s.delete(sid)
@@ -47,93 +90,160 @@ function toggle(sid: string) {
   selected.value = s
 }
 function selectAll() {
-  selected.value = new Set(connectedTabs.value.map((t) => t.sid))
+  selected.value = new Set(shownTabs.value.map((t) => t.sid))
 }
 function selectNone() {
   selected.value = new Set()
 }
+function onGroupChange() {
+  selectNone()
+}
 const selTabs = computed(() => connectedTabs.value.filter((t) => selected.value.has(t.sid)))
 
-// --- 实时观测（CPU/内存来自 fleet；时延/丢包 3s 高采） -----------------------
-const pingHist = ref<Record<string, PingTick>>({})
-const pingLast = ref<Record<string, { lat: number | null; loss: number | null; at: number }>>({})
-const lostAlarm = ref<Record<string, boolean>>({})
+// --- 采样数据（3s 一档，窗口 3分/15分/本次） ----------------------------------
+const windowMode = ref<'3m' | '15m' | 'all'>('3m')
+const WINDOW_CAP: Record<string, number> = { '3m': 60, '15m': 300, all: 2400 }
+const series = ref<Record<string, Series>>({})
 let pollTimer: ReturnType<typeof setInterval> | null = null
-let unsetAlarm: ReturnType<typeof setTimeout> | null = null
 
-function sparkPath(vals: number[], w: number, h: number): string {
-  if (!vals.length) return ''
-  const max = Math.max(...vals, 1)
-  const step = w / Math.max(1, vals.length - 1)
-  return vals
-    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - 2 - (h - 6) * (v / max)).toFixed(1)}`)
-    .join(' ')
+function pushSample(sid: string, p: { lat: number | null; loss: number | null }, m?: Metrics) {
+  const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [] })
+  s.t.push(new Date().toTimeString().slice(0, 8))
+  s.cpu.push(+(m?.cpu_pct ?? 0).toFixed(1))
+  s.mem.push(+(m?.mem_pct ?? 0).toFixed(1))
+  s.lat.push(p.lat != null ? +(p.lat.toFixed(2)) : 0)
+  s.loss.push(p.loss != null ? +(p.loss.toFixed(1)) : 0)
+  const cap = WINDOW_CAP[windowMode.value]
+  if (s.t.length > cap) {
+    s.t.shift(); s.cpu.shift(); s.mem.shift(); s.lat.shift(); s.loss.shift()
+  }
+  s.inject.forEach((mk) => (mk.atIdx--))
+  s.inject = s.inject.filter((mk) => mk.atIdx >= 0)
 }
 
 async function tickPing() {
   const targets = selTabs.value
   if (!targets.length) return
-  const jobs = targets.map(async (t) => {
-    try {
-      const p = await api.pingNow(t.sid)
-      if (!p.rtt_avg && !p.loss_pct) return // 网关拿不到：跳过，不画 0 骗人
-      const h = (pingHist.value[t.sid] ??= { lat: [], loss: [], t: [] })
-      h.lat.push(+(p.rtt_avg ?? 0).toFixed(2))
-      h.loss.push(+(p.loss_pct ?? 0).toFixed(1))
-      h.t.push(new Date().toTimeString().slice(0, 8))
-      if (h.lat.length > 60) {
-        h.lat.shift(); h.loss.shift(); h.t.shift()
+  await Promise.allSettled(
+    targets.map(async (t) => {
+      try {
+        const p = await api.pingNow(t.sid)
+        pushSample(t.sid, { lat: p.rtt_avg, loss: p.loss_pct }, sampleFor(t.sid)?.metrics)
+      } catch {
+        /* 单台失败不影响其它 */
       }
-      pingLast.value[t.sid] = { lat: p.rtt_avg, loss: p.loss_pct, at: Date.now() }
-      // 丢包 >0 或时延 >50ms（局域网基准）红闪 3 秒
-      const alertNow = (p.loss_pct ?? 0) > 0 || (p.rtt_avg ?? 0) >= 50
-      if (alertNow) {
-        lostAlarm.value = { ...lostAlarm.value, [t.sid]: true }
-        if (unsetAlarm) clearTimeout(unsetAlarm)
-        unsetAlarm = setTimeout(() => {
-          lostAlarm.value = {}
-        }, 4000)
-      }
-    } catch {
-      /* 单台失败不影响其它台 */
-    }
-  })
-  await Promise.allSettled(jobs)
+    })
+  )
+  await nextTick()
+  updateCharts()
 }
 
-function live(t: LabTab) {
-  return sampleFor(t.sid)?.metrics
-}
-function cpuPct(m?: Metrics): number | null {
-  return m ? m.cpu_pct : null
-}
-function memPct(m?: Metrics): number | null {
-  return m ? m.mem_pct : null
-}
-
-// --- 注入时间线（标记线 + 恢复倒计时） --------------------------------------
-interface InjectMark {
-  atIdx: number
-  recAt: number // epoch ms，0 = 不自动恢复
-  kind: string
-}
-const injectMarks = ref<Record<string, InjectMark>>({})
-const nowTick = ref(Date.now())
-setInterval(() => (nowTick.value = Date.now()), 1000)
-function markInject(sid: string, kind: string, recoverSecs: number) {
-  const h = pingHist.value[sid]
-  injectMarks.value = {
-    ...injectMarks.value,
-    [sid]: { atIdx: h ? h.lat.length : 0, recAt: recoverSecs > 0 ? Date.now() + recoverSecs * 1000 : 0, kind },
+// --- ECharts（同监控平台配置） ------------------------------------------------
+const AXIS = { fontSize: 9 }
+const LEGEND = { top: 0, itemHeight: 8, itemWidth: 12, icon: 'roundRect' }
+function colorOption(p: ReturnType<typeof chartPalette>, colors: string[]) {
+  return {
+    color: colors,
+    textStyle: { color: p.text, fontSize: 10 },
+    axisPointer: { link: [{ xAxisIndex: 'all' }], lineStyle: { color: p.axis } },
   }
 }
-function remainingSec(sid: string): number {
-  const m = injectMarks.value[sid]
-  if (!m || !m.recAt) return 0
-  return Math.max(0, Math.ceil((m.recAt - nowTick.value) / 1000))
+function axisStyle(p: ReturnType<typeof chartPalette>) {
+  return {
+    axisLabel: { color: p.axis, fontSize: 9 },
+    axisLine: { lineStyle: { color: p.split } },
+    splitLine: { lineStyle: { color: p.split } },
+    nameTextStyle: { color: p.axis, fontSize: 9 },
+  }
+}
+const chartEls = ref<Record<string, { cpu?: HTMLDivElement; ping?: HTMLDivElement }>>({})
+const charts = ref<Record<string, { cpu?: echarts.ECharts; ping?: echarts.ECharts }>>({})
+
+function initCpu(el: HTMLDivElement): echarts.ECharts {
+  const p = chartPalette()
+  const c = echarts.init(el)
+  c.setOption({
+    backgroundColor: 'transparent',
+    ...colorOption(p, [p.blue, p.green]),
+    grid: { left: 34, right: 10, top: 24, bottom: 18 },
+    legend: { ...LEGEND, data: ['CPU %', '内存 %'] },
+    tooltip: { trigger: 'axis', valueFormatter: (v: number) => v.toFixed(1) + '%' },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: { type: 'value', min: 0, max: 100, ...axisStyle(p) },
+    series: [['CPU %', p.blue], ['内存 %', p.green]].map(([name, color]) => ({
+      name, type: 'line', data: [], smooth: true, showSymbol: false,
+      lineStyle: { width: 1.5, color }, itemStyle: { color }, areaStyle: { opacity: 0.12, color },
+    })),
+  })
+  return c
 }
 
-// --- 故障注入（复用总览逻辑，目标=勾选） ------------------------------------
+function initPing(el: HTMLDivElement): echarts.ECharts {
+  const p = chartPalette()
+  const c = echarts.init(el)
+  c.setOption({
+    backgroundColor: 'transparent',
+    ...colorOption(p, [p.blue, p.red]),
+    grid: { left: 42, right: 42, top: 24, bottom: 18 },
+    legend: { ...LEGEND, data: ['时延 ms', '丢包 %'] },
+    tooltip: {
+      trigger: 'axis',
+      formatter: (ps: unknown) => {
+        const a = ps as { marker: string; seriesName: string; value: number; axisValue: string }[]
+        const rows = a.map((x) =>
+          x.seriesName === '时延 ms' ? `${x.marker}时延：${(+x.value).toFixed(2)} ms` : `${x.marker}丢包：${(+x.value).toFixed(1)} %`
+        )
+        const inj = (a[0] as unknown as { dataIndex?: number })?.dataIndex ?? -1
+        return (a[0]?.axisValue ?? '') + (inj >= 0 ? '<br/>▲ 注入时刻' : '') + '<br/>' + rows.join('<br/>')
+      },
+    },
+    xAxis: { type: 'category', data: [], axisLabel: AXIS, axisLine: { lineStyle: { color: p.split } } },
+    yAxis: [
+      { type: 'value', name: 'ms', min: 0, ...axisStyle(p) },
+      { type: 'value', name: '%', min: 0, max: 100, ...axisStyle(p), splitLine: { show: false } },
+    ],
+    series: [
+      { name: '时延 ms', type: 'line', data: [], yAxisIndex: 0, smooth: true, showSymbol: false, lineStyle: { width: 1.5, color: p.blue }, itemStyle: { color: p.blue }, areaStyle: { opacity: 0.12, color: p.blue }, markLine: { symbol: 'none', lineStyle: { color: p.yellow, width: 1.3, type: 'dashed' }, label: { show: false }, data: [] } },
+      { name: '丢包 %', type: 'line', data: [], yAxisIndex: 1, smooth: true, showSymbol: false, lineStyle: { width: 1.5, color: p.red, type: 'dashed' }, itemStyle: { color: p.red }, areaStyle: { opacity: 0.1, color: p.red } },
+    ],
+  })
+  return c
+}
+
+function ensureCharts(tabs: LabTab[]) {
+  for (const t of tabs) {
+    if (!charts.value[t.sid]) charts.value[t.sid] = {}
+    const el = chartEls.value[t.sid]
+    if (el?.cpu && !charts.value[t.sid].cpu) charts.value[t.sid].cpu = initCpu(el.cpu)
+    if (el?.ping && !charts.value[t.sid].ping) charts.value[t.sid].ping = initPing(el.ping)
+  }
+}
+
+function updateCharts() {
+  for (const t of selTabs.value) {
+    const s = series.value[t.sid]
+    if (!s) continue
+    const c = charts.value[t.sid]
+    c?.cpu?.setOption({ xAxis: { data: s.t }, series: [{ data: s.cpu }, { data: s.mem }] })
+    const mark = s.inject.map((mk) => ({ xAxis: mk.atIdx }))
+    c?.ping?.setOption({ xAxis: { data: s.t }, series: [{ data: s.lat }, { data: s.loss }, { markLine: { data: mark } }] })
+  }
+}
+
+function setChartRef(sid: string, kind: 'cpu' | 'ping', el: HTMLDivElement | null) {
+  if (!el) return
+  if (!chartEls.value[sid]) chartEls.value[sid] = {}
+  chartEls.value[sid][kind] = el
+  ensureCharts([{ sid } as LabTab])
+}
+
+// --- 注入时间线 --------------------------------------------------------------
+function markInject(sid: string, kind: string, recoverSecs: number) {
+  const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [] })
+  s.inject.push({ atIdx: Math.max(0, s.lat.length - 1), recAt: recoverSecs > 0 ? Date.now() + recoverSecs * 1000 : 0, kind })
+}
+
+// --- 故障注入（目标=勾选，逻辑同 v1） -----------------------------------------
 const injectType = ref<'delay' | 'loss' | 'blip' | 'clear'>('delay')
 const injectDelayMs = ref(200)
 const injectLossPct = ref(50)
@@ -201,12 +311,11 @@ function runInject() {
   }
   const cmd = injectCommand()
   for (const t of targets) emit('command', { sid: t.sid, text: cmd })
-  for (const t of targets) {
-    markInject(t.sid, injectType.value, injectRecover.value ? injectRecoverSecs.value : 0)
-  }
+  for (const t of targets) markInject(t.sid, injectType.value, injectRecover.value ? injectRecoverSecs.value : 0)
   const preview = (cmd.split('\n').find((l) => l.startsWith('tc qdisc')) || cmd.split('\n').pop() || '').slice(0, 60)
   injectConfirm.value = { n: targets.length, cmd, preview, targets: targets.map((t) => ({ sid: t.sid, label: t.label })) }
   injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，选择是否立即执行`
+  void nextTick(() => updateCharts())
 }
 
 function confirmInjectExecute() {
@@ -214,10 +323,10 @@ function confirmInjectExecute() {
   if (!c) return
   for (const t of c.targets) emit('command', { sid: t.sid, text: c.cmd, execute: true })
   injectConfirm.value = null
-  injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 观察上方实时卡`
+  injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 观察底部趋势图`
 }
 
-// --- 命令/脚本就地执行 ------------------------------------------------------
+// --- 命令/脚本就地执行 --------------------------------------------------------
 const execCmd = ref('')
 const execTimeout = ref(60)
 const execBusy = ref(false)
@@ -228,10 +337,7 @@ function runExecSubmit() {
   const cmd = (execCmd.value ?? '').trim()
   if (!cmd) return
   const n = selTabs.value.length
-  if (!n) {
-    execResults.value = { err: { sid: '', ok: false, stdout: '', exit: -1, elapsed_ms: 0, error: '还没有勾选已连接的主机' } as LabExec }
-    return
-  }
+  if (!n) return
   execConfirm.value = { n, preview: cmd.split('\n')[0].slice(0, 80) }
 }
 
@@ -243,36 +349,94 @@ async function runExec() {
   if (!targets.length) return
   execBusy.value = true
   const results: Record<string, LabExec> = {}
-  const started: Record<string, { label: string }> = {}
-  for (const t of targets) started[t.sid] = { label: t.label }
   await Promise.allSettled(
     targets.map(async (t) => {
       try {
-        const r = await api.execBatch(t.sid, execCmd.value.trim(), execTimeout.value)
-        results[t.sid] = r
+        results[t.sid] = await api.execBatch(t.sid, execCmd.value.trim(), execTimeout.value)
       } catch (e) {
         results[t.sid] = { sid: t.sid, ok: false, stdout: '', exit: -1, elapsed_ms: 0, error: String(e) }
       }
     })
   )
-  execResults.value = { ...started, ...results } as unknown as Record<string, LabExec>
+  execResults.value = results
   execBusy.value = false
 }
 
-function execOut(t: LabTab): LabExec | undefined {
-  const r = execResults.value[t.sid]
-  if (!r || r.sid === '') return undefined
-  if (r.ok === undefined) return r // 占位（运行中）
-  return r
+// --- 导出（采样 CSV + 注入事件 CSV，复用后端落盘） ------------------------------
+const exportMsg = ref('')
+async function exportCsvs() {
+  const targets = selTabs.value
+  if (!targets.length) {
+    exportMsg.value = '失败：还没有勾选主机'
+    return
+  }
+  try {
+    const ts = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')
+    // 采样 CSV
+    const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`
+    const head = ['host', 'time', 'cpu_pct', 'mem_pct', 'latency_ms', 'loss_pct', 'inject_kind'].join(',')
+    const rows: string[] = [head]
+    const evRows: string[] = ['host,time,event,kind,recover_at']
+    for (const t of targets) {
+      const s = series.value[t.sid]
+      if (!s) continue
+      const label = t.label
+      // 事件 CSV（闪断/注入开始/恢复）
+      s.inject.forEach((mk, idx) => {
+        const tStr = s.t[mk.atIdx] ?? ''
+        evRows.push([esc(label), esc(tStr), 'inject', esc(mk.kind), mk.recAt ? esc(new Date(mk.recAt).toTimeString().slice(0, 8)) : ''].join(','))
+        void idx
+      })
+      for (let j = 0; j < s.t.length; j++) {
+        const kindAt = s.inject.find((mk) => mk.atIdx === j)?.kind ?? ''
+        rows.push([esc(label), esc(s.t[j]), s.cpu[j], s.mem[j], s.lat[j], s.loss[j], esc(kindAt)].join(','))
+      }
+    }
+    const bom = String.fromCharCode(0xfeff)
+    const sampleR = await api.exportCsvText(`lab-${ts}-samples.csv`, bom + rows.join(String.fromCharCode(13, 10)), 'lab')
+    const eventR = await api.exportCsvText(`lab-${ts}-events.csv`, bom + evRows.join(String.fromCharCode(13, 10)), 'lab')
+    exportMsg.value = `已导出 ${targets.length} 台：${sampleR.path} / ${eventR.path}`
+  } catch (e) {
+    exportMsg.value = `导出失败：${String(e)}`
+  }
 }
 
+// --- 终端展开（双击主机行） ----------------------------------------------------
+const openTerm = ref<Set<string>>(new Set())
+function toggleTerm(sid: string) {
+  const s = new Set(openTerm.value)
+  if (s.has(sid)) s.delete(sid)
+  else s.add(sid)
+  openTerm.value = s
+}
+
+watch(themeVersion, () => {
+  Object.values(charts.value).forEach((c) => {
+    c.cpu?.dispose?.()
+    c.ping?.dispose?.()
+  })
+  charts.value = {}
+  void nextTick(() => ensureCharts(selTabs.value))
+})
+
+watch(windowMode, () => {
+  for (const sid of Object.keys(series.value)) {
+    const s = series.value[sid]
+    const cap = WINDOW_CAP[windowMode.value]
+    while (s.t.length > cap) {
+      s.t.shift(); s.cpu.shift(); s.mem.shift(); s.lat.shift(); s.loss.shift()
+    }
+  }
+  void nextTick(() => updateCharts())
+})
+
 onMounted(() => {
+  emit('enter')
   pollTimer = setInterval(() => void tickPing(), 3000)
   void tickPing()
 })
 onBeforeUnmount(() => {
   if (pollTimer) clearInterval(pollTimer)
-  if (unsetAlarm) clearTimeout(unsetAlarm)
 })
 </script>
 
@@ -281,84 +445,53 @@ onBeforeUnmount(() => {
     <div class="lab panel">
       <div class="head">
         <span class="title">故障演练台</span>
-        <span class="sub">目标多选 · CPU/内存实时 · 时延/丢包 3s 高采 · 注入/执行全程不跳页</span>
+        <select v-model="groupSel" class="sel" @change="onGroupChange" title="分组">
+          <option v-for="g in groupOptions" :key="g" :value="g">{{ groupLabel(g) }}</option>
+        </select>
+        <span class="dim">已选 {{ selTabs.length }}/{{ shownTabs.length }} 台</span>
         <span class="spacer"></span>
-        <span class="dim">已选 {{ selTabs.length }}/{{ connectedTabs.length }} 台</span>
         <button class="btn ghost" @click="selectAll">全选</button>
         <button class="btn ghost" @click="selectNone">清空</button>
+        <button class="btn ghost" @click="exportCsvs" :disabled="!selTabs.length" title="导出勾选主机的采样数据 + 注入事件，两份 CSV">导出 CSV</button>
         <button class="btn ghost" @click="emit('close')">关闭</button>
       </div>
 
-      <div class="pick-row">
-        <label v-for="t in connectedTabs" :key="t.sid" class="pick" :class="{ on: selected.has(t.sid) }">
-          <input type="checkbox" :checked="selected.has(t.sid)" @change="toggle(t.sid)" />
-          {{ t.label }}
-        </label>
-        <span v-if="!connectedTabs.length" class="dim">还没有连接的主机 —— 先双击左侧主机建立会话</span>
-      </div>
-
-      <!-- 实时卡 -->
-      <div v-if="selTabs.length" class="grid">
-        <div
-          v-for="t in selTabs"
-          :key="t.sid"
-          class="lab-card"
-          :class="{ alarm: lostAlarm[t.sid] }"
-        >
-          <div class="c-head">
-            <span class="c-name" :title="t.sid">{{ t.label }}</span>
-            <span v-if="remainingSec(t.sid)" class="badge hot" :title="injectMarks[t.sid].kind + ' 注入中'">
-              注入中 · {{ remainingSec(t.sid) }}s
-            </span>
-          </div>
-          <div class="c-row">
-            <span class="c-k">CPU</span>
-            <span class="c-v" :class="{ hot: (cpuPct(live(t)) ?? 0) > 85 }">{{ (cpuPct(live(t)) ?? 0).toFixed(1) }}%</span>
-          </div>
-          <div class="c-row">
-            <span class="c-k">内存</span>
-            <span class="c-v" :class="{ hot: (memPct(live(t)) ?? 0) > 90 }">{{ (memPct(live(t)) ?? 0).toFixed(1) }}%</span>
-          </div>
-          <div class="c-row">
-            <span class="c-k">时延</span>
-            <span class="c-v" :class="{ hot: (pingLast[t.sid]?.lat ?? 0) >= 50 }">
-              {{ pingLast[t.sid]?.lat != null ? pingLast[t.sid]!.lat!.toFixed(2) + ' ms' : '—' }}
-            </span>
-            <span class="c-k">丢包</span>
-            <span class="c-v" :class="{ hot: (pingLast[t.sid]?.loss ?? 0) > 0 }">
-              {{ pingLast[t.sid]?.loss != null ? pingLast[t.sid]!.loss!.toFixed(1) + '%' : '—' }}
-            </span>
-          </div>
-          <svg
-            v-if="pingHist[t.sid]?.lat.length"
-            viewBox="0 0 240 34"
-            preserveAspectRatio="none"
-            width="100%"
-            height="34"
-            class="lab-spark"
-          >
-            <line
-              v-if="injectMarks[t.sid]"
-              :x1="injectMarks[t.sid].atIdx * (240 / Math.max(1, pingHist[t.sid].lat.length - 1))"
-              :x2="injectMarks[t.sid].atIdx * (240 / Math.max(1, pingHist[t.sid].lat.length - 1))"
-              y1="0"
-              y2="34"
-              stroke="var(--ctp-yellow)"
-              stroke-width="1.4"
-              stroke-dasharray="2 2"
-            />
-            <path :d="sparkPath(pingHist[t.sid]?.lat ?? [], 240, 34)" fill="none" stroke="var(--ctp-sky)" stroke-width="1.4" />
-            <path
-              :d="sparkPath(pingHist[t.sid]?.loss ?? [], 240, 34)"
-              fill="none"
-              stroke="var(--ctp-red)"
-              stroke-width="1.4"
-              stroke-dasharray="1 3"
-            />
-          </svg>
-          <div class="c-foot dim">蓝实=时延 · 红点=丢包 · 黄虚线=注入时刻</div>
+      <!-- 主机列表：名称 + IP，双击展开/收起该主机终端 -->
+      <div class="host-list">
+        <div v-for="t in shownTabs" :key="t.sid" class="h-row" :class="{ on: selected.has(t.sid) }">
+          <label class="check"><input type="checkbox" :checked="selected.has(t.sid)" @change="toggle(t.sid)" /></label>
+          <span class="h-name" :title="t.sid" @dblclick="toggleTerm(t.sid)">{{ t.label }}</span>
+          <span class="h-ip dim">{{ hostIp(t) || '临时连接' }}</span>
+          <span class="h-stat" :class="{ conn: t.status === 'connected' }">{{ t.status === 'connected' ? '● 在线' : '—' }}</span>
+          <button class="btn ghost mini" @click="toggleTerm(t.sid)" :title="openTerm.has(t.sid) ? '收起终端' : '展开该主机终端（双击名称也行）'">
+            {{ openTerm.has(t.sid) ? '收起终端' : '终端 ▸' }}
+          </button>
+        </div>
+        <div v-if="!shownTabs.length" class="dim empty">该分组下没有已连接的主机 —— 先双击左侧主机建立会话</div>
+        <div v-if="openTerm.size" class="term-zone">
+          <TerminalPane v-for="sid in [...openTerm]" :key="sid" :sid="sid" :active="true" />
         </div>
       </div>
+
+      <!-- 底部趋势图：每台两块 ECharts -->
+      <template v-if="selTabs.length">
+        <div class="sec-title">
+          实时趋势 <span class="dim">· 3s 采样 | 注入在图中画黄虚线标记</span>
+          <span class="seg">
+            <button :class="{ on: windowMode === '3m' }" @click="windowMode = '3m'">近3分</button>
+            <button :class="{ on: windowMode === '15m' }" @click="windowMode = '15m'">近15分</button>
+            <button :class="{ on: windowMode === 'all' }" @click="windowMode = 'all'">本次</button>
+          </span>
+        </div>
+        <div class="charts">
+          <div v-for="t in selTabs" :key="t.sid" class="chart-card">
+            <div class="chart-title">{{ t.label }} <span class="dim">{{ hostIp(t) }}</span></div>
+            <div class="chart-box" :ref="(el) => setChartRef(t.sid, 'cpu', el as HTMLDivElement | null)"></div>
+            <div class="chart-box" :ref="(el) => setChartRef(t.sid, 'ping', el as HTMLDivElement | null)"></div>
+          </div>
+        </div>
+      </template>
+      <div v-else class="dim empty">勾选主机后，这里显示每台的 CPU/内存 与 时延/丢包 趋势图</div>
 
       <!-- 故障注入 -->
       <div class="section">
@@ -374,15 +507,16 @@ onBeforeUnmount(() => {
           <input v-model.number="injectBlipOn" class="num" style="width: 54px" />s 断
           <input v-model.number="injectBlipOff" class="num" style="width: 54px" />s 恢复 ×
           <input v-model.number="injectBlipN" class="num" style="width: 42px" />
+          <label class="check"><input type="radio" value="clear" v-model="injectType" /> 清除</label>
         </div>
         <div class="inj-row">
           <span class="dim">网卡</span>
-          <label class="check"><input type="radio" value="auto" v-model="injectNicMode" /> 自动（各台探测默认路由出口）</label>
+          <label class="check"><input type="radio" value="auto" v-model="injectNicMode" /> 自动</label>
           <label class="check"><input type="radio" value="manual" v-model="injectNicMode" /> 手动</label>
           <input v-if="injectNicMode === 'manual'" v-model="injectNic" class="num" style="width: 96px" />
           <label class="check"><input type="checkbox" v-model="injectRecover" /> 到期自动恢复</label>
           <input v-model.number="injectRecoverSecs" class="num" style="width: 60px" :disabled="!injectRecover" />
-          <span class="dim">秒（期间该终端被占住，可 Ctrl+C 后用「清除」恢复）</span>
+          <span class="dim">秒</span>
         </div>
         <div class="inj-row">
           <button class="btn" :disabled="!selTabs.length" @click="runInject">生成并填入终端（{{ selTabs.length }} 台）</button>
@@ -390,26 +524,21 @@ onBeforeUnmount(() => {
             <div class="inj-confirm">
               <span class="dim">将执行：<code>{{ injectConfirm.preview }}</code></span>
               <button class="btn danger" @click="confirmInjectExecute">⚠ 立即执行（{{ injectConfirm.n }} 台）</button>
-              <button class="btn ghost" style="margin-left: 6px" @click="injectConfirm = null">仅等待，我自己回车</button>
+              <button class="btn ghost" style="margin-left: 6px" @click="injectConfirm = null">仅等待</button>
             </div>
           </template>
           <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
         </div>
       </div>
 
-      <!-- 命令 / 脚本就地执行 -->
+      <!-- 命令/脚本就地执行 -->
       <div class="section">
         <div class="sec-title">
           命令 / 脚本就地执行
-          <span class="dim">（目标=上方勾选 · 并行 only-read 通道 · 交互式命令请去终端页 · 执行前确认一次）</span>
+          <span class="dim">（目标=勾选 · only-read 通道 · 交互命令走列表里展开的终端）</span>
         </div>
-        <textarea
-          v-model="execCmd"
-          class="exec-input"
-          rows="3"
-          spellcheck="false"
-          placeholder="例如：uptime&#10;也支持多行脚本：&#10;for i in $(seq 1 3); do echo tick $i; sleep 1; done"
-        ></textarea>
+        <textarea v-model="execCmd" class="exec-input" rows="3" spellcheck="false"
+          placeholder="例如：uptime&#10;多行脚本也行：&#10;for i in 1 2 3; do echo tick $i; sleep 1; done"></textarea>
         <div class="inj-row">
           <span class="dim">超时</span>
           <input v-model.number="execTimeout" class="num" style="width: 60px" />
@@ -424,46 +553,49 @@ onBeforeUnmount(() => {
           <button class="btn ghost" style="margin-left: 6px" @click="execConfirm = null">取消</button>
         </div>
         <div v-if="Object.keys(execResults).length" class="exec-outs">
-          <div v-for="t in selTabs" :key="t.sid" class="exec-out" v-show="execOut(t)">
+          <div v-for="t in selTabs" :key="t.sid" class="exec-out">
             <div class="eo-head">
               <span class="eo-host">{{ t.label }}</span>
-              <span v-if="execOut(t)?.ok !== undefined" class="eo-meta" :class="{ ok: execOut(t)?.ok, bad: !execOut(t)?.ok }">
-                {{ execOut(t)?.ok ? 'exit ' + execOut(t)?.exit : '失败' }}
-                · {{ execOut(t)?.elapsed_ms }}ms
+              <span v-if="execResults[t.sid]" class="eo-meta" :class="{ ok: execResults[t.sid]?.ok, bad: !execResults[t.sid]?.ok }">
+                {{ execResults[t.sid]?.ok ? 'exit ' + execResults[t.sid]?.exit : '失败' }} · {{ execResults[t.sid]?.elapsed_ms }}ms
               </span>
             </div>
-            <pre v-if="execOut(t)?.stdout" class="eo-out">{{ execOut(t)?.stdout }}</pre>
-            <div v-if="execOut(t)?.error" class="eo-err">{{ execOut(t)?.error }}</div>
+            <pre v-if="execResults[t.sid]?.stdout" class="eo-out">{{ execResults[t.sid]?.stdout }}</pre>
+            <div v-if="execResults[t.sid]?.error" class="eo-err">{{ execResults[t.sid]?.error }}</div>
           </div>
         </div>
+        <div v-if="exportMsg" class="dim" :class="{ err: exportMsg.startsWith('失败') }">{{ exportMsg }}</div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.lab { width: min(1080px, 94vw); max-height: 92vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
-.head { display: flex; align-items: center; gap: 10px; }
+.lab { width: min(1240px, 95vw); max-height: 94vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .head .spacer { flex: 1; }
 .title { font-weight: 700; font-size: 15px; }
-.sub { font-size: 11px; color: var(--ctp-overlay0); }
-.pick-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.pick { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--ctp-surface0); border-radius: 14px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
-.pick.on { border-color: var(--ctp-blue); color: var(--ctp-blue); }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
-.lab-card { border: 1px solid var(--ctp-surface0); border-radius: 8px; padding: 8px 10px; }
-.lab-card.alarm { border-color: var(--ctp-red); box-shadow: 0 0 0 1px var(--ctp-red); }
-.c-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.c-name { font-weight: 600; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.badge.hot { background: var(--ctp-red); color: var(--on-accent); border-radius: 10px; padding: 1px 8px; font-size: 10.5px; }
-.c-row { display: flex; align-items: baseline; gap: 8px; margin-top: 3px; white-space: nowrap; }
-.c-k { color: var(--ctp-overlay0); font-size: 11px; min-width: 30px; }
-.c-v { font-weight: 600; font-size: 13px; font-variant-numeric: tabular-nums; }
-.c-v.hot { color: var(--ctp-red); }
-.lab-spark { display: block; margin-top: 4px; background: var(--ctp-mantle); border-radius: 4px; }
-.c-foot { font-size: 10px; margin-top: 2px; }
+.sel { background: var(--ctp-mantle); border: 1px solid var(--ctp-surface0); border-radius: 6px; color: var(--ctp-text); padding: 3px 6px; font-size: 12px; }
+.host-list { border: 1px solid var(--ctp-surface0); border-radius: 8px; padding: 6px 8px; }
+.h-row { display: flex; align-items: center; gap: 10px; padding: 3px 6px; border-radius: 6px; }
+.h-row.on { background: var(--ctp-surface0); }
+.h-name { font-weight: 600; font-size: 12.5px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.h-ip { font-size: 11px; }
+.h-stat { font-size: 11px; color: var(--ctp-overlay0); }
+.h-stat.conn { color: var(--ctp-green); }
+.btn.mini { padding: 1px 8px; font-size: 11px; }
+.term-zone { margin-top: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 8px; }
+.term-zone :deep(.term-wrap) { border: 1px solid var(--ctp-surface0); border-radius: 6px; height: 260px; }
+.empty { padding: 8px 4px; }
+.sec-title { font-weight: 600; display: flex; align-items: center; gap: 10px; margin: 4px 0 6px; }
+.seg { display: inline-flex; border: 1px solid var(--ctp-surface0); border-radius: 6px; overflow: hidden; margin-left: auto; }
+.seg button { background: transparent; border: none; color: var(--ctp-subtext0); font-size: 11px; padding: 3px 10px; cursor: pointer; }
+.seg button.on { background: var(--ctp-blue); color: var(--on-accent); }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 10px; }
+.chart-card { border: 1px solid var(--ctp-surface0); border-radius: 8px; padding: 8px; }
+.chart-title { font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+.chart-box { height: 130px; width: 100%; }
 .section { border-top: 1px solid var(--ctp-surface0); padding-top: 8px; }
-.sec-title { font-weight: 600; margin-bottom: 6px; }
 .inj-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 6px; }
 .inj-row .num { width: 64px; }
 .inj-confirm { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
