@@ -8,6 +8,7 @@
  * a monitoring view that hides the age of its numbers is worse than no view.
  */
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { listen } from '@tauri-apps/api/event'
 import { api, type Alert, type HistoryHost, type HistoryRange, type HostsFile, type Metrics, type PingRange } from '../api'
 import { alertFor, fleetNow, sampleFor } from '../fleet'
 
@@ -29,7 +30,7 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'focus', sid: string): void
   (e: 'connect', hostId: string): void
-  (e: 'command', p: { sid: string; text: string }): void
+  (e: 'command', p: { sid: string; text: string; execute?: boolean }): void
 }>()
 
 // --- 故障注入（#12）--------------------------------------------------------
@@ -45,9 +46,28 @@ const injectBlipEvery = ref(10)
 const injectBlipDur = ref(3)
 const injectBlipTimes = ref(3)
 const injectNic = ref('eth0')
+/** 网卡来源：auto=各台自动探测默认路由出口接口（多台网卡名不同也兼容）；manual=统一手动指定。 */
+const injectNicMode = ref<'auto' | 'manual'>('auto')
 const injectRecover = ref(false)
 const injectRecoverSecs = ref(120)
 const injectMsg = ref('')
+/** 已填入后的确认状态：null=无；非 null=在等用户选「立即执行」还是「仅等待」。 */
+const injectConfirm = ref<{ n: number; cmd: string; preview: string; targets: { sid: string; label: string }[] } | null>(null)
+/** 实时趋势窗口（按 sid，60 点上限）：CPU/内存来自 ssh://metrics（约 1s 一档），
+ *  时延/丢包来自 ssh://ping（15s 一档，采不到网关整次跳过，不画 0 骗人）。 */
+interface LiveTrend { cpu: number[]; mem: number[]; lat: number[]; loss: number[] }
+const liveTrend = ref<Record<string, LiveTrend>>({})
+let unLiveMet: (() => void) | null = null
+let unLivePing: (() => void) | null = null
+function pushLive(sid: string, k: keyof LiveTrend, v: number) {
+  let h = liveTrend.value[sid]
+  if (!h) { h = { cpu: [], mem: [], lat: [], loss: [] }; liveTrend.value[sid] = h }
+  h[k].push(Number.isFinite(v) ? v : 0)
+  if (h[k].length > 60) h[k].shift()
+}
+function liveFor(sid?: string): LiveTrend | undefined {
+  return sid ? liveTrend.value[sid] : undefined
+}
 
 const connectedTabs = computed(() => props.tabs.filter((t) => t.status === 'connected'))
 const connectedCount = computed(() => connectedTabs.value.length)
@@ -66,37 +86,59 @@ const injectCanRun = computed(
 )
 
 function injectCommand(): string {
-  const nic = injectNic.value.trim() || 'eth0'
+  const setup = ifaceSetup()
   const head =
-    '# 故障注入（SSHBox 生成）· 回车由你执行；需要 root；网卡名先用 `ip link` 确认'
+    '# 故障注入（SSHBox 生成）· 回车由你执行；需要 root' +
+    (injectNicMode.value === 'auto'
+      ? '；网卡自动探测（各台默认路由出口，多台网卡不同也兼容）'
+      : '；网卡手动指定')
   if (injectType.value === 'clear') {
     return [
       head,
-      `tc qdisc del dev ${nic} root 2>/dev/null; echo '已清除（原本没有规则则无输出）'; tc qdisc show dev ${nic} || true`,
+      ...setup,
+      `tc qdisc del dev "$IFACE" root 2>/dev/null; echo '已清除（原本没有规则则无输出）'; tc qdisc show dev "$IFACE" || true`,
     ].join('\n')
   }
   if (injectType.value === 'delay') {
     const ms = Math.max(1, Math.round(injectMs.value || 1))
-    const rule = `delay ${ms}ms`
-    return [head, netemLine(nic, rule)].join('\n')
+    return [head, ...setup, netemLine(`"$IFACE"`, `delay ${ms}ms`)].join('\n')
   }
   if (injectType.value === 'loss') {
     const p = Math.min(100, Math.max(1, Math.round(injectLoss.value || 1)))
-    return [head, netemLine(nic, `loss ${p}%`)].join('\n')
+    return [head, ...setup, netemLine(`"$IFACE"`, `loss ${p}%`)].join('\n')
   }
   const every = Math.max(1, Math.round(injectBlipEvery.value || 1))
   const dur = Math.max(1, Math.round(injectBlipDur.value || 1))
   const times = Math.max(1, Math.round(injectBlipTimes.value || 1))
   return [
     head,
+    ...setup,
     `for i in $(seq 1 ${times}); do`,
-    `  tc qdisc replace dev ${nic} root netem loss 100%`,
+    `  tc qdisc replace dev "$IFACE" root netem loss 100%`,
     `  sleep ${dur}`,
-    `  tc qdisc del dev ${nic} root 2>/dev/null`,
+    `  tc qdisc del dev "$IFACE" root 2>/dev/null`,
     `  [ $i -lt ${times} ] && sleep ${every}`,
     `done`,
-    `echo '闪断注入完成，网络已恢复'; tc qdisc show dev ${nic} || true`,
+    `echo '闪断注入完成，网络已恢复'; tc qdisc show dev "$IFACE" || true`,
   ].join('\n')
+}
+
+/** 网卡变量的初始化：自动=探测默认路由出口（`ip route` 的第一条 default 的 dev 字段）；
+ *  手动=固定值并先验证网卡存在。多台主机各跑各的探测，网卡不同也各自正确。 */
+function ifaceSetup(): string[] {
+  const manual = injectNicMode.value === 'manual' ? injectNic.value.trim() : ''
+  if (manual) {
+    return [
+      `IFACE=${manual}`,
+      `ip link show "$IFACE" >/dev/null 2>&1 || { echo "网卡不存在（${manual}），中止"; exit 1; }`,
+      `echo "注入接口: $IFACE"`,
+    ]
+  }
+  return [
+    `IFACE=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')`,
+    `[ -n "$IFACE" ] || { echo "未找到默认路由出接口（该主机没有默认路由？），中止"; exit 1; }`,
+    `echo "注入接口: $IFACE"`,
+  ]
 }
 
 function netemLine(nic: string, rule: string): string {
@@ -120,11 +162,24 @@ function runInject() {
     return
   }
   const cmd = injectCommand()
-  for (const t of targets) {
-    emit('command', { sid: t.sid, text: cmd })
+    for (const t of targets) {
+      emit('command', { sid: t.sid, text: cmd })
+    }
+    const preview = (cmd.split('\n').find((l) => l.startsWith('tc qdisc')) || cmd.split('\n').pop() || '').slice(0, 60)
+    injectConfirm.value = { n: targets.length, cmd, preview, targets: targets.map((t) => ({ sid: t.sid, label: t.label })) }
+    injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，选择是否立即执行`
   }
-  injectMsg.value = `已把命令填入 ${targets.length} 台主机的终端，回车由你按`
-}
+
+  /** 「立即执行」：向每台目标终端写命令+回车自动执行；不切标签，总览停留。 */
+  function confirmExecute() {
+    const c = injectConfirm.value
+    if (!c) return
+    for (const t of c.targets) {
+      emit('command', { sid: t.sid, text: c.cmd, execute: true })
+    }
+    injectConfirm.value = null
+    injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 切「卡片」视图看实时趋势观察效果`
+  }
 
 type Freshness = 'fresh' | 'stale' | 'dead' | 'unknown'
 
@@ -507,9 +562,24 @@ onMounted(async () => {
   await loadHistory()
   // Offline numbers drift, so refresh them while the panel is open.
   timer = setInterval(() => void loadHistory(), 30000)
+  // 实时趋势（卡片视图 4 线）：每台会话自己的事件流，按 sid 入窗。
+  unLiveMet = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
+    const m = e.payload.metrics
+    pushLive(e.payload.sid, 'cpu', m.cpu_pct)
+        pushLive(e.payload.sid, 'mem', m.mem_pct)
+  })
+  unLivePing = await listen<{ sid: string; ping: { rtt_avg: number; loss_pct: number } | null }>('ssh://ping', (e) => {
+      if (e.payload.ping) {
+        pushLive(e.payload.sid, 'lat', +e.payload.ping.rtt_avg.toFixed(2))
+        pushLive(e.payload.sid, 'loss', +e.payload.ping.loss_pct.toFixed(1))
+      }
+    })
 })
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
+  unLiveMet?.()
+  unLivePing?.()
+  unLiveMet = unLivePing = null
 })
 </script>
 
@@ -603,10 +673,19 @@ onBeforeUnmount(() => {
             <div class="track"><div class="fill" :class="barClass(worstDisk(r.metrics))" :style="{ width: Math.min(100, worstDisk(r.metrics) ?? 0) + '%' }"></div></div>
             <span class="v">{{ fmtPct(worstDisk(r.metrics)) }}</span>
           </div>
-          <div class="card-net dim">
-            <span v-if="r.metrics">↓ {{ fmtBytes(netTotals(r.metrics).rx) }} ↑ {{ fmtBytes(netTotals(r.metrics).tx) }} · 负载 {{ r.metrics.load?.[0]?.toFixed(2) ?? '—' }} · 进程 {{ r.metrics.proc_total }}</span>
-            <span v-else>—</span>
-          </div>
+                    <div v-if="liveFor(r.sid)" class="card-spark">
+                      <svg viewBox="0 0 220 30" preserveAspectRatio="none" width="100%" height="30">
+                        <path :d="sparkPath(liveFor(r.sid)!.cpu, 220, 30)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.4" />
+                        <path :d="sparkPath(liveFor(r.sid)!.mem, 220, 30)" fill="none" stroke="var(--ctp-green)" stroke-width="1.4" stroke-dasharray="3 2" />
+                        <path :d="sparkPath(liveFor(r.sid)!.lat, 220, 30)" fill="none" stroke="var(--ctp-sky)" stroke-width="1.4" />
+                        <path :d="sparkPath(liveFor(r.sid)!.loss, 220, 30)" fill="none" stroke="var(--ctp-red)" stroke-width="1.4" stroke-dasharray="1 3" />
+                      </svg>
+                      <div class="card-legend dim">实时趋势：CPU ─· 内存 ─· 时延 ─ 丢包% ··（60 点窗口）</div>
+                    </div>
+                    <div class="card-net dim">
+                      <span v-if="r.metrics">↓ {{ fmtBytes(netTotals(r.metrics).rx) }} ↑ {{ fmtBytes(netTotals(r.metrics).tx) }} · 负载 {{ r.metrics.load?.[0]?.toFixed(2) ?? '—' }} · 进程 {{ r.metrics.proc_total }}</span>
+                      <span v-else>—</span>
+                    </div>
           <div class="acts">
             <button v-if="r.sid" class="btn" @click="emit('focus', r.sid!)">切到</button>
             <button v-else-if="r.hostId" class="btn" @click="emit('connect', r.hostId!)">连接</button>
@@ -770,8 +849,10 @@ onBeforeUnmount(() => {
                               <label class="check"><input type="radio" value="clear" v-model="injectType" /> 清除规则</label>
                             </div>
                             <div class="inject-row">
-                              <span class="inj-label">网卡</span>
-                              <input v-model="injectNic" class="num" style="width: 96px" />
+                                            <span class="inj-label">网卡</span>
+                                            <label class="check"><input type="radio" value="auto" v-model="injectNicMode" /> 自动（各台探测默认路由出口）</label>
+                                            <label class="check"><input type="radio" value="manual" v-model="injectNicMode" /> 手动</label>
+                                            <input v-if="injectNicMode === 'manual'" v-model="injectNic" class="num" style="width: 96px" />
                               <template v-if="injectType === 'delay' || injectType === 'loss'">
                                 <label class="check"><input type="checkbox" v-model="injectRecover" /> 到期自动恢复</label>
                                 <input v-if="injectRecover" v-model.number="injectRecoverSecs" type="number" min="1" class="num" /> 秒后清除
@@ -779,7 +860,14 @@ onBeforeUnmount(() => {
                             </div>
                             <div class="inject-row">
                               <button class="btn" :disabled="!injectCanRun" @click="runInject">生成并填入终端（{{ injectTargetCount }} 台）</button>
-                              <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
+                                                            <template v-if="injectConfirm">
+                                                              <div class="inject-confirm">
+                                                                <div class="dim">将执行：<code>{{ injectConfirm.preview }}</code></div>
+                                                                <button class="btn danger" @click="confirmExecute">⚠ 立即执行（{{ injectConfirm.n }} 台）</button>
+                                                                <button class="btn ghost" style="margin-left:6px" @click="injectConfirm = null">仅等待，我自己回车</button>
+                                                              </div>
+                                                            </template>
+                                                            <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
                             </div>
                           </div>
               </div>
@@ -873,6 +961,12 @@ onBeforeUnmount(() => {
 .hist-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .hist-title { font-weight: 600; }
 .inject { border-top: 1px solid var(--ctp-surface0); margin-top: 12px; padding-top: 8px; }
+.inject-confirm { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.inject-confirm code { background: var(--ctp-mantle); padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+.inject-confirm .danger { background: var(--ctp-red); color: var(--on-accent); border: none; font-weight: 600; }
+.card-spark { margin-top: 6px; }
+.card-spark svg { display: block; background: var(--ctp-mantle); border-radius: 6px; }
+.card-legend { font-size: 10px; margin-top: 2px; }
 .inject-head { margin-bottom: 4px; }
 .inject-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
 .inject-row .num { width: 64px; }

@@ -303,29 +303,35 @@ function askCommandFromSelection() {
 /** 把 AI 生成的命令填进终端 —— **不自动回车**，由用户确认。
  *
  * 命令是给某一台主机生成的（`sid`），所以优先填回那个会话并切到它的标签：
- * 用户在别的标签上双击历史里的命令时，不该把 A 机的命令贴到 B 机。 */
-function insertToTerminal(p: { text: string; sid?: string }) {
-  const body = (p.text ?? '').trim()
-  if (!body) return
-  const want = (p.sid ?? '').trim()
-  let tab = activeTab.value
-  if (want && tab?.sid !== want) {
-    const target = tabs.value.find((t) => t.sid === want)
-    if (!target) {
-      toast('error', '生成这条命令的会话已关闭，没有填入终端')
-      return
-    }
-    focusTab(want)
-    tab = target
-  }
-  if (!tab) {
-    // 之前这里静默 return：用户点了「插入终端」什么也没发生，看起来就是功能坏了。
-    toast('error', '还没有连接的主机 —— 先双击左侧主机建立会话，再插入命令')
-    return
-  }
-  void api.termWrite(tab.sid, body)
-  toast('info', `命令已填入 ${tab.label}，确认后按回车执行`)
-}
+  * 用户在别的标签上双击历史里的命令时，不该把 A 机的命令贴到 B 机。
+  * `execute: true`（总览故障注入的「立即执行」）：不切标签，直接向该会话
+  * pty 写入命令 + 回车 —— 自动执行，界面停留在总览。 */
+ function insertToTerminal(p: { text: string; sid?: string; execute?: boolean }) {
+   const body = (p.text ?? '').trim()
+   if (!body) return
+   const want = (p.sid ?? '').trim()
+   let tab = activeTab.value
+   if (want && tab?.sid !== want) {
+     const target = tabs.value.find((t) => t.sid === want)
+     if (!target) {
+       toast('error', '生成这条命令的会话已关闭，没有填入终端')
+       return
+     }
+     tab = target
+     if (!p.execute) focusTab(want)
+   }
+   if (!tab) {
+     toast('error', '还没有连接的主机 —— 先双击左侧主机建立会话，再插入命令')
+     return
+   }
+   if (p.execute) {
+     void api.termWrite(tab.sid, body + '\n')
+     toast('info', `已执行：${body.split('\n').pop()?.slice(0, 40)}`)
+   } else {
+       void api.termWrite(tab.sid, body)
+       toast('info', `命令已填入 ${tab.label}，确认后按回车执行`)
+     }
+   }
 
 /** 一键巡检报告。hours: 1/24/168，默认 24。 */
 async function makeReport(hours = reportHours.value) {
