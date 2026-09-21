@@ -5,6 +5,7 @@ mod commands;
 mod forward;
 mod history;
 mod hostkey;
+mod lab;
 mod localfs;
 mod monitor;
 mod report;
@@ -39,7 +40,10 @@ pub fn run() {
             ssh::monitor_restart,
             ssh::monitor_set_paused,
             ssh::monitor_paused,
-            ssh::monitor_sample_now,
+                        ssh::monitor_sample_now,
+                        // --- 故障演练台 ---
+                        lab::exec_batch,
+                        lab::ping_now,
             // --- hosts ---
             commands::hosts_list,
             commands::host_save,

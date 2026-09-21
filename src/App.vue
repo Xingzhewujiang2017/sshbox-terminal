@@ -11,6 +11,7 @@ import MonitorPanel from './components/MonitorPanel.vue'
 import AiPanel from './components/AiPanel.vue'
 import HistoryPanel from './components/HistoryPanel.vue'
 import OverviewPanel from './components/OverviewPanel.vue'
+import LabPanel from './components/LabPanel.vue'
 import SftpPanel from './components/SftpPanel.vue'
 import ForwardPanel from './components/ForwardPanel.vue'
 import QuickCommands from './components/QuickCommands.vue'
@@ -70,6 +71,7 @@ const hostDialog = ref<{ open: boolean; host: Host | null }>({ open: false, host
 const settingsOpen = ref(false)
 const historyOpen = ref(false)
 const overviewOpen = ref(false)
+const labOpen = ref(false)
 const sftpOpen = ref(false)
 const forwardOpen = ref(false)
 /** 标签拖拽排序：拖到哪儿，标签就插到哪儿 */
@@ -981,8 +983,11 @@ function statusDot(t: Tab) {
             转发
           </button>
           <button class="icon-btn" title="总览（所有已连接主机）" @click="overviewOpen = true">
-            总览
-          </button>
+                      总览
+                    </button>
+                    <button class="icon-btn" title="故障演练台（注入/实时观测/就地执行，不跳页）" @click="labOpen = true">
+                      演练台
+                    </button>
           <button class="icon-btn" title="历史回看（落盘数据）" @click="historyOpen = true">
             历史
           </button>
@@ -1133,16 +1138,23 @@ function statusDot(t: Tab) {
     />
 
     <OverviewPanel
-      v-if="overviewOpen"
-      :tabs="tabs"
-      :hosts="hosts"
-      :interval="settings?.sample_interval_secs ?? 2"
-      :active-sid="activeTab?.sid"
-      @close="overviewOpen = false"
-            @focus="focusTab"
-            @connect="connectFromOverview"
-            @command="insertToTerminal"
-          />
+          v-if="overviewOpen"
+          :tabs="tabs"
+          :hosts="hosts"
+          :interval="settings?.sample_interval_secs ?? 2"
+          :active-sid="activeTab?.sid"
+          @close="overviewOpen = false"
+          @focus="focusTab"
+          @connect="connectFromOverview"
+          @command="insertToTerminal"
+        />
+
+        <LabPanel
+          v-if="labOpen"
+          :tabs="tabs"
+          @close="labOpen = false"
+          @command="insertToTerminal"
+        />
 
     <HistoryPanel
       v-if="historyOpen"

@@ -43,6 +43,26 @@ static REGISTRY: LazyLock<StdMutex<HashMap<SessionId, TaskHandle>>> =
 static STATIC_CACHE: LazyLock<StdMutex<HashMap<SessionId, StaticInfo>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
+/// 会话 → SSH 客户端句柄。演练台（lab）的组播执行 / 快 ping 要从 tauri 命令侧
+/// 直接用句柄开一次性 channel，而采集任务内部才有句柄 —— 所以 spawn 时登记、stop/forget 时清除。
+static HANDLES: LazyLock<StdMutex<HashMap<SessionId, Arc<client::Handle<ClientHandler>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+pub fn register_handle(sid: SessionId, handle: Arc<client::Handle<ClientHandler>>) {
+    HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(sid, handle);
+}
+
+pub fn unregister_handle(sid: &SessionId) {
+    HANDLES.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
+}
+
+pub fn get_handle(sid: &SessionId) -> Option<Arc<client::Handle<ClientHandler>>> {
+    HANDLES.lock().unwrap_or_else(|e| e.into_inner()).get(sid).cloned()
+}
+
 /// The static snapshot for a session, if it has been collected yet.
 pub fn cached_static(sid: &SessionId) -> Option<StaticInfo> {
     STATIC_CACHE
@@ -294,10 +314,19 @@ echo "@@END@@"
 
 /// Run a one-shot exec command over the SSH connection, return combined stdout.
 async fn exec_capture(handle: &client::Handle<ClientHandler>, cmd: &str) -> Result<String> {
+    exec_capture_code(handle, cmd).await.map(|(o, _)| o)
+}
+
+/// 同 exec_capture，但额外返回退出码（演练台组播执行用；缺 ExitStatus 时给 -1）。
+pub async fn exec_capture_code(
+    handle: &client::Handle<ClientHandler>,
+    cmd: &str,
+) -> Result<(String, i32)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
 
     let mut out = Vec::new();
+    let mut code: i32 = -1;
     loop {
         match channel.wait().await {
             Some(russh::ChannelMsg::Data { ref data }) => out.extend_from_slice(&data[..]),
@@ -305,13 +334,13 @@ async fn exec_capture(handle: &client::Handle<ClientHandler>, cmd: &str) -> Resu
                 out.extend_from_slice(&data[..])
             }
             Some(russh::ChannelMsg::Eof) => {}
-            Some(russh::ChannelMsg::ExitStatus { .. }) => {}
+            Some(russh::ChannelMsg::ExitStatus { exit_status }) => code = exit_status as i32,
             Some(russh::ChannelMsg::Close) | None => break,
             _ => {}
         }
     }
     let _ = channel.close().await;
-    Ok(String::from_utf8_lossy(&out).to_string())
+    Ok((String::from_utf8_lossy(&out).to_string(), code))
 }
 
 /// Split the KEYED script output into sections by @@NAME@@ markers.
@@ -1385,6 +1414,7 @@ pub fn spawn(
     app: AppHandle,
 ) {
     stop(&sid);
+    register_handle(sid.clone(), handle.clone());
 
     let visible = Arc::new(AtomicBool::new(true));
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1568,6 +1598,7 @@ pub(crate) fn retire(sid: &SessionId, stop_flag: &Arc<AtomicBool>) {
 /// 和任务收尾不同：这里要连静态缓存一起清，因为 sid 不会再被复用。
 pub fn forget(sid: &SessionId) {
     stop(sid);
+    unregister_handle(sid);
     registry().remove(sid);
     STATIC_CACHE
         .lock()
@@ -1576,6 +1607,7 @@ pub fn forget(sid: &SessionId) {
 }
 
 pub fn stop(sid: &SessionId) {
+    unregister_handle(sid);
     if let Some(t) = registry().remove(sid) {
         t.stop.store(true, Ordering::SeqCst);
     }

@@ -411,6 +411,23 @@ export function emptyHost(): Host {
 
 // --- command wrappers ------------------------------------------------------
 
+/** 演练台（lab）一次性执行结果。exit=-1 且 ok=false 表示通道错误或超时。 */
+export interface LabExec {
+  sid: string
+  ok: boolean
+  stdout: string
+  exit: number
+  elapsed_ms: number
+  error: string | null
+}
+
+/** 演练台快 ping（3s 高采）：拿不到网关时 target/rtt_avg 为 null，不编 0。 */
+export interface PingNow {
+  target: string | null
+  rtt_avg: number | null
+  loss_pct: number | null
+}
+
 export const api = {
   // hosts
   hostsList: () => call<HostsFile>('hosts_list'),
@@ -468,6 +485,9 @@ export const api = {
       maxPoints: maxPoints ?? null,
     }),
   /** 一次查多台主机（组内历史对比）。单台无数据就缺那一台，不报错。 */
+  execBatch: (sid: string, cmd: string, timeoutSecs: number) =>
+    call<LabExec>('exec_batch', { sid, cmd, timeoutSecs }),
+  pingNow: (sid: string) => call<PingNow>('ping_now', { sid }),
   historyRangeMulti: (hostIds: string[], from: number, to: number, maxPoints?: number) =>
     call<Record<string, HistoryRange>>('history_range_multi', {
       hostIds, from, to, maxPoints: maxPoints ?? null,
