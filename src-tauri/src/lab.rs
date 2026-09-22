@@ -85,7 +85,7 @@ pub struct PingNow {
 #[tauri::command]
 pub async fn ping_now(sid: String) -> Result<PingNow, String> {
     let handle = get_handle(&sid).ok_or_else(|| "演练台：会话已关闭".to_string())?;
-    const SCRIPT: &str = r#"GW=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}'); [ -n "$GW" ] || { echo "NO_GW"; exit 0; }; ping -c10 -W1 "$GW" 2>/dev/null | tail -3; echo "GW=$GW""#;
+    const SCRIPT: &str = r#"GW=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}'); [ -n "$GW" ] || { echo "NO_GW"; exit 0; }; timeout 3 ping -c10 -W1 -i 0.2 "$GW" 2>/dev/null | tail -3; echo "GW=$GW""#;
     let (out, _) = exec_capture_code(&handle, SCRIPT)
         .await
         .map_err(|e| format!("{:#}", e))?;

@@ -172,6 +172,19 @@ function rowIp(sid: string): string {
   return allRows.value.find((r) => r.sid === sid)?.ip ?? ''
 }
 
+function recoverLeft(sid: string): string {
+  const until = recoverUntil.value[sid]
+  if (!until) return ''
+  const left = Math.ceil((until - Date.now()) / 1000)
+  if (left <= 0) {
+    delete recoverUntil.value[sid]
+    return ''
+  }
+  return `恢复中 ${left}s`
+}
+const recoveringCount = computed(() => Object.keys(recoverUntil.value).filter((s) => recoverLeft(s) !== '').length)
+const injectDangerous = computed(() => injectType.value === 'blip' || (injectType.value === 'loss' && injectLossPct.value >= 80))
+
 // --- 目标勾选 ---------------------------------------------------------------
 const selected = ref<Set<string>>(new Set())
 function toggle(sid: string) {
@@ -196,6 +209,8 @@ const windowMode = ref<'3m' | '15m' | 'all'>('3m')
 const WINDOW_CAP: Record<string, number> = { '3m': 60, '15m': 300, all: 2400 }
 const series = ref<Record<string, Series>>({})
 let pollTimer: ReturnType<typeof setInterval> | null = null
+/** tickPing 防重入：高丢包时单轮可能超 3s，拒绝堆叠（堆叠会让采样时间轴失真） */
+let pinging = false
 
 function pushSample(sid: string, p: { lat: number | null; loss: number | null }, m?: Metrics) {
   const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [] })
@@ -224,16 +239,22 @@ function pushSample(sid: string, p: { lat: number | null; loss: number | null },
 async function tickPing() {
   const targets = selTabs.value
   if (!targets.length) return
-  await Promise.allSettled(
-    targets.map(async (t) => {
-      try {
-        const p = await api.pingNow(t.sid)
-        pushSample(t.sid, { lat: p.rtt_avg, loss: p.loss_pct }, sampleFor(t.sid)?.metrics)
-      } catch {
-        /* 单台失败不影响其它 */
-      }
-    })
-  )
+  if (pinging) return // 防重入：上一轮高丢包场景可能跑超 3s，拒绝堆叠造成时间轴失真
+  pinging = true
+  try {
+    await Promise.allSettled(
+      targets.map(async (t) => {
+        try {
+          const p = await api.pingNow(t.sid)
+          pushSample(t.sid, { lat: p.rtt_avg, loss: p.loss_pct }, sampleFor(t.sid)?.metrics)
+        } catch {
+          /* 单台失败不影响其它 */
+        }
+      })
+    )
+  } finally {
+    pinging = false
+  }
   checkInjectEffect()
   await nextTick()
   updateCharts()
@@ -369,20 +390,23 @@ function setChartRef(sid: string, kind: 'cpu' | 'ping', el: HTMLDivElement | nul
 function markInject(sid: string, kind: string, recoverSecs: number) {
   const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [] })
   s.inject.push({ atIdx: Math.max(0, s.lat.length - 1), recAt: recoverSecs > 0 ? Date.now() + recoverSecs * 1000 : 0, kind })
+  if (recoverSecs > 0) recoverUntil.value[sid] = Date.now() + recoverSecs * 1000
 }
 
-/** 注入效果检测：注入后 25s 内时延/丢包毫无变化 → 判定注入疑似未生效
- *  （目标机缺 sch_netem 等），如实提示而不是让用户对着平线猜。 */
-const injWatch = ref<Record<string, { baseLat: number; baseLoss: number; at: number }>>({})
+/** 注入效果检测：观察窗口与恢复时长联动；闪断不判（时断时续，判定随机无意义）。
+ *  窗口 = max(25s, 恢复秒数×2)。恢复 60s 时给 2 分钟余量，恢复 10s 时不误报。 */
+const injWatch = ref<Record<string, { baseLat: number; baseLoss: number; at: number; windowMs: number }>>({})
 const injInert = ref<string[]>([])
-function armInjectWatch(targets: { sid: string; label: string }[]) {
-  const w: Record<string, { baseLat: number; baseLoss: number; at: number }> = {}
+function armInjectWatch(targets: { sid: string; label: string }[], recoverSecs = 0, skipSids: Set<string> = new Set()) {
+  const w: Record<string, { baseLat: number; baseLoss: number; at: number; windowMs: number }> = {}
   for (const t of targets) {
+    if (skipSids.has(t.sid)) continue
     const s = series.value[t.sid]
     w[t.sid] = {
       baseLat: s && s.lat.length ? s.lat[s.lat.length - 1] : NaN,
       baseLoss: s && s.loss.length ? s.loss[s.loss.length - 1] : NaN,
       at: Date.now(),
+      windowMs: Math.max(25000, recoverSecs * 2 * 1000),
     }
   }
   injWatch.value = w
@@ -395,7 +419,7 @@ function checkInjectEffect() {
   const now = Date.now()
   for (const sid of Object.keys(w)) {
     const meta = w[sid]
-    if (now - meta.at < 25000) continue // 还在观察期，留着下次判
+    if (now - meta.at < meta.windowMs) continue // 窗口内：留着下次判
     const s = series.value[sid]
     if (!s || !s.lat.length) {
       delete injWatch.value[sid]
@@ -430,7 +454,9 @@ function keyOf(sid: string): string {
   return allRows.value.find((r) => r.sid === sid)?.key ?? sid
 }
 /** 注入事件流水（每台一次，导出事件 CSV 据此逐台记录，4 台必 4 条） */
-const labEvents = ref<{ label: string; time: string; kind: string; recAt: string; note: string }[]>([])
+const labEvents = ref<{ label: string; time: string; kind: string; recAt: string; note: string; status: string }[]>([])
+/** 恢复链预计完成时刻（sid → epoch ms），主机行显示"⏳ 恢复中 Ns" */
+const recoverUntil = ref<Record<string, number>>({})
 const injectConfirm = ref<{ n: number; cmd: string; preview: string; targets: { sid: string; label: string; cmd: string }[] } | null>(null)
 
 /** auto 模式：注入前逐台探测默认路由出接口，确认弹窗显示每台接口、命令各自生成 */
@@ -478,14 +504,19 @@ function buildInjectCmd(t: { sid: string; key?: string }, autoNic: string): stri
   const body: string[] = [...setup]
   if (injectType.value === 'clear') {
     body.push(`"$TC" qdisc del dev "$IFACE" root && echo 已清除该网卡上的规则; "$TC" qdisc show dev "$IFACE" || true`)
-  } else if (injectType.value === 'delay') {
+  } else {
+    // qdisc 覆盖保护：注入前展示该网卡现有 root 规则（若已有非 netem 整形，replace 会顶掉它，
+    // 恢复只还原"无规则"状态 —— 让用户先看见，出事有据可查）
+    body.push(`echo '--- 当前网卡规则 ---'; "$TC" qdisc show dev "$IFACE" | head -8`)
+  }
+  if (injectType.value === 'delay') {
     body.push(netemLine(`delay ${injectDelayMs.value}ms`))
   } else if (injectType.value === 'loss') {
     body.push(netemLine(`loss ${injectLossPct.value}%`))
-  } else {
-    const on = Math.max(1, injectBlipOn.value)
+  } else if (injectType.value === 'blip') {
+    const on = Math.max(8, injectBlipOn.value)
     const off = Math.max(1, injectBlipOff.value)
-    const n = Math.max(1, injectBlipN.value)
+    const n = Math.max(1, Math.min(20, injectBlipN.value))
     for (let i = 0; i < n; i++) {
       body.push(`"$TC" qdisc replace dev "$IFACE" root netem loss 100% && sleep ${on} && "$TC" qdisc del dev "$IFACE" root && sleep ${off}`)
     }
@@ -501,49 +532,96 @@ function runInject() {
     return
   }
   void (async () => {
+    // 参数钳制：0/负/越界直接收敛到安全区间，不生成垃圾命令
+    const delay = Math.min(10000, Math.max(1, Math.round(injectDelayMs.value) || 1))
+    const loss = Math.min(100, Math.max(1, Math.round(injectLossPct.value) || 1))
+    const blipOn = Math.min(120, Math.max(8, Math.round(injectBlipOn.value) || 8)) // ≥8s：3s 采样×2+余量，否则闪断落在采样间隙图上无痕
+    const blipOff = Math.min(600, Math.max(1, Math.round(injectBlipOff.value) || 1))
+    const blipN = Math.min(20, Math.max(1, Math.round(injectBlipN.value) || 1))
+    injectDelayMs.value = delay; injectLossPct.value = loss; injectBlipOn.value = blipOn; injectBlipOff.value = blipOff; injectBlipN.value = blipN
+
     if (injectNicMode.value === 'auto') injectMsg.value = '正在探测各台默认路由出接口…'
-    // auto：逐台探测接口；manual：取每台自己的输入
+    // 每台：auto → 默认出口；manual → 行内网卡；同时都探测一次默认出口用于路径一致性判断
     const nicOf: Record<string, string> = {}
-    if (injectNicMode.value === 'auto') {
-      for (const t of targets) nicOf[t.sid] = await probeNic(t.sid)
+    const nicDefault: Record<string, string> = {}
+    const probe = async (t: { sid: string }) => {
+      nicDefault[t.sid] = await probeNic(t.sid)
+      if (injectNicMode.value === 'manual') {
+        nicOf[t.sid] = (manualNics.value[keyOf(t.sid)] ?? '').trim()
+      } else {
+        nicOf[t.sid] = nicDefault[t.sid]
+      }
     }
-    const per = targets.map((t) => ({ t, cmd: buildInjectCmd({ sid: t.sid, key: keyOf(t.sid) }, nicOf[t.sid] ?? '') }))
+    for (const t of targets) await probe(t)
+    const skipCheck = new Set<string>()
+    const notes: string[] = []
+    const per = targets.map((t) => {
+      const nic = nicOf[t.sid] ?? ''
+      // 手动模式网卡 ≠ 默认出口 → 观测曲线（ping 默认网关）测不到该接口，不判"未生效"
+      if (injectNicMode.value === 'manual' && nic && nicDefault[t.sid] && nic !== nicDefault[t.sid]) {
+        skipCheck.add(t.sid)
+        notes.push(`${t.label}: 网卡 ${nic} 不是默认出口（${nicDefault[t.sid]}），趋势图不观测该路径，跳过生效检测`)
+      }
+      if (injectNicMode.value === 'manual' && !nic) notes.push(`${t.label}: 未填网卡，该台中止`)
+      return { t, cmd: buildInjectCmd({ sid: t.sid, key: keyOf(t.sid) }, installNic(nic, nicDefault[t.sid])), nic }
+    })
     for (const p of per) emit('command', { sid: p.t.sid, text: p.cmd })
     if (injectType.value === 'clear') {
-      // 清除：移除该主机的注入标记（黄线）与效果检测，不画新标记。
+      // 清除：移除注入标记与效果检测；事件记"已清除"
       for (const t of targets) {
         const s = series.value[t.sid]
         if (s) s.inject = []
+        delete recoverUntil.value[t.sid]
+        labEvents.value.push({
+          label: t.label, time: new Date().toTimeString().slice(0, 8),
+          kind: 'clear', recAt: '', note: '', status: '已清除（命令已下发）',
+        })
       }
     } else {
       for (const p of per) {
+        if (injectType.value === 'blip') {
+          // 闪断不判"未生效"（时断时续，25s 判定纯随机）
+          skipCheck.add(p.t.sid)
+        }
         markInject(p.t.sid, injectType.value, injectRecover.value ? injectRecoverSecs.value : 0)
         labEvents.value.push({
-          label: p.t.label,
-          time: new Date().toTimeString().slice(0, 8),
+          label: p.t.label, time: new Date().toTimeString().slice(0, 8),
           kind: `inject:${injectType.value}`,
-          recAt: '',
-          note: nicOf[p.t.sid] ? `接口 ${nicOf[p.t.sid]}` : (injectNicMode.value === 'manual' ? '手动网卡' : '远端探测'),
+          recAt: injectRecover.value ? new Date(Date.now() + injectRecoverSecs.value * 1000).toTimeString().slice(0, 8) : '',
+          note: p.nic ? `接口 ${p.nic}` : '远端探测',
+          status: injectRecover.value ? `已下发，预计 ${injectRecoverSecs.value}s 后自动恢复` : '已下发（持续生效，需手动清除）',
         })
       }
-      armInjectWatch(targets.map((t) => ({ sid: t.sid, label: t.label })))
+      armInjectWatch(targets.map((t) => ({ sid: t.sid, label: t.label })), injectRecover.value ? injectRecoverSecs.value : 0, skipCheck)
     }
     const preview = per.map((p) => {
       const nicShown = injectNicMode.value === 'auto' ? nicOf[p.t.sid] : (manualNics.value[keyOf(p.t.sid)] ?? '')
       return `${p.t.label}${nicShown ? ' [' + nicShown + ']' : ''}: ${(p.cmd.split('\n').find((l) => l.includes('qdisc')) || p.cmd.split('\n').pop() || '').slice(0, 56)}`
     }).join('  |  ')
     injectConfirm.value = { n: targets.length, cmd: per.map((p) => p.cmd).join('\n'), preview, targets: per.map((p) => ({ sid: p.t.sid, label: p.t.label, cmd: p.cmd })) }
-    injectMsg.value = `已按主机分别生成命令并填入 ${targets.length} 台终端的终端（回车执行；也可点立即执行）`
+    injectEvalSkip.value = skipCheck
+    injectMsg.value = notes.length
+      ? '提示：' + notes.join('；')
+      : `已按主机分别生成命令并填入 ${targets.length} 台终端的终端（回车执行；也可点立即执行）`
     void nextTick(() => updateCharts())
   })()
 }
+
+/** 手动模式网卡为空 → 走远端探测回退；否则用给定网卡 */
+function installNic(nic: string, nicDefault: string): string {
+  if (injectNicMode.value === 'manual') return nic
+  return nicDefault
+}
+
+/** 注入效果检测跳过名单（非默认出口/blip），确认执行时沿用 */
+const injectEvalSkip = ref<Set<string>>(new Set())
 
 function confirmInjectExecute() {
   const c = injectConfirm.value
   if (!c) return
   for (const t of c.targets) emit('command', { sid: t.sid, text: t.cmd, execute: true })
   injectConfirm.value = null
-  armInjectWatch(c.targets)
+  armInjectWatch(c.targets, injectRecover.value ? injectRecoverSecs.value : 0, injectEvalSkip.value)
   injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 观察底部趋势图`
 }
 
@@ -597,10 +675,10 @@ async function exportCsvs() {
     const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`
     const head = ['host', 'time', 'cpu_pct', 'mem_pct', 'latency_ms', 'loss_pct', 'inject_kind'].join(',')
     const rows: string[] = [head]
-    const evRows: string[] = ['host,time,event,kind,recover_at,note']
+    const evRows: string[] = ['host,time,event,kind,recover_at,note,status']
     // 注入事件流水：每台一条（4 台注入必 4 条，含失败/权限提示上下文）
     for (const ev of labEvents.value) {
-      evRows.push([esc(ev.label), esc(ev.time), ev.kind.split(':')[0], esc(ev.kind), ev.recAt ? esc(new Date(ev.recAt).toTimeString().slice(0, 8)) : '', esc(ev.note)].join(','))
+      evRows.push([esc(ev.label), esc(ev.time), ev.kind.split(':')[0], esc(ev.kind), ev.recAt ? esc(ev.recAt) : '', esc(ev.note), esc(ev.status)].join(','))
     }
     for (const t of targets) {
       const s = series.value[t.sid]
@@ -642,12 +720,8 @@ const openTerm = ref<Set<string>>(new Set())
 function toggleTerm(sid: string) {
   const s = new Set(openTerm.value)
   if (s.has(sid)) s.delete(sid)
-  else {
-    s.add(sid)
-    // 会话事件流不回溯：最初 welcome+提示符早已流过，新终端挂载时看不到。
-    // 发一个空回车让 shell 重新打印提示符（无害，只是换一行）。
-    api.termWrite(sid, '\r').catch(() => {})
-  }
+  else s.add(sid)
+  // 提示符刷新由 TerminalPane 挂载后自己补（等事件订阅就绪再发，见组件 onMounted）
   openTerm.value = s
 }
 
@@ -729,6 +803,7 @@ onBeforeUnmount(() => {
           <span class="h-name" :title="r.sid ?? r.hostId ?? ''" @dblclick="r.status === 'connected' ? toggleTerm(r.sid!) : connectOffline(r)">{{ r.label }}</span>
           <span class="h-ip dim">{{ r.ip || '临时连接' }}</span>
           <span class="h-stat" :class="{ conn: r.status === 'connected' }">{{ r.status === 'connected' ? '● 在线' : '离线' }}</span>
+          <span v-if="recoverLeft(r.sid!) !== ''" class="recover-tag">⏳ {{ recoverLeft(r.sid!) }}</span>
           <input v-if="injectNicMode === 'manual'" v-model="manualNics[r.key]" class="num nic-in" placeholder="网卡" style="width: 64px" :title="`${r.label} 的网卡名（如 eth0/ens33），注入/清除都用它`" />
           <button v-if="r.status === 'connected'" class="btn ghost mini" @click="toggleTerm(r.sid!)" :title="openTerm.has(r.sid!) ? '收起终端' : '展开该主机终端（双击名称也行）'">
             {{ openTerm.has(r.sid!) ? '收起终端' : '终端 ▸' }}
@@ -749,6 +824,7 @@ onBeforeUnmount(() => {
             <TerminalPane
               :sid="sid"
               :active="true"
+              :no-ask="true"
               @data="(d) => api.termWrite(sid, d)"
             />
           </div>
@@ -760,15 +836,15 @@ onBeforeUnmount(() => {
         <div class="sec-title">故障注入 <span class="dim">（目标=上方勾选 · tc netem · 需要 root）</span></div>
         <div class="inj-row">
           <label class="check"><input type="radio" value="delay" v-model="injectType" /> 时延</label>
-          <input v-model.number="injectDelayMs" class="num" style="width: 70px" title="时延 ms" />
+          <input v-model.number="injectDelayMs" class="num" style="width: 70px" min="1" max="10000" title="时延 ms（1-10000）" />
           <span class="dim">ms</span>
           <label class="check"><input type="radio" value="loss" v-model="injectType" /> 丢包</label>
-          <input v-model.number="injectLossPct" class="num" style="width: 60px" title="丢包 %" />
+          <input v-model.number="injectLossPct" class="num" style="width: 60px" min="1" max="100" title="丢包 %（1-100，100=全断）" />
           <span class="dim">%</span>
           <label class="check"><input type="radio" value="blip" v-model="injectType" /> 闪断</label>
-          <input v-model.number="injectBlipOn" class="num" style="width: 54px" />s 断
-          <input v-model.number="injectBlipOff" class="num" style="width: 54px" />s 恢复 ×
-          <input v-model.number="injectBlipN" class="num" style="width: 42px" />
+          <input v-model.number="injectBlipOn" class="num" style="width: 54px" min="8" max="120" title="断 N 秒（≥8s，否则 3s 采样采不到）" />s 断
+          <input v-model.number="injectBlipOff" class="num" style="width: 54px" min="1" max="600" />s 恢复 ×
+          <input v-model.number="injectBlipN" class="num" style="width: 42px" min="1" max="20" />
           <label class="check"><input type="radio" value="clear" v-model="injectType" /> 清除</label>
         </div>
         <div class="inj-row">
@@ -785,12 +861,21 @@ onBeforeUnmount(() => {
           <button class="btn" :disabled="!selTabs.length" @click="runInject">生成并填入终端（{{ selTabs.length }} 台）</button>
           <template v-if="injectConfirm">
             <div class="inj-confirm">
+              <div v-if="injectDangerous" class="err" style="margin-bottom: 4px">
+                ⚠ 危险：{{ injectType === 'blip' ? '闪断会让该网卡短暂全断' : '丢包 100% 会让该网卡全断' }} —— SSH 会话自身也走这张卡，连接可能中断；
+                有到期自动恢复链则会在远端 shell 自行恢复，否则请确保有带外手段（IPMI/控制台）后再执行。
+              </div>
               <div class="dim" style="margin-bottom: 4px">将执行（每台命令已按各自网卡生成）：<code>{{ injectConfirm.preview }}</code></div>
+              <details class="dim" style="margin-bottom: 4px">
+                <summary>查看完整命令（逐台）</summary>
+                <pre class="inj-full">{{ injectConfirm.cmd }}</pre>
+              </details>
               <button class="btn danger" @click="confirmInjectExecute">⚠ 立即执行（{{ injectConfirm.n }} 台）</button>
               <button class="btn ghost" style="margin-left: 6px" @click="injectConfirm = null">仅等待</button>
             </div>
           </template>
-          <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') }">{{ injectMsg }}</span>
+          <span v-if="injectMsg" class="dim" :class="{ err: injectMsg.startsWith('失败') || injectMsg.startsWith('提示') }">{{ injectMsg }}</span>
+          <span v-if="recoveringCount" class="dim">（{{ recoveringCount }} 台恢复链运行中 —— 新命令会在其结束后再执行，或以「清除」优先处理）</span>
           <div v-if="injInert.length" class="err inj-inert">
             ⚠ 注入疑似未生效（{{ injInert.join('、') }}）：25 秒内时延/丢包曲线无变化 —— 目标机可能缺少 sch_netem 内核模块（受限内核/容器环境常见），请检查终端里的命令输出；可用「清除」恢复。
           </div>
@@ -872,8 +957,9 @@ onBeforeUnmount(() => {
 .h-row.on { background: var(--ctp-surface0); }
 .h-name { font-weight: 600; font-size: 12.5px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .h-ip { font-size: 11px; }
-.h-stat { font-size: 11px; color: var(--ctp-overlay0); }
-.h-stat.conn { color: var(--ctp-green); }
+.lab .h-stat { font-size: 11px; color: var(--ctp-overlay0); }
+.lab .h-stat.conn { color: var(--ctp-green); }
+.recover-tag { font-size: 11px; color: var(--ctp-yellow); white-space: nowrap; }
 .btn.mini { padding: 1px 8px; font-size: 11px; }
 .term-zone { margin-top: 6px; display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 8px; }
 .lab-term-block { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px; }
@@ -901,6 +987,19 @@ onBeforeUnmount(() => {
 }
 .fade-enter-active, .fade-leave-active { transition: opacity 0.25s; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
+.inj-full {
+  background: var(--ctp-mantle);
+  border: 1px solid var(--ctp-surface0);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 220px;
+  overflow-y: auto;
+  color: var(--ctp-text);
+}
 .sec-title { font-weight: 600; display: flex; align-items: center; gap: 10px; margin: 4px 0 6px; }
 .seg { display: inline-flex; border: 1px solid var(--ctp-surface0); border-radius: 6px; overflow: hidden; margin-left: auto; }
 .seg button { background: transparent; border: none; color: var(--ctp-subtext0); font-size: 11px; padding: 3px 10px; cursor: pointer; }

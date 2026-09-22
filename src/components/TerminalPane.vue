@@ -6,7 +6,7 @@ import { api } from '../api'
 import { listen } from '@tauri-apps/api/event'
 import { terminalTheme, themeVersion } from '../theme'
 
-const props = defineProps<{ sid: string; active: boolean }>()
+const props = defineProps<{ sid: string; active: boolean; noAsk?: boolean }>()
 
 /**
  * 键盘输入一律往上抛：广播模式下 App 要把它同时发给多个会话，
@@ -183,14 +183,20 @@ onMounted(async () => {
   ro.observe(termEl.value!)
 
   // The listener reads the *current* sid, so a reconnect does not need to
-  // re-subscribe and the scrollback above the reconnect marker is preserved.
-  unlisten = await listen<{ sid: string; data: string }>('ssh://data', (e) => {
-    if (e.payload.sid === currentSid) term?.write(b64decode(e.payload.data))
-  })
+    // re-subscribe and the scrollback above the reconnect marker is preserved.
+    unlisten = await listen<{ sid: string; data: string }>('ssh://data', (e) => {
+      if (e.payload.sid === currentSid) term?.write(b64decode(e.payload.data))
+    })
 
-  currentSid = props.sid
-  pushSize()
-})
+    currentSid = props.sid
+    if (props.sid) {
+      // 会话事件流不回溯：welcome+提示符在订阅前早已流过，新挂载的终端看不到。
+      // 等订阅就绪后再补一次空回车让 shell 重新打印提示符 —— 必须放在 await listen
+      // 之后，否则回车在订阅完成前到达照样丢（反复收起/展开就会复现）。
+      api.termWrite(props.sid, String.fromCharCode(13)).catch(() => {})
+    }
+    pushSize()
+  })
 
 watch(
   () => props.sid,
@@ -230,8 +236,8 @@ onBeforeUnmount(() => {
     <div v-if="ctxMenu" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
       <button @click="ctxCopy">📋 复制选中</button>
       <button @click="ctxPaste">📥 粘贴</button>
-      <button @click="ctxAskAI">🤖 解释这段（AI）</button>
-    </div>
+      <button v-if="!noAsk" @click="ctxAskAI">🤖 解释这段（AI）</button>
+          </div>
   </div>
 </template>
 
