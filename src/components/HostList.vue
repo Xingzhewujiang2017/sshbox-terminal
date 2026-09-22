@@ -19,6 +19,12 @@ const emit = defineEmits<{
 }>()
 
 const query = ref('')
+const searchEl = ref<HTMLInputElement | null>(null)
+/** 清空后把焦点留在输入框 —— 接着就能打字，不用再点一下。 */
+function clearSearch() {
+  query.value = ''
+  searchEl.value?.focus()
+}
 const collapsed = ref<Record<string, boolean>>({})
 /** 是否显示被合并的重复配置（默认合并，点了才展开）。 */
 const showAll = ref(false)
@@ -172,7 +178,16 @@ function onGroupClick(g: string) {
 
     <button class="connect-btn" @click="emit('new')">＋ 新建连接</button>
 
-    <input v-model="query" class="search" placeholder="搜索主机 / 地址 / 用户" />
+    <div class="search-wrap">
+      <input
+        ref="searchEl"
+        v-model="query"
+        class="search"
+        placeholder="搜索主机 / 地址 / 用户"
+        @keydown.esc="clearSearch"
+      />
+      <button v-if="query" class="search-clear" title="清空（Esc）" @click="clearSearch">×</button>
+    </div>
 
     <div v-if="mergedCount > 0 && !query" class="merge-hint">
       <span>已合并 {{ mergedCount }} 条指向相同目标的配置</span>
@@ -271,6 +286,16 @@ function onGroupClick(g: string) {
   color: var(--ctp-text); padding: 5px 8px; font-size: 12px; outline: none;
 }
 .search:focus { border-color: var(--ctp-blue); }
+.search-wrap { position: relative; }
+.search-wrap .search { width: 100%; box-sizing: border-box; padding-right: 26px; }
+/* × 给足 20px 热区：13px 的字号直接点很难点中 */
+.search-clear {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+  background: none; border: none; border-radius: 4px; padding: 0;
+  color: var(--ctp-overlay0); font-size: 14px; line-height: 1; cursor: pointer;
+}
+.search-clear:hover { color: var(--ctp-text); background: var(--ctp-surface0); }
 .merge-hint {
   display: flex; align-items: center; justify-content: space-between; gap: 6px;
   margin: 6px 0 2px; padding: 5px 8px; border-radius: 6px;

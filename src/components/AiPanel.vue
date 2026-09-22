@@ -143,6 +143,28 @@ async function scrollToEnd() {
 watch(() => turns.value.length, scrollToEnd)
 watch(() => turns.value[turns.value.length - 1]?.content, scrollToEnd)
 
+/** 首屏引导默认折叠：8 行文字会把输入框顶上去（实测 151px）。 */
+const emptyMore = ref(false)
+
+/** 输入框里点名"这句话发给哪台机器" —— 标题行让给模型显示。 */
+const ctx = computed(() => (props.activeLabel ?? '').trim())
+
+type Seg = { cmd: boolean; lines: string[] }
+/**
+ * 把连续的命令行聚成一块。
+ * 按行给「插入」按钮会把多行脚本（for/while、多个 && 串联）拆成几条坏命令填进终端。
+ */
+function segments(content: string): Seg[] {
+  const out: Seg[] = []
+  for (const line of content.split('\n')) {
+    const isCmd = looksLikeCommand(line)
+    const last = out[out.length - 1]
+    if (isCmd && last && last.cmd) last.lines.push(line)
+    else out.push({ cmd: isCmd, lines: [line] })
+  }
+  return out
+}
+
 /** 缩进/反引号那类行单独显示成代码样式。 */
 function looksLikeCommand(line: string): boolean {
   const t = line.trim()
@@ -158,12 +180,8 @@ function plainThink(s: string): string {
 <template>
   <aside class="ai-drawer">
     <div class="head">
-      <span class="title">AI 助手{{ props.activeLabel ? ' · ' + props.activeLabel : '' }}</span>
+      <span class="title">AI 助手</span>
       <span class="spacer"></span>
-      <div v-if="showNotice" class="ai-notice">
-        提示：提问/生成命令时会自动带上当前终端最近的输出（敏感内容已自动打码），发送到第三方模型 {{ profile?.protocol ?? 'AI 服务商' }}。点「知道了」后不再提示。
-        <button class="mini" @click="dismissNotice">知道了</button>
-      </div>
       <!-- 直接在下拉里换模型：以前每次换都要开设置 → AI 模型 → 使用，问一句换一次很烦 -->
       <select
         v-if="profiles.length"
@@ -196,16 +214,26 @@ function plainThink(s: string): string {
 
     <div ref="scroller" class="turns">
       <div v-if="!turns.length" class="empty">
-        <p>三条入口，随取随用：</p>
-        <ul>
-          <li><b>右键解释</b>：终端里选中报错/输出 → 右键「解释这段」，AI 只看这一小段</li>
-          <li><b>生成命令</b>：右上切「生成命令」→ 一句话描述要做的事 → 双击命令或点「插入终端」填入（<b>不自动执行</b>，回车由你按）</li>
-          <li><b>直接对话</b>：就在这里提问</li>
-        </ul>
-        <p class="hint">
-          提问自动带上当前会话最近的终端输出作上下文，所以「刚才的服务为什么没起来」不用补背景。
+        <!-- 默认只占一行：原来 8 行文字（实测 151px）把输入框顶上去，看着乱 -->
+        <p class="e-line">
+          三个入口：右键解释 · 生成命令 · 直接提问
+          <button class="e-toggle" @click="emptyMore = !emptyMore">{{ emptyMore ? '收起' : '展开' }}</button>
         </p>
-        <p class="hint"><b>Ctrl+Shift+I</b> 或工具栏 AI 按钮 = 打开/收起本面板。</p>
+        <div v-if="emptyMore" class="e-more">
+          <ul>
+            <li><b>右键解释</b>：终端里选中报错/输出 → 右键「解释这段」，AI 只看这一小段</li>
+            <li><b>生成命令</b>：右上切「生成命令」→ 一句话描述要做的事 → 点「插入终端」填入（<b>不自动执行</b>，回车由你按）</li>
+            <li><b>直接对话</b>：就在这里提问</li>
+          </ul>
+          <p class="hint">
+            提问自动带上当前会话最近的终端输出作上下文（敏感内容已打码），所以「刚才的服务为什么没起来」不用补背景。
+          </p>
+          <p class="hint"><b>Ctrl+Shift+I</b> 或工具栏 AI 按钮 = 打开/收起本面板。</p>
+          <div v-if="showNotice" class="ai-notice">
+            提问/生成命令会发送到第三方模型 {{ profile?.protocol ?? 'AI 服务商' }}。
+            <button class="mini" @click="dismissNotice">知道了</button>
+          </div>
+        </div>
       </div>
 
       <div v-for="(t, i) in turns" :key="i" class="turn" :class="t.role">
@@ -231,12 +259,19 @@ function plainThink(s: string): string {
             </summary>
             <pre>{{ plainThink(t.reasoning) }}</pre>
           </details>
-          <template v-for="(line, li) in (t.content || '').split('\n')" :key="li">
-            <div v-if="looksLikeCommand(line)" class="code-line">
-              <span class="cl-text">{{ line }}</span>
-              <button class="cl-insert" title="把这行填入终端（回车由你按）" @click="insertTurn({ content: line, sid: t.sid })">插入</button>
+          <template v-for="(seg, si) in segments(t.content || '')" :key="si">
+            <!-- 连续命令行合成一块：按行给按钮会把多行脚本拆成几条坏命令填进终端 -->
+            <div v-if="seg.cmd" class="cmd-block">
+              <code class="cb-text">{{ seg.lines.join('\n') }}</code>
+              <div class="cb-actions">
+                <button
+                  class="mini primary"
+                  title="把这段填入终端（不会自动执行，回车由你按）"
+                  @click="insertTurn({ content: seg.lines.join('\n'), sid: t.sid })"
+                >插入终端</button>
+              </div>
             </div>
-            <div v-else class="text-line">{{ line || '\u00a0' }}</div>
+            <div v-else class="text-line">{{ seg.lines[0] || '\u00a0' }}</div>
           </template>
           <span v-if="t.streaming" class="caret">▋</span>
         </div>
@@ -263,7 +298,9 @@ function plainThink(s: string): string {
             ? '先在设置里配置模型'
             : mode === 'command'
               ? '描述你要做的事，例如：找出占用 80 端口的进程'
-              : '问点什么（Enter 发送，Shift+Enter 换行）'
+              : ctx
+                ? `问点什么 · 发给 ${ctx}（Enter 发送）`
+                : '问点什么（Enter 发送，Shift+Enter 换行）'
         "
         :disabled="!ready"
         @keydown.enter.exact.prevent="send"
@@ -345,6 +382,15 @@ function plainThink(s: string): string {
 .empty ul { margin: 4px 0 8px; padding-left: 18px; }
 .empty b { color: var(--ctp-subtext0); }
 .empty .hint { color: var(--ctp-surface2); }
+/* 首屏引导默认一行，细节折在「展开」后面（原来 8 行 151px 顶得输入框很难看） */
+.e-line { margin: 0; }
+.e-toggle {
+  background: none; border: none; color: var(--ctp-blue); font: inherit;
+  cursor: pointer; padding: 0 2px; text-decoration: underline dotted;
+}
+.e-toggle:hover { text-decoration: underline; }
+.e-more { margin-top: 6px; }
+.e-more .ai-notice { margin: 8px 0 0; flex-wrap: wrap; }
 .turn { margin-bottom: 14px; animation: turn-in 0.15s ease; }
 @keyframes turn-in { from { opacity: 0; transform: translateY(3px); } }
 .who { font-size: 10px; color: var(--ctp-overlay0); margin-bottom: 4px; letter-spacing: 0.4px; }
@@ -370,33 +416,24 @@ function plainThink(s: string): string {
 }
 .body { font-size: 12px; color: var(--ctp-subtext1); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
 .text-line { white-space: pre-wrap; }
-.code-line {
+/* 对话里的命令行块：按钮和「生成命令」的命令框共用 .mini.primary —— 同一件事两处长得不一样
+   会让人以为功能不同；尺寸/字号/配色逐项对齐，不靠"看起来差不多" */
+.cmd-block {
+  background: var(--ctp-crust);
+  border: 1px solid var(--ctp-surface0);
+  border-radius: 6px;
+  padding: 6px 9px;
+  margin: 3px 0;
+}
+.cmd-block .cb-text {
+  display: block;
   font-family: ui-monospace, monospace;
   font-size: 11.5px;
-  background: var(--ctp-crust);
   color: var(--ctp-green);
-  border-radius: 4px;
-  padding: 2px 6px;
-  margin: 2px 0;
   white-space: pre-wrap;
   word-break: break-all;
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
-.code-line .cl-text { flex: 1; min-width: 0; }
-.code-line .cl-insert {
-  flex-shrink: 0;
-  background: var(--ctp-surface1);
-  color: var(--ctp-text);
-  border: none;
-  border-radius: 4px;
-  font-size: 10px;
-  padding: 2px 7px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.code-line .cl-insert:hover { background: var(--ctp-blue); color: var(--on-accent); }
+.cmd-block .cb-actions { display: flex; gap: 6px; margin-top: 6px; }
 .cmd-box {
   background: var(--ctp-crust);
   border: 1px solid var(--ctp-surface1);

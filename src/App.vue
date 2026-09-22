@@ -1048,6 +1048,7 @@ function statusDot(t: Tab) {
                         <button class="rp-opt" @click="makeReport(24)">最近 24 小时</button>
                         <button class="rp-opt" @click="makeReport(168)">最近 7 天</button>
                         <button class="rp-opt cancel" @click="reportPickOpen = false">取消</button>
+                        <div class="rp-note">三档数据都会存进报告，打开后可随意切换；想回顾更长时间段，这里就选 7 天</div>
                       </div>
                     </span>
           <button class="icon-btn" title="切换监控面板" @click="monitorVisible = !monitorVisible">
@@ -1327,6 +1328,10 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(-
 }
 .report-pick .rp-opt:hover { background: var(--ctp-surface0); }
 .report-pick .rp-opt.cancel { color: var(--ctp-overlay0); border-top: 1px solid var(--ctp-surface0); border-radius: 0 0 5px 5px; margin-top: 4px; }
+.report-pick .rp-note {
+  font-size: 10px; color: var(--ctp-overlay0); line-height: 1.5;
+  padding: 6px 8px 4px; border-top: 1px solid var(--ctp-surface0); margin-top: 4px;
+}
 .reconnect-btn {
   background: var(--ctp-green); color: var(--on-accent); border: none; border-radius: 5px;
   padding: 3px 10px; font-size: 11.5px; font-weight: 600; cursor: pointer;
