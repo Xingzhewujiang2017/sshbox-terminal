@@ -32,7 +32,12 @@ export interface AiTurn {
 export const ai = reactive({
   open: false,
   kind: 'chat' as AiKind,
-  turns: [] as AiTurn[],
+  /** 每个终端标签（tab.id）一份对话；' ' = 无标签/全局兜底槽 */
+  turnsByTab: {} as Record<string, AiTurn[]>,
+  /** per-slot 流式标志：一槽在生成不挡另一槽提问 */
+  streamingByTab: {} as Record<string, boolean>,
+  /** 当前 AI 面板服务的标签 id（切换页签时由 App 联动） */
+  activeTabId: '',
   streaming: false,
   settings: null as AiSettings | null,
   /** 全局错误（比如"还没选模型"），显示在面板顶部 */
@@ -44,6 +49,56 @@ export const ai = reactive({
   /** 当前请求 id（停止时要按它取消） */
   reqId: '',
 })
+
+/** 当前槽 key：activeTabId（无标签时回退全局槽） */
+export function activeSlot(): string {
+  return ai.activeTabId
+}
+
+/** 当前槽的对话数组（惰性建槽） */
+export function slotTurns(): AiTurn[] {
+  const k = activeSlot()
+  return (ai.turnsByTab[k] ??= [])
+}
+
+/** 切槽：面板显示跟随页签但不自动开/关面板 */
+export function setActiveSlot(tabId: string) {
+  if (tabId !== ai.activeTabId) ai.activeTabId = tabId
+}
+
+/** 清空当前槽对话 */
+export function clearTurnSlot() {
+  slotTurns().length = 0
+}
+
+/** 槽数量上限（LRU）：关标签保留对话，但开过的主机无限积累会常驻内存。
+ *  超过上限时回收最久没被激活的槽（每个槽的记录 at 取最新一轮时间）。 */
+const SLOT_LIMIT = 30
+export function enforceSlotLimit() {
+  const keys = Object.keys(ai.turnsByTab)
+  if (keys.length <= SLOT_LIMIT) return
+  const byLastUse = keys
+    .filter((k) => k !== activeSlot() && ai.turnsByTab[k].length > 0)
+    .map((k) => ({ k, last: ai.turnsByTab[k][ai.turnsByTab[k].length - 1]?.at ?? 0 }))
+    .sort((a, b) => a.last - b.last)
+  const overflow = keys.length - SLOT_LIMIT
+  for (let i = 0; i < Math.min(overflow, byLastUse.length); i++) {
+    delete ai.turnsByTab[byLastUse[i].k]
+    delete ai.streamingByTab[byLastUse[i].k]
+  }
+}
+
+/** 请求 id → 槽 key：流式回复必须写回发起时的槽，防中途切标签写错 */
+const reqSlot = new Map<string, string>()
+function trackReq(reqId: string) {
+  reqSlot.set(reqId, activeSlot())
+}
+function slotOfReq(reqId: string): string {
+  return reqSlot.get(reqId) ?? activeSlot()
+}
+function finishReq(reqId: string) {
+  reqSlot.delete(reqId)
+}
 
 /** 终端尾部文本由 App.vue 注入（面板不直接持有 xterm）。 */
 let tailProvider: () => string = () => ''
@@ -97,33 +152,43 @@ export async function initAi() {
   if (inited) return
   inited = true
   await listen<{ req_id: string; text: string }>('ssh://ai/delta', (e) => {
-    const t = ai.turns[ai.turns.length - 1]
+    const slot = slotOfReq(e.payload.req_id)
+    const arr = ai.turnsByTab[slot] ?? []
+    const t = arr[arr.length - 1]
     if (!t || t.role !== 'assistant' || !t.streaming) return
     t.content += e.payload.text
   })
   // 思考过程单独一条流：面板默认折叠，展开才看
   await listen<{ req_id: string; text: string }>('ssh://ai/reasoning', (e) => {
-    const t = ai.turns[ai.turns.length - 1]
+    const slot = slotOfReq(e.payload.req_id)
+    const arr = ai.turnsByTab[slot] ?? []
+    const t = arr[arr.length - 1]
     if (!t || t.role !== 'assistant' || !t.streaming) return
     t.reasoning = (t.reasoning ?? '') + e.payload.text
   })
-  await listen<{ req_id: string }>('ssh://ai/done', () => {
-    const t = ai.turns[ai.turns.length - 1]
+  await listen<{ req_id: string }>('ssh://ai/done', (e) => {
+    const slot = slotOfReq(e.payload.req_id)
+    const arr = ai.turnsByTab[slot] ?? []
+    const t = arr[arr.length - 1]
     if (t && t.role === 'assistant') {
       t.streaming = false
       finalizeTurn(t)
     }
-    ai.streaming = false
+    ai.streamingByTab[slot] = false
+    finishReq(e.payload.req_id)
   })
   await listen<{ req_id: string; message: string }>('ssh://ai/error', (e) => {
-    const t = ai.turns[ai.turns.length - 1]
+    const slot = slotOfReq(e.payload.req_id)
+    const arr = ai.turnsByTab[slot] ?? []
+    const t = arr[arr.length - 1]
     if (t && t.role === 'assistant') {
       t.streaming = false
       t.error = e.payload.message
       if (!t.content) t.content = ''
     }
-    ai.streaming = false
+    ai.streamingByTab[slot] = false
     ai.error = e.payload.message
+    finishReq(e.payload.req_id)
   })
 }
 
@@ -136,7 +201,8 @@ export async function ask(
   kind: AiKind,
   opts: { selection?: string; prompt?: string; sid?: string } = {},
 ): Promise<void> {
-  if (ai.streaming) return
+  const slot = activeSlot()
+  if (ai.streamingByTab[slot]) return
   if (!aiReady()) {
     ai.error = aiDisabledReason()
     return
@@ -152,17 +218,19 @@ export async function ask(
         ? `生成命令：${opts.prompt ?? ''}`
         : (opts.prompt ?? '')
 
-  ai.turns.push({ role: 'user', content: label, kind, sid: opts.sid, at: Date.now() })
-  ai.turns.push({ role: 'assistant', content: '', streaming: true, kind, sid: opts.sid, at: Date.now() })
-  ai.streaming = true
+  const turns = slotTurns()
+  turns.push({ role: 'user', content: label, kind, sid: opts.sid, at: Date.now() })
+  turns.push({ role: 'assistant', content: '', streaming: true, kind, sid: opts.sid, at: Date.now() })
+  ai.streamingByTab[slot] = true
 
-  const history: ChatMessage[] = ai.turns
+  const history: ChatMessage[] = turns
     .slice(0, -2)
     .filter((t) => !t.error && t.content.trim())
     .map((t) => ({ role: t.role, content: t.content }))
 
   const reqId = newReqId()
   ai.reqId = reqId
+  trackReq(reqId)
   try {
     const full = await api.aiAsk({
       reqId,
@@ -173,7 +241,7 @@ export async function ask(
       tail: tailProvider(),
       history: kind === 'chat' ? history : null,
     })
-    const t = ai.turns[ai.turns.length - 1]
+    const t = turns[turns.length - 1]
     if (t && t.role === 'assistant') {
       t.streaming = false
       if (!t.content) t.content = full
@@ -184,7 +252,7 @@ export async function ask(
       ai.pendingSid = opts.sid ?? ''
     }
   } catch (e) {
-    const t = ai.turns[ai.turns.length - 1]
+    const t = turns[turns.length - 1]
     const msg = (e as Error).message
     if (t && t.role === 'assistant') {
       t.streaming = false
@@ -192,8 +260,25 @@ export async function ask(
     }
     ai.error = msg
   } finally {
-    ai.streaming = false
+    ai.streamingByTab[slot] = false
+    finishReq(reqId)
+    enforceSlotLimit()
   }
+}
+
+/** 停止当前槽正在生成的请求（原 streaming 全局语义改为按槽）。 */
+export function stopAi() {
+  const slot = activeSlot()
+  if (!ai.streamingByTab[slot]) return
+  const arr = ai.turnsByTab[slot] ?? []
+  const t = arr[arr.length - 1]
+  if (t && t.role === 'assistant') {
+    t.streaming = false
+    if (!t.content) t.content = '（已停止）'
+  }
+  ai.streamingByTab[slot] = false
+  if (ai.reqId) void api.aiCancel(ai.reqId).catch(() => {})
+  finishReq(ai.reqId)
 }
 
 /** 收尾时剥离"写进正文的思考"（Qwen3 风格自建模型把思考混在 content 里）。
@@ -222,19 +307,23 @@ export function firstLine(s: string, max = 60): string {
 }
 
 export async function cancelAi() {
-  if (!ai.streaming) return
+  const slot = activeSlot()
+  if (!ai.streamingByTab[slot]) return
   // 先告诉后端别再读了，再把前端状态收回来（后端会保留已收到的部分）
   if (ai.reqId) void api.aiCancel(ai.reqId).catch(() => {})
-  ai.streaming = false
-  const t = ai.turns[ai.turns.length - 1]
+  ai.streamingByTab[slot] = false
+  const arr = ai.turnsByTab[slot] ?? []
+  const t = arr[arr.length - 1]
   if (t && t.role === 'assistant') {
     t.streaming = false
     if (!t.content) t.content = '（已停止）'
   }
+  finishReq(ai.reqId)
 }
 
+/** 清空当前标签的 AI 对话（原全局 clearTurns 语义改为按槽） */
 export function clearTurns() {
-  ai.turns = []
+  clearTurnSlot()
   ai.error = ''
   ai.pendingCommand = ''
 }

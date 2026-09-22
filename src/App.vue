@@ -5,7 +5,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from '@tauri
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { disposeFleet, forgetSession, initFleet } from './fleet'
 import { initTransfers, pendingDrop, transfers } from './transfers'
-import { ai, ask, initAi, loadAiSettings, setTailProvider, aiReady, aiDisabledReason } from './ai'
+import { ai, ask, initAi, loadAiSettings, setTailProvider, setActiveSlot, aiReady, aiDisabledReason } from './ai'
 import TerminalPane from './components/TerminalPane.vue'
 import MonitorPanel from './components/MonitorPanel.vue'
 import AiPanel from './components/AiPanel.vue'
@@ -49,9 +49,11 @@ interface Tab {
   hostId?: string | null
   host?: Host
   status: TabStatus
-  attempts: number
-  nextRetryIn?: number
-}
+    attempts: number
+    nextRetryIn?: number
+    /** 连接代次：手动重试/新调度会让旧挂起连接的结果作废（防晚到结果污染状态） */
+    connectGen?: number
+  }
 
 const hosts = ref<HostsFile>({ version: 1, groups: ['默认'], hosts: [] })
 const settings = ref<Settings | null>(null)
@@ -585,22 +587,37 @@ async function connectHost(host: Host, opts: {
     })}`,
   )
   try {
-    const sid = await api.connectHost({
-      hostId: host.id,
-      password: opts.password,
-      keyPassphrase: opts.keyPassphrase,
-      acceptHostKey: opts.acceptHostKey,
-      savePassword: opts.savePassword,
-    })
-    addTab(sid, host, undefined, opts.tabId)
-    uiLog(`连接成功 sid=${sid}`)
-    banner.value = null
-  } catch (e) {
-    handleConnectError(e as SshboxError, host, opts)
-  } finally {
-    busyHostId.value = null
+      // 代次：重连路径（tabId）上每次发起连接都 +1，旧连接晚到的成功结果作废
+      const myGen = (() => {
+        if (!opts.tabId) return 0
+        const tab = tabs.value.find((x) => x.id === opts.tabId)
+        const g = (tab?.connectGen ?? 0) + 1
+        if (tab) tab.connectGen = g
+        return g
+      })()
+      const sid = await api.connectHost({
+        hostId: host.id,
+        password: opts.password,
+        keyPassphrase: opts.keyPassphrase,
+        acceptHostKey: opts.acceptHostKey,
+        savePassword: opts.savePassword,
+      })
+      if (opts.tabId) {
+        const cur = tabs.value.find((x) => x.id === opts.tabId)
+        if (!cur || cur.connectGen !== myGen) {
+          uiLog('本轮连接结果已过期（有更新的重试），忽略以免覆盖新状态')
+          return
+        }
+      }
+      addTab(sid, host, undefined, opts.tabId)
+      uiLog(`连接成功 sid=${sid}`)
+      banner.value = null
+    } catch (e) {
+      handleConnectError(e as SshboxError, host, opts)
+    } finally {
+      busyHostId.value = null
+    }
   }
-}
 
 function handleConnectError(err: SshboxError, host: Host, opts: Record<string, unknown>) {
   const p = err.payload ?? ({ kind: 'unknown', message: err.message } as ErrPayload)
@@ -638,9 +655,19 @@ function handleConnectError(err: SshboxError, host: Host, opts: Record<string, u
       }
       break
     default:
-      toast('error', p.message || '连接失败')
-  }
-}
+          toast('error', p.message || '连接失败')
+          // 重连路径的失败（含 25s 超时）不能让它停在"重连中"：转回已断开 + 继续调度
+          if (opts.tabId) {
+            const t = tabs.value.find((x) => x.id === opts.tabId)
+            if (t) {
+              t.status = 'closed'
+              t.nextRetryIn = undefined
+              const wantAuto = (settings.value?.auto_reconnect ?? true) && (t.host?.auto_reconnect ?? true) && !!t.host
+              if (wantAuto) scheduleReconnect(t)
+            }
+          }
+      }
+    }
 
 async function trustHostKey() {
   const prompt = hostKeyPrompt.value
@@ -661,6 +688,11 @@ async function trustHostKey() {
 
 // --- reconnect -------------------------------------------------------------
 const RETRY_DELAYS = [2, 5, 10, 20]
+
+// 页签切换 → AI 槽联动（所有切标签路径都走 activeIdx，一处 watch 全覆盖）
+watch(activeIdx, (i) => {
+  setActiveSlot(tabs.value[i]?.id ?? '')
+})
 
 function markClosed(t: Tab) {
   t.status = 'closed'
@@ -693,6 +725,7 @@ function scheduleReconnect(t: Tab) {
 function manualReconnect(t: Tab) {
   t.attempts = 0
   t.status = 'connecting'
+  t.nextRetryIn = undefined
   connectHost(t.host!, { tabId: t.id })
 }
 
@@ -947,10 +980,11 @@ function statusDot(t: Tab) {
         </div>
         <div class="tabbar-right">
           <button
-            v-if="activeTab?.status === 'closed'"
-            class="reconnect-btn"
-            @click="manualReconnect(activeTab)"
-          >重连</button>
+                      v-if="activeTab?.status === 'closed' || activeTab?.status === 'connecting'"
+                      class="reconnect-btn"
+                      :title="activeTab?.status === 'connecting' ? '卡在重连中可手动重试（后端连接 25s 超时兜底）' : '重新连接该主机'"
+                      @click="manualReconnect(activeTab)"
+                    >{{ activeTab?.status === 'connecting' ? '立即重试' : '重连' }}</button>
           <button
             class="icon-btn"
             :title="`主题：${THEME_LABELS[themeMode]}（点击切到${resolvedTheme === 'dark' ? '浅色' : '深色'}）`"
@@ -1061,11 +1095,12 @@ function statusDot(t: Tab) {
           </div>
         </div>
         <AiPanel
-          v-if="ai.open"
-          :sid="activeTab?.sid"
-          @insert="insertToTerminal"
-          @close="ai.open = false"
-        />
+                  v-if="ai.open"
+                  :sid="activeTab?.sid"
+                  :active-label="activeTab?.label"
+                  @insert="insertToTerminal"
+                  @close="ai.open = false"
+                />
 
         <div v-if="monitorVisible && activeTab" class="monitor-area">
           <!-- key 绑定 sid：切标签 / 关标签时重建面板。否则组件被复用，

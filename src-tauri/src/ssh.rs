@@ -370,9 +370,13 @@ async fn do_connect(
     });
 
     let addr = (params.host.as_str(), port);
-    let mut handle = match client::connect(config, addr, handler).await {
-        Ok(h) => h,
-        Err(e) => {
+    // TCP connect 总超时 25s：目标机网络黑洞（WSL 停机/防火墙 drop）时，
+    // 默认交给系统内核可能要 1-2 分钟才失败 —— 前端"重连中…"会长时间无反馈。
+    // 25s 到就真失败（invoke 返回错误），不留孤儿会话。
+    let conn = tokio::time::timeout(Duration::from_secs(25), client::connect(config, addr, handler));
+    let mut handle = match conn.await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
             // A refused host key is the interesting case: report it precisely.
             let outcome = outcome_slot.lock().ok().and_then(|o| o.clone());
             match outcome {
@@ -424,6 +428,9 @@ async fn do_connect(
                 host_id: params.host_id.clone(),
                 ..Default::default()
             }));
+        }
+        Err(_) => {
+            return Err("连接超时（25 秒）：目标机无响应，请确认主机在线或网络可达".to_string());
         }
     };
 

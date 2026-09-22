@@ -20,12 +20,16 @@ import {
   loadAiSettings,
 } from '../ai'
 
-const props = defineProps<{ sid?: string | null }>()
+const props = defineProps<{ sid?: string | null; activeLabel?: string }>()
 const emit = defineEmits<{
   /** 把命令填进终端；sid = 这条命令是为哪个会话生成的（填回同一台主机） */
   (e: 'insert', payload: { text: string; sid: string }): void
   (e: 'close'): void
 }>()
+
+/** 当前槽（跟随活动标签）的对话与流式状态 */
+const turns = computed(() => ai.turnsByTab[ai.activeTabId] ?? [])
+const streamingNow = computed(() => !!ai.streamingByTab[ai.activeTabId])
 
 const input = ref('')
 /** 面板里的两种模式：聊天，或把需求变成一条命令 */
@@ -58,7 +62,7 @@ async function switchModel(id: string) {
 
 function send() {
   const text = input.value.trim()
-  if (!text || ai.streaming) return
+  if (!text || streamingNow.value) return
   input.value = ''
   void ask(mode.value, { prompt: text, sid: props.sid ?? undefined })
 }
@@ -136,8 +140,8 @@ async function scrollToEnd() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
-watch(() => ai.turns.length, scrollToEnd)
-watch(() => ai.turns[ai.turns.length - 1]?.content, scrollToEnd)
+watch(() => turns.value.length, scrollToEnd)
+watch(() => turns.value[turns.value.length - 1]?.content, scrollToEnd)
 
 /** 缩进/反引号那类行单独显示成代码样式。 */
 function looksLikeCommand(line: string): boolean {
@@ -154,7 +158,7 @@ function plainThink(s: string): string {
 <template>
   <aside class="ai-drawer">
     <div class="head">
-      <span class="title">AI 助手</span>
+      <span class="title">AI 助手{{ props.activeLabel ? ' · ' + props.activeLabel : '' }}</span>
       <span class="spacer"></span>
       <div v-if="showNotice" class="ai-notice">
         提示：提问/生成命令时会自动带上当前终端最近的输出（敏感内容已自动打码），发送到第三方模型 {{ profile?.protocol ?? 'AI 服务商' }}。点「知道了」后不再提示。
@@ -191,7 +195,7 @@ function plainThink(s: string): string {
     </div>
 
     <div ref="scroller" class="turns">
-      <div v-if="!ai.turns.length" class="empty">
+      <div v-if="!turns.length" class="empty">
         <p>三条入口，随取随用：</p>
         <ul>
           <li><b>右键解释</b>：终端里选中报错/输出 → 右键「解释这段」，AI 只看这一小段</li>
@@ -204,7 +208,7 @@ function plainThink(s: string): string {
         <p class="hint"><b>Ctrl+Shift+I</b> 或工具栏 AI 按钮 = 打开/收起本面板。</p>
       </div>
 
-      <div v-for="(t, i) in ai.turns" :key="i" class="turn" :class="t.role">
+      <div v-for="(t, i) in turns" :key="i" class="turn" :class="t.role">
         <div class="who">{{ t.role === 'user' ? '你' : (profile?.name ?? 'AI') }}</div>
         <div
           v-if="t.role === 'assistant' && t.kind === 'command'"
@@ -264,7 +268,7 @@ function plainThink(s: string): string {
         :disabled="!ready"
         @keydown.enter.exact.prevent="send"
       ></textarea>
-      <button v-if="ai.streaming" class="send stop" @click="cancelAi">停止</button>
+      <button v-if="streamingNow" class="send stop" @click="cancelAi">停止</button>
       <button v-else class="send" :disabled="!ready || !input.trim()" @click="send">发送</button>
     </div>
   </aside>
