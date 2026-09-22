@@ -918,6 +918,10 @@ function hhmm(ts) {
   return p(d.getMonth() + 1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
 function appendChart(arr, i1, i2, name, c1, c2, fmt, pct) {
+  // 必须自己取容器：这个函数是顶层函数，看不到 draw() 里的局部 box。
+  // 之前漏了这一行，draw() 里调用它时抛 ReferenceError，导致初始化 IIFE 中断、
+  // 所有范围按钮监听器都没绑上（点『1 小时』没反应），时延/丢包两张图也不画。
+  const box = document.getElementById('charts');
   const a = arr.map(p => p[i1]);
   const b = i2 != null ? arr.map(p => p[i2]) : null;
   let max = Math.max.apply(null, a.concat(b || [0]));
@@ -1701,6 +1705,15 @@ mod tests {
         assert!(html.contains("PINGERIES"), "HTML 要内嵌时延序列");
         assert!(html.contains("时延（实线）"), "HTML 要有时延/抖动趋势图");
         assert!(html.contains("丢包率"), "HTML 要有丢包趋势图");
+        // 回归断言（真实事故）：appendChart 是顶层函数，看不到 draw() 里的局部 box。
+        // 漏掉自己的取容器那行就是 ReferenceError → 初始化 IIFE 中断 → 时延/丢包两张图
+        // 不画、所有时间范围按钮都点不动。靠这条断言挡住。
+        assert_eq!(
+            html.matches("const box = document.getElementById('charts')")
+                .count(),
+            2,
+            "draw() 与 appendChart() 必须各自取一次 charts 容器"
+        );
         assert!(!html.contains("cdn."), "依旧自包含，不引 CDN");
     }
 
