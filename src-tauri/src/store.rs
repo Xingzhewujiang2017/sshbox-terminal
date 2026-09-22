@@ -333,6 +333,9 @@ fn default_quick_commands() -> Vec<QuickCommand> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// 配置结构版本（v0.6：写 1；旧文件缺省按 1 读，迁移钩子挂这里）
+    #[serde(default = "one")]
+    pub version: u32,
     #[serde(default = "default_interval")]
     pub sample_interval_secs: u64,
     #[serde(default = "default_true")]
@@ -388,6 +391,7 @@ fn default_theme() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            version: 1,
             sample_interval_secs: default_interval(),
             monitor_enabled: true,
             auto_reconnect: true,

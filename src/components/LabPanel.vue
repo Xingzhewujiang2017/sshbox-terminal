@@ -12,6 +12,7 @@
  * 安全：注入/执行的每个动作都需用户手动确认；AI/agent 不自动触发。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
 import { chartPalette, themeVersion } from '../theme'
 import { api, type LabExec, type Metrics } from '../api'
@@ -45,6 +46,8 @@ interface Series {
   lat: number[]
   loss: number[]
   inject: { atIdx: number; recAt: number; kind: string }[]
+  /** 断线时刻（HH:MM:SS）—— 重连窗口采样为空，图上画红线，不假装这段时间指标为 0 */
+  breaks: string[]
 }
 
 const emit = defineEmits<{
@@ -213,7 +216,7 @@ let pollTimer: ReturnType<typeof setInterval> | null = null
 let pinging = false
 
 function pushSample(sid: string, p: { lat: number | null; loss: number | null }, m?: Metrics) {
-  const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [] })
+  const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [], breaks: [] })
   s.t.push(new Date().toTimeString().slice(0, 8))
   s.cpu.push(+(m?.cpu_pct ?? 0).toFixed(1))
   s.mem.push(+(m?.mem_pct ?? 0).toFixed(1))
@@ -374,7 +377,15 @@ function updateCharts() {
     const lat = s.lat.slice(-cap)
     const loss = s.loss.slice(-cap)
     const mark = s.inject.filter((mk) => mk.atIdx < tt.length).map((mk) => ({ xAxis: mk.atIdx }))
-    c?.cpu?.setOption({ xAxis: { data: tt }, series: [{ data: cpu }, { data: mem }] })
+    // 断线时刻：在 x 轴上定位最近时间点画红线（如果没有正好对应的点，用 ':' 分段找最近）
+    const brk = s.breaks
+      .filter((b) => tt.includes(b))
+      .map((b) => ({ xAxis: tt.indexOf(b), lineStyle: { color: '#e64553', width: 1, type: 'solid' }, label: { formatter: '断线', color: '#e64553', fontSize: 9, position: 'insideEndTop' } }))
+    if (brk.length) {
+      c?.cpu?.setOption({ xAxis: { data: tt }, series: [{ data: cpu }, { data: mem }], markLine: { symbol: 'none', label: { show: false }, data: brk } })
+    } else {
+      c?.cpu?.setOption({ xAxis: { data: tt }, series: [{ data: cpu }, { data: mem }] })
+    }
     c?.ping?.setOption({ xAxis: { data: tt }, series: [{ data: lat }, { data: loss }, { markLine: { data: mark } }] })
   }
 }
@@ -388,7 +399,7 @@ function setChartRef(sid: string, kind: 'cpu' | 'ping', el: HTMLDivElement | nul
 
 // --- 注入时间线 --------------------------------------------------------------
 function markInject(sid: string, kind: string, recoverSecs: number) {
-  const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [] })
+  const s = (series.value[sid] ??= { t: [], cpu: [], mem: [], lat: [], loss: [], inject: [], breaks: [] })
   s.inject.push({ atIdx: Math.max(0, s.lat.length - 1), recAt: recoverSecs > 0 ? Date.now() + recoverSecs * 1000 : 0, kind })
   if (recoverSecs > 0) recoverUntil.value[sid] = Date.now() + recoverSecs * 1000
 }
@@ -762,6 +773,14 @@ onMounted(() => {
   emit('enter')
   pollTimer = setInterval(() => void tickPing(), 3000)
   void tickPing()
+  // 断线标记：会话关闭（或重连）时在趋势图上画红线 —— 采样空窗期不假装指标为 0
+  void listen<{ sid: string }>('ssh://closed', (e) => {
+    const s = series.value[e.payload.sid]
+    if (!s) return
+    const mark = new Date().toTimeString().slice(0, 8)
+    if (s.breaks[s.breaks.length - 1] !== mark) s.breaks.push(mark)
+    void nextTick(() => updateCharts())
+  })
 })
 onBeforeUnmount(() => {
   if (pollTimer) clearInterval(pollTimer)

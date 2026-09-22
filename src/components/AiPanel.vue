@@ -68,11 +68,37 @@ function send() {
  * 之前按钮用的是全局 pendingCommand 并在点击后清空，一旦 App 那边因为
  * "没有会话"把这次插入丢掉（用户看到的是毫无反应），状态就已经被吃掉了，
  * 按钮此后再也点不动 —— 实测复现过。 */
+/** 危险命令模式：AI 生成的命令只“填不执行”（回车由用户按），但高危模式
+ *  仍要红字提醒 —— 最后一道防线是用户的眼睛，别让它们松懈。 */
+const DANGEROUS: { re: RegExp; hint: string }[] = [
+  { re: /\brm\s+-[a-z]*r[a-z]*f\s+\/\s*($|;|&&|\|)/, hint: 'rm -rf / 根目录' },
+  { re: /\bmkfs(\s|\.)/, hint: 'mkfs 格式化' },
+  { re: /\bdd\b[^\n]*\bof=\/dev\/sd/, hint: 'dd 写块设备' },
+  { re: /\b(>|>>|1>)\s*\/dev\/sd/, hint: '重定向写块设备' },
+  { re: /:\(\)\s*\{\s*:\|\s*:\&\s*\}\s*;/, hint: 'fork 炸弹' },
+  { re: /\bshutdown\b|\breboot\b|\binit\s+0\b|\bpoweroff\b/, hint: '关机/重启' },
+  { re: /\bcurl\b[^\n]*\|\s*(ba)?sh\b/, hint: 'curl | sh 管道执行' },
+  { re: /\bsudo\s+(rm|mkfs|dd)\b/, hint: 'sudo 高危命令' },
+  { re: /\bchmod\s+-R\s+777\s+\//, hint: 'chmod -R 777 /' },
+]
+const insertWarn = ref<{ text: string; hint: string } | null>(null)
+
 function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
   if (t.streaming) return
   const text = cleanCommand(t.content)
   if (!text.trim()) return
+  const hit = DANGEROUS.find((d) => d.re.test(text))
+  if (hit) {
+    insertWarn.value = { text, hint: hit.hint }
+    return
+  }
   emit('insert', { text, sid: t.sid ?? '' })
+}
+
+function confirmWarnedInsert() {
+  const w = insertWarn.value
+  insertWarn.value = null
+  if (w) emit('insert', { text: w.text, sid: '' })
 }
 
 /** 复制这一轮的命令到剪贴板。 */
@@ -186,6 +212,15 @@ function plainThink(s: string): string {
           <span v-if="t.streaming" class="caret">▋</span>
         </div>
         <div v-if="t.error" class="turn-err">{{ t.error }}</div>
+      </div>
+    </div>
+
+    <div v-if="insertWarn" class="warn-float">
+      <div class="err">⚠ 危险命令（{{ insertWarn.hint }}）：不会自动执行，确认要插入终端？</div>
+      <code>{{ insertWarn.text }}</code>
+      <div class="warn-actions">
+        <button class="mini primary" @click="confirmWarnedInsert">确认插入</button>
+        <button class="mini" @click="insertWarn = null">取消</button>
       </div>
     </div>
 
@@ -385,6 +420,22 @@ function plainThink(s: string): string {
 .caret { color: var(--ctp-blue); animation: blink 1s steps(2) infinite; }
 @keyframes blink { to { opacity: 0; } }
 .turn-err { font-size: 11px; color: var(--ctp-red); margin-top: 4px; line-height: 1.5; }
+.warn-float {
+  margin: 0 10px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--ctp-red);
+  border-radius: 6px;
+  background: var(--ctp-mantle);
+}
+.warn-float code {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  margin: 6px 0;
+  color: var(--ctp-text);
+}
+.warn-actions { display: flex; gap: 6px; }
 .foot { display: flex; gap: 6px; padding: 8px 10px; border-top: 1px solid var(--ctp-surface0); }
 .foot textarea {
   flex: 1;

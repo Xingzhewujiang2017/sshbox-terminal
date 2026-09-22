@@ -199,6 +199,7 @@ mod tests {
 
     fn metrics(ts: f64, cpu: f64, mem: f64, disk: f64) -> Metrics {
         Metrics {
+            platform: "Linux".into(),
             ts,
             cpu_pct: cpu,
             cpu_per_core: vec![],

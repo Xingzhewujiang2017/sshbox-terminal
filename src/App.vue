@@ -1049,14 +1049,15 @@ function statusDot(t: Tab) {
             <div class="empty-hint">左侧主机列表双击即可连接 · Ctrl+T 新建 · Ctrl+W 关闭</div>
           </div>
           <TerminalPane
-            v-for="(t, i) in tabs"
-            :key="t.id"
-            :sid="t.sid"
-            :active="i === activeIdx"
-            :ref="(el) => setTermRef(t.sid, el)"
-            @data="(d) => onTermData(t, d)"
-            @context="(p) => onTermContext(p, t.sid)"
-          />
+                      v-for="(t, i) in tabs"
+                      :key="t.id"
+                      :sid="t.sid"
+                      :active="i === activeIdx"
+                      :broadcast-count="broadcastOn ? broadcastSel.length : 0"
+                      :ref="(el) => setTermRef(t.sid, el)"
+                      @data="(d) => onTermData(t, d)"
+                      @context="(p) => onTermContext(p, t.sid)"
+                    />
           </div>
         </div>
         <AiPanel

@@ -1406,6 +1406,7 @@ mod tests {
                 disks: vec![],
             },
             metrics: Metrics {
+                platform: "Linux".into(),
                 ts: 0.0,
                 cpu_pct: 12.0,
                 cpu_per_core: vec![],

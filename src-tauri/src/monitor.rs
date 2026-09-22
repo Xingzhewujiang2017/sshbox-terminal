@@ -95,6 +95,8 @@ fn wall_secs() -> f64 {
 #[derive(Debug, Serialize, Clone)]
 pub struct Metrics {
     pub ts: f64,
+    /// `uname -s` 结果（Linux/Darwin/…）。空 = 采集脚本没跑出结果（目标可能非类 Unix）。
+    pub platform: String,
     pub cpu_pct: f64,
     pub cpu_per_core: Vec<f64>,
     pub mem_total_kb: u64,
@@ -163,6 +165,7 @@ const SLOW_EVERY: Duration = Duration::from_secs(15);
 /// the timestamp is display-only and the Rust side falls back to its own clock.
 const COLLECT_SCRIPT: &str = r#"
 echo "@@TS@@ $(date +%s.%N 2>/dev/null || date +%s)"
+echo "@@PLATFORM@@ $(uname -s 2>/dev/null)"
 echo "@@STAT@@"; cat /proc/stat 2>/dev/null
 echo "@@MEM@@"; cat /proc/meminfo 2>/dev/null
 echo "@@NET@@"; cat /proc/net/dev 2>/dev/null
@@ -1310,6 +1313,7 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
 
     Some(Metrics {
         ts,
+        platform: s.get("PLATFORM").and_then(|v| v.first()).cloned().unwrap_or_default(),
         cpu_pct,
         cpu_per_core,
         mem_total_kb: mem_total,

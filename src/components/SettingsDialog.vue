@@ -208,6 +208,7 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
                       </label>
                     </div>
         <div class="hintline">不可见标签页会自动降频到 5 倍间隔以省带宽。</div>
+        <div v-if="form.sample_interval_secs <= 2" class="hintline warn">间隔 ≤2s 时每台每秒一条采集通道 —— 目标 ≥10 台建议加到 ≥3s，避免通道风暴。</div>
 
         <label class="check">
           <input v-model="form.monitor_enabled" type="checkbox" />

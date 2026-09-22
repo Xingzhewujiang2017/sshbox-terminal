@@ -18,8 +18,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
+                            .level(log::LevelFilter::Info)
+                            .max_file_size(5 * 1024 * 1024)
+                                                        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                            .build(),
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())

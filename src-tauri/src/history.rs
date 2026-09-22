@@ -1021,6 +1021,7 @@ mod tests {
 
     fn metrics(cpu: f64, mem: f64, net: Vec<NetIf>, io: Vec<DiskIo>) -> Metrics {
         Metrics {
+            platform: "Linux".into(),
             ts: 1_700_000_000.0,
             cpu_pct: cpu,
             cpu_per_core: vec![cpu],

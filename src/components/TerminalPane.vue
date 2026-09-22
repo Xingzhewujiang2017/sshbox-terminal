@@ -6,7 +6,7 @@ import { api } from '../api'
 import { listen } from '@tauri-apps/api/event'
 import { terminalTheme, themeVersion } from '../theme'
 
-const props = defineProps<{ sid: string; active: boolean; noAsk?: boolean }>()
+const props = defineProps<{ sid: string; active: boolean; noAsk?: boolean; broadcastCount?: number }>()
 
 /**
  * 键盘输入一律往上抛：广播模式下 App 要把它同时发给多个会话，
@@ -60,12 +60,24 @@ async function pasteClipboard(): Promise<boolean> {
   try {
     const text = await navigator.clipboard.readText()
     if (!text) return false
-    // 走 xterm 自己的 paste：它会处理 bracketed paste，比直接写 pty 安全
+    // 广播模式：粘贴只作用于当前终端（键盘输入才广播）。提示而不是静默 ——
+    // 用户十有八九想贴到多台，这里把事实讲清楚，避免"以为全贴了、回车只动一台"。
+    if ((props.broadcastCount ?? 0) > 0) {
+      pasteConfirm.value = { text, n: props.broadcastCount ?? 0 }
+      return false
+    }
     term?.paste(text)
     return true
   } catch {
     return false
   }
+}
+
+const pasteConfirm = ref<{ text: string; n: number } | null>(null)
+function confirmPaste() {
+  const p = pasteConfirm.value
+  pasteConfirm.value = null
+  if (p && term) term.paste(p.text)
 }
 
 function selectAllText() {
@@ -233,6 +245,13 @@ onBeforeUnmount(() => {
   <div class="term-wrap" v-show="active" @contextmenu.prevent="onContext">
     <div ref="termEl" class="term"></div>
     <!-- 右键菜单：复制 / 粘贴 / 解释这段（终端里 Ctrl+Shift+C/V 同效） -->
+    <div v-if="pasteConfirm" class="ctx-menu paste-confirm" :style="{ left: '40%', top: '40%' }" @click.stop>
+      <div class="dim">⚠ 广播模式中（{{ pasteConfirm.n }} 台）—— 粘贴<b>只作用于当前终端</b>，键盘输入才会广播。要继续？</div>
+      <div class="paste-actions">
+        <button @click="confirmPaste">仅粘到当前终端</button>
+        <button @click="pasteConfirm = null">取消</button>
+      </div>
+    </div>
     <div v-if="ctxMenu" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
       <button @click="ctxCopy">📋 复制选中</button>
       <button @click="ctxPaste">📥 粘贴</button>
@@ -265,6 +284,10 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 .ctx-menu button:hover { background: var(--ctp-surface0); }
+.paste-confirm { width: 280px; padding: 10px; gap: 8px; }
+.paste-confirm .dim { line-height: 1.5; }
+.paste-actions { display: flex; gap: 6px; }
+.paste-actions button { flex: 1; justify-content: center; }
 .term-wrap {
   height: 100%;
   width: 100%;

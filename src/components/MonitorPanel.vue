@@ -555,11 +555,14 @@ onBeforeUnmount(() => {
 
       <div class="net-box">
         <div class="section-title">网络 <span class="unit">{{ windowLabel }}</span></div>
-        <div v-if="ping" class="net-quality">
-                  <span class="unit">到 {{ ping.target }}</span>
+                <div v-if="metrics?.platform && metrics.platform !== 'Linux'" class="ping-hint dim warn">
+                  目标平台 {{ metrics.platform }} 非 Linux —— /proc 不存在，下方指标不可用（不编 0 骗人）。
                 </div>
-                <div class="chart-box" ref="pingEl"></div>
-                <div class="ping-hint dim">时延 / 丢包 · 每 15 秒一档 · 指针悬停看图例数值 · 采到默认网关才有曲线</div>
+                <div v-if="ping" class="net-quality">
+                          <span class="unit">到 {{ ping.target }}</span>
+                        </div>
+                        <div class="chart-box" ref="pingEl"></div>
+                        <div class="ping-hint dim">时延 / 丢包 = 本机 → 默认网关路径（每 15 秒一档 · 悬停看图例数值 · 采到网关才有曲线）；速率 = 目标机网卡计数 —— 经跳板/隧道时不是端到端链路</div>
                 <div class="net-total">
           <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
           <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
@@ -794,6 +797,7 @@ onBeforeUnmount(() => {
 .net-quality { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .net-quality .bad { color: #e5484d; font-weight: 600; }
 .ping-hint { font-size: 10px; color: var(--ctp-overlay0); margin: 4px 0 2px; }
+.ping-hint.warn { color: var(--ctp-red); }
 .down { color: var(--ctp-green); } .up { color: var(--ctp-blue); }
 .net-if, .io-row { display: flex; gap: 10px; color: var(--ctp-subtext0); padding: 1px 0; }
 .ifname { color: var(--ctp-overlay0); min-width: 56px; }

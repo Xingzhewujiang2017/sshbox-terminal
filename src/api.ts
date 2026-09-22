@@ -244,6 +244,7 @@ export interface ProcInfo {
 }
 export interface Metrics {
   ts: number
+  platform?: string
   cpu_pct: number
   cpu_per_core: number[]
   mem_total_kb: number
