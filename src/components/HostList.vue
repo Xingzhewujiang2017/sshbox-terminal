@@ -20,11 +20,34 @@ const emit = defineEmits<{
 
 const query = ref('')
 const collapsed = ref<Record<string, boolean>>({})
+/** 是否显示被合并的重复配置（默认合并，点了才展开）。 */
+const showAll = ref(false)
+
+/** 同 host+port+user 只显示第一条：hosts.json 里复制出来的重复条目
+ *  （hostId 不同但指向同一台机器）会在主页列表、演练台出现 N 个同名行，
+ *  连接还会开出一堆重复标签。按连接目标去重，保留首次出现的那条。 */
+const deduped = computed(() => {
+  const seen = new Set<string>()
+  const out: Host[] = []
+  for (const h of props.data.hosts ?? []) {
+    const key = `${h.username}@${h.host}:${h.port ?? 22}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(h)
+  }
+  return out
+})
+
+/** 被去重隐藏的条数（数据仍在 hosts.json 里，只是列表不重复显示）。 */
+const mergedCount = computed(() => (props.data.hosts?.length ?? 0) - deduped.value.length)
+
+/** 默认合并显示；用户点「显示全部」后按原样列出，避免"我建的主机不见了"。 */
+const shown = computed(() => (showAll.value ? (props.data.hosts ?? []) : deduped.value))
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase()
-  if (!q) return props.data.hosts
-  return props.data.hosts.filter(
+  if (!q) return shown.value
+  return shown.value.filter(
     (h) =>
       h.name.toLowerCase().includes(q) ||
       h.host.toLowerCase().includes(q) ||
@@ -151,6 +174,13 @@ function onGroupClick(g: string) {
 
     <input v-model="query" class="search" placeholder="搜索主机 / 地址 / 用户" />
 
+    <div v-if="mergedCount > 0 && !query" class="merge-hint">
+      <span>已合并 {{ mergedCount }} 条指向相同目标的配置</span>
+      <button class="merge-toggle" @click="showAll = !showAll">
+        {{ showAll ? '合并显示' : '显示全部' }}
+      </button>
+    </div>
+
     <div class="list">
       <div v-if="!filtered.length" class="empty-hint">
         {{ data.hosts.length ? '没有匹配的主机' : '还没有主机，点「新建连接」添加' }}
@@ -241,6 +271,16 @@ function onGroupClick(g: string) {
   color: var(--ctp-text); padding: 5px 8px; font-size: 12px; outline: none;
 }
 .search:focus { border-color: var(--ctp-blue); }
+.merge-hint {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  margin: 6px 0 2px; padding: 5px 8px; border-radius: 6px;
+  background: var(--ctp-surface0); color: var(--ctp-subtext0); font-size: 11px;
+}
+.merge-toggle {
+  background: none; border: none; padding: 0; cursor: pointer;
+  color: var(--ctp-blue); font-size: 11px; text-decoration: underline;
+}
+.merge-toggle:hover { color: var(--ctp-sapphire); }
 .list { flex: 1; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
 .empty-hint { color: var(--ctp-surface1); font-size: 11px; padding: 10px 2px; line-height: 1.6; }
 .group-head {
