@@ -634,6 +634,17 @@ const injectEvalSkip = ref<Set<string>>(new Set())
 /** 清除类型确认后：**不走终端 pty**（恢复链 sleep 还占着终端时，pty 里的清除会
  *  排队等到睡眠结束——用户看到的"清除没生效"根因）。改走独立 exec 通道立即
  *  执行，直连每台目标清掉规则，不排队不等待。 */
+/** 清除改走「填入终端」：直连清除以登录用户身份执行，**不继承终端里 su/sudo
+ *  切换的 root**。已切换身份的用户用这个 —— 命令填进终端自己回车，
+ *  在 root shell 里跑（与注入同一身份，保证能清掉）。 */
+function fillClearToTerminals() {
+  const c = injectConfirm.value
+  if (!c) return
+  for (const t of c.targets) emit('command', { sid: t.sid, text: t.cmd })
+  injectConfirm.value = null
+  injectMsg.value = `清除命令已填入 ${c.n} 台终端 —— 终端里已 su/sudo 切换 root 的话直接回车执行；没切换则命令会自动尝试免密 sudo`
+}
+
 async function confirmInjectExecute() {
   const c = injectConfirm.value
   if (!c) return
@@ -661,7 +672,9 @@ async function confirmInjectExecute() {
       })
     }
     const bad = c.targets.filter((t) => !results[t.sid]?.ok).map((t) => t.label)
-    injectMsg.value = bad.length ? `清除完成，${bad.length} 台失败：${bad.join('、')}（看输出块）` : `已直连清除 ${c.n} 台 —— 曲线将在下个采样周期回落`
+    injectMsg.value = bad.length
+      ? `清除完成，${bad.length} 台失败：${bad.join('、')}（看输出块）—— 直连清除以登录用户身份执行，不继承终端里 su/sudo 的 root；已切换身份的话用「填入终端」方式再清一次`
+      : `已直连清除 ${c.n} 台 —— 曲线将在下个采样周期回落`
     void nextTick(() => updateCharts())
     return
   }
@@ -924,6 +937,7 @@ onBeforeUnmount(() => {
                 <pre class="inj-full">{{ injectConfirm.cmd }}</pre>
               </details>
               <button class="btn danger" @click="confirmInjectExecute">{{ injectType === 'clear' ? '⚠ 立即清除（' + injectConfirm.n + ' 台，直连不排队）' : '⚠ 立即执行（' + injectConfirm.n + ' 台）' }}</button>
+              <button v-if="injectType === 'clear'" class="btn ghost" style="margin-left: 6px" @click="fillClearToTerminals" title="直连清除以登录用户身份执行，不继承终端里 su/sudo 切换的 root —— 已切换身份时用这个，回车由你按">填入终端（跟随当前身份）</button>
               <button class="btn ghost" style="margin-left: 6px" @click="injectConfirm = null">仅等待</button>
             </div>
           </template>
