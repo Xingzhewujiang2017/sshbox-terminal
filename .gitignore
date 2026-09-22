@@ -3,3 +3,6 @@ dist
 src-tauri/target
 *.log
 .dev/
+
+# 交付产物（安装包/绿色版/WebView2 离线包，体积大不入库）
+release-artifacts/
