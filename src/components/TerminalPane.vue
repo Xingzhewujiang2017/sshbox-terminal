@@ -86,10 +86,32 @@ defineExpose({
   clearScreen,
 })
 
+const ctxMenu = ref<{ x: number; y: number } | null>(null)
+
 function onContext(e: MouseEvent) {
-  // 选中了就提供「解释这段」；没选中也能用（AI 看最近的输出）
-  emit('context', { x: e.clientX, y: e.clientY, selection: getSelection() })
+  ctxMenu.value = { x: e.clientX, y: e.clientY }
 }
+
+function ctxCopy() {
+  ctxMenu.value = null
+  void copySelection()
+}
+
+function ctxPaste() {
+  ctxMenu.value = null
+  // 不自动回车 —— 由用户确认后再按，避免误执行剪贴板里的命令
+  void pasteClipboard()
+}
+
+function ctxAskAI() {
+  const pos = ctxMenu.value
+  ctxMenu.value = null
+  if (pos) emit('context', { x: pos.x, y: pos.y, selection: getSelection() })
+}
+
+onMounted(() => {
+  document.addEventListener('click', () => (ctxMenu.value = null))
+})
 
 const termEl = ref<HTMLDivElement>()
 let term: Terminal | null = null
@@ -204,10 +226,39 @@ onBeforeUnmount(() => {
 <template>
   <div class="term-wrap" v-show="active" @contextmenu.prevent="onContext">
     <div ref="termEl" class="term"></div>
+    <!-- 右键菜单：复制 / 粘贴 / 解释这段（终端里 Ctrl+Shift+C/V 同效） -->
+    <div v-if="ctxMenu" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
+      <button @click="ctxCopy">📋 复制选中</button>
+      <button @click="ctxPaste">📥 粘贴</button>
+      <button @click="ctxAskAI">🤖 解释这段（AI）</button>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  background: var(--ctp-mantle);
+  border: 1px solid var(--ctp-surface0);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.ctx-menu button {
+  background: transparent;
+  border: none;
+  color: var(--ctp-text);
+  font-size: 12px;
+  text-align: left;
+  padding: 6px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-menu button:hover { background: var(--ctp-surface0); }
 .term-wrap {
   height: 100%;
   width: 100%;
