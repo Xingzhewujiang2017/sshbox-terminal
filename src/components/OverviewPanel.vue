@@ -495,7 +495,7 @@ onBeforeUnmount(() => {
                               <button :class="{ on: viewMode === 'cards' }" @click="viewMode = 'cards'">卡片</button>
                             </span>
               <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
-                                    <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前视图为 CSV（含分组）">导出 CSV</button>
+                                    <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前实时视图为 CSV（快照型：当前窗口/矩阵数据，非历史全量；要历史范围请用历史页导出）">导出 CSV（当前视图）</button>
                       <button
                         v-if="Object.keys(histData).length"
                         class="btn ghost"

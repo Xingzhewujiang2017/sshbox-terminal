@@ -179,7 +179,7 @@ for f in /sys/class/net/*/operstate; do
   echo "$n $st ${ty:-0}"
 done
 echo "@@DISKIO@@"; cat /proc/diskstats 2>/dev/null
-echo "@@DF@@"; df -P -k 2>/dev/null
+echo "@@DF@@"; df -P -T -k 2>/dev/null
 echo "@@LOAD@@"; cat /proc/loadavg 2>/dev/null
 echo "@@SYS@@ hz=$(getconf CLK_TCK 2>/dev/null || echo 100) pagesize=$(getconf PAGESIZE 2>/dev/null || echo 4096)"
 # Processes, builtins only (read/echo) so 200+ procs stay cheap.
@@ -189,7 +189,8 @@ for d in /proc/[0-9]*; do
   IFS= read -r st < "$d/stat" 2>/dev/null || continue
   comm=${st#*(}; comm=${comm%%)*}
   rest=${st##*) }
-  [ -n "$rest" ] || continue
+  [ ext4 -n "$rest" ] || continue
+
   set -- $rest
   # ${12} braces are mandatory: "$12" is $1 followed by a literal 2 in POSIX sh.
   echo "${d#/proc/}|$comm|$1|${12}|${13}|${22}"
@@ -311,7 +312,7 @@ echo "@@LSCPU@@"; lscpu 2>/dev/null
 echo "@@CPUINFO@@"; head -40 /proc/cpuinfo 2>/dev/null
 echo "@@MEMTOT@@ $(grep MemTotal /proc/meminfo 2>/dev/null)"
 echo "@@UPTIME@@ $(cat /proc/uptime 2>/dev/null)"
-echo "@@DF@@"; df -P -k 2>/dev/null
+echo "@@DF@@"; df -P -T -k 2>/dev/null
 echo "@@END@@"
 "#;
 
@@ -321,10 +322,16 @@ async fn exec_capture(handle: &client::Handle<ClientHandler>, cmd: &str) -> Resu
 }
 
 /// 同 exec_capture，但额外返回退出码（演练台组播执行用；缺 ExitStatus 时给 -1）。
+/// 全局采集并发节流：N 标签 = N 路独立采样循环，30 台全开可见会成 exec 风暴。
+/// 这里统一限 8 路并发，其余排队（Tokio semaphore，permit 持到命令收发完）。
+static EXEC_SEM: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(8));
+
 pub async fn exec_capture_code(
     handle: &client::Handle<ClientHandler>,
     cmd: &str,
 ) -> Result<(String, i32)> {
+    // 全局节流：permit 在函数返回时释放（它在 async 块里 drop）
+    let _permit = EXEC_SEM.acquire().await.map_err(|_| anyhow::anyhow!("采集并发闸门关闭"))?;
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, cmd).await?;
 
@@ -392,9 +399,13 @@ const SKIP_MOUNT_PREFIXES: &[&str] = &[
 /// Filtering on the *device* (old behaviour: `starts_with('/')`) silently
 /// dropped the root row in containers (`overlay`) and on WSL (`none`), so the
 /// decision is made from the mountpoint plus a real-filesystem check.
-fn keep_mount(device: &str, mount: &str) -> bool {
+fn keep_mount(device: &str, fstype: &str, mount: &str) -> bool {
     if mount == "/" {
         return true;
+    }
+    // 网络盘（NFS/CIFS/SMB/9p）不显示：statfs 对挂死的网络盘会阻塞整个采样循环
+    if matches!(fstype, "nfs" | "nfs4" | "cifs" | "smb" | "smb3" | "9p" | "fuse.sshfs" | "fuse.glusterfs") {
+        return false;
     }
     if SKIP_MOUNT_PREFIXES.iter().any(|p| mount.starts_with(p)) {
         return false;
@@ -414,16 +425,16 @@ fn parse_df(lines: Option<&Vec<String>>) -> Vec<DiskUsage> {
     if let Some(ls) = lines {
         for line in ls {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() >= 6 && f[0] != "Filesystem" && keep_mount(f[0], f[5]) {
-                let total = f[1].parse::<u64>().unwrap_or(0);
-                let used = f[2].parse::<u64>().unwrap_or(0);
+            if f.len() >= 7 && f[0] != "Filesystem" && keep_mount(f[0], f[1], f[6]) {
+                let total = f[2].parse::<u64>().unwrap_or(0);
+                let used = f[3].parse::<u64>().unwrap_or(0);
                 let pct = if total > 0 {
                     used as f64 / total as f64 * 100.0
                 } else {
                     0.0
                 };
                 disks.push(DiskUsage {
-                    mount: f[5].to_string(),
+                    mount: f[6].to_string(),
                     total_kb: total,
                     used_kb: used,
                     use_pct: pct,
@@ -1372,13 +1383,31 @@ pub async fn collect_snapshot(handle: &client::Handle<ClientHandler>) -> Result<
         .ok_or_else(|| anyhow::anyhow!("指标解析失败（采集脚本输出异常）"))?;
 
     // 服务/硬件失败不致命：报告少两节，总比整份出不来强。
-    let (services, hardware, ping) = match exec_capture(handle, &slow_script()).await {
-        Ok(sraw) => {
+    let (services, hardware, ping) = match tokio::time::timeout(Duration::from_secs(25), exec_capture(handle, &slow_script())).await {
+        Ok(Ok(sraw)) => {
             let sec = sections(&sraw);
             (parse_services(&sec), parse_hardware(&sec), parse_ping(&sec))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::warn!("报告：服务/硬件采集失败: {:#}", e);
+            (
+                ServiceInfo {
+                    failed: Vec::new(),
+                    ports: Vec::new(),
+                    port_total: 0,
+                    containers: Vec::new(),
+                    docker_available: false,
+                },
+                HardwareInfo {
+                    temps: Vec::new(),
+                    fans: Vec::new(),
+                    gpus: Vec::new(),
+                },
+                None,
+            )
+        }
+        Err(_) => {
+            log::warn!("报告：服务/硬件采集超时（25s 上限），跳过该节");
             (
                 ServiceInfo {
                     failed: Vec::new(),
@@ -1494,11 +1523,16 @@ pub fn spawn(
             if stop_flag.load(Ordering::SeqCst) || closed.load(Ordering::SeqCst) {
                 break;
             }
-            let raw = match exec_capture(&handle, COLLECT_SCRIPT).await {
-                Ok(r) => r,
-                Err(e) => {
+            let raw = match tokio::time::timeout(Duration::from_secs(8), exec_capture(&handle, COLLECT_SCRIPT)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
                     log::warn!("采集失败，监控任务退出: {:#}", e);
                     break;
+                }
+                Err(_) => {
+                    // 单轮超时（目标机卡死/docker 假死）不杀任务：跳过本轮，下轮再来
+                    log::warn!("采集超时（8s 上限），跳过本轮采样");
+                    continue;
                 }
             };
 
@@ -1508,8 +1542,8 @@ pub fn spawn(
             let slow_due = last_slow.map_or(true, |t| t.elapsed() >= SLOW_EVERY);
             if slow_due {
                 last_slow = Some(Instant::now());
-                match exec_capture(&handle, &slow_script()).await {
-                    Ok(sraw) => {
+                match tokio::time::timeout(Duration::from_secs(20), exec_capture(&handle, &slow_script())).await {
+                    Ok(Ok(sraw)) => {
                         // One round trip carries both: the sensor reads are a
                         // few file cats, the GPU query is the only real cost.
                         let sec = sections(&sraw);
@@ -1545,7 +1579,8 @@ pub fn spawn(
                             }
                         }
                     }
-                    Err(e) => log::warn!("服务信息采集失败: {:#}", e),
+                    Ok(Err(e)) => log::warn!("服务信息采集失败: {:#}", e),
+                    Err(_) => log::warn!("慢采集超时（20s 上限），跳过本轮"),
                 }
             }
             if let Some(m) = parse_metrics(&raw, &mut prev) {
@@ -1740,15 +1775,15 @@ mod tests {
     #[test]
     fn df_keeps_root_and_drops_noise() {
         let rows = lines(&[
-            "Filesystem     1024-blocks      Used Available Capacity Mounted on",
-            "none               4029616         4   4029612       1% /mnt/wsl",
-            "drivers          209715196 191965376  17749820      92% /usr/lib/wsl/drivers",
-            "/dev/sdc        1055762868   2311604 999747792       1% /",
-            "tmpfs                 4096         0      4096       0% /sys/fs/cgroup",
-            "C:\\              209715196 191965376  17749820      92% /mnt/c",
-            "/dev/sdb1        1048576000  10485760 1038090240       1% /data",
-            "overlay          104857600   52428800  52428800      50% /var/lib/docker/overlay2",
-            "overlay           52428800   26214400  26214400      50% /var/lib/containers",
+            "Filesystem Type 1024-blocks      Used Available Capacity Mounted on",
+            "none ext4 4029616 4 4029612 1% /mnt/wsl",
+            "drivers ext4 209715196 191965376 17749820 92% /usr/lib/wsl/drivers",
+            "/dev/sdc ext4 1055762868 2311604 999747792 1% /",
+            "tmpfs ext4 4096 0 4096 0% /sys/fs/cgroup",
+            "C:\\ ext4 209715196 191965376 17749820 92% /mnt/c",
+            "/dev/sdb1 ext4 1048576000 10485760 1038090240 1% /data",
+            "overlay ext4 104857600 52428800 52428800 50% /var/lib/docker/overlay2",
+            "overlay ext4 52428800 26214400 26214400 50% /var/lib/containers",
         ]);
         let disks = parse_df(Some(&rows));
         let mounts: Vec<&str> = disks.iter().map(|d| d.mount.as_str()).collect();

@@ -365,6 +365,27 @@ fn prune(conn: &mut Connection) {
         Ok(n) => log::info!("时延历史清理: 删除 {} 行（保留 {} 天）", n, days),
         Err(e) => log::warn!("时延历史清理失败: {:#}", e),
     }
+    // DELETE 之后 WAL 不回收，-wal 文件会越涨越大（长跑机器的 %APPDATA% 陷阱）。
+    // checkpoint(TRUNCATE) 把 WAL 合并回主库并截断；低频 VACUUM 回收主库空洞。
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let meta: Result<String, _> = conn
+        .query_row("SELECT v FROM meta WHERE k = 'last_vacuum'", [], |r| r.get(0));
+    let due = match meta {
+        Ok(s) => s.parse::<i64>().unwrap_or(0) + 7 * 86_400 <= now_unix() as i64,
+        Err(_) => true,
+    };
+    if due {
+        match conn.execute_batch("VACUUM;") {
+            Ok(()) => {
+                let _ = conn.execute(
+                    "INSERT INTO meta(k, v) VALUES('last_vacuum', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    params![now_unix().to_string()],
+                );
+                log::info!("历史库 VACUUM 完成（每 7 天一次，回收删除空洞）");
+            }
+            Err(e) => log::warn!("VACUUM 失败: {:#}", e),
+        }
+    }
 }
 
 fn open_at(path: &Path) -> Result<Connection> {

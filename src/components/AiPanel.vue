@@ -5,7 +5,8 @@
  * 生成命令**不自动执行** —— 面板里给一个「插入终端」按钮，
  * 命令落进终端后仍由用户按回车。这是安全底线：模型可能给出 rm 之类的命令。
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { listen } from '@tauri-apps/api/event'
 import { api } from '../api'
 import {
   ai,
@@ -83,6 +84,25 @@ const DANGEROUS: { re: RegExp; hint: string }[] = [
 ]
 const insertWarn = ref<{ text: string; hint: string } | null>(null)
 
+// --- 一次性告知（c）：上下文会发往第三方模型；localStorage 记住，不每轮弹窗 ---
+const showNotice = ref(!localStorage.getItem('sshbox_ai_notice'))
+function dismissNotice() {
+  localStorage.setItem('sshbox_ai_notice', '1')
+  showNotice.value = false
+}
+
+// --- 成本透明：服务端 usage 事件 → 每轮回复显示 token 数 ---
+const lastUsage = ref<{ p: number; c: number; total: number } | null>(null)
+let unlistenUsage: (() => void) | null = null
+onMounted(() => {
+  void listen<{ req_id?: string; prompt_tokens?: number; completion_tokens?: number; total?: number }>('ssh://ai/usage', (e) => {
+    if (e.payload && e.payload.total != null) {
+      lastUsage.value = { p: e.payload.prompt_tokens ?? 0, c: e.payload.completion_tokens ?? 0, total: e.payload.total }
+    }
+  }).then((u) => (unlistenUsage = u))
+})
+onBeforeUnmount(() => unlistenUsage?.())
+
 function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
   if (t.streaming) return
   const text = cleanCommand(t.content)
@@ -135,6 +155,11 @@ function plainThink(s: string): string {
   <aside class="ai-drawer">
     <div class="head">
       <span class="title">AI 助手</span>
+      <span class="spacer"></span>
+      <div v-if="showNotice" class="ai-notice">
+        提示：提问/生成命令时会自动带上当前终端最近的输出（敏感内容已自动打码），发送到第三方模型 {{ profile?.protocol ?? 'AI 服务商' }}。点「知道了」后不再提示。
+        <button class="mini" @click="dismissNotice">知道了</button>
+      </div>
       <!-- 直接在下拉里换模型：以前每次换都要开设置 → AI 模型 → 使用，问一句换一次很烦 -->
       <select
         v-if="profiles.length"
@@ -215,6 +240,7 @@ function plainThink(s: string): string {
       </div>
     </div>
 
+    <div v-if="lastUsage" class="tok">↑{{ lastUsage.p }} ↓{{ lastUsage.c }} · {{ lastUsage.total }} tok（本模型 {{ profile?.model ?? '' }}）</div>
     <div v-if="insertWarn" class="warn-float">
       <div class="err">⚠ 危险命令（{{ insertWarn.hint }}）：不会自动执行，确认要插入终端？</div>
       <code>{{ insertWarn.text }}</code>
@@ -427,6 +453,15 @@ function plainThink(s: string): string {
   border-radius: 6px;
   background: var(--ctp-mantle);
 }
+.ai-notice {
+  font-size: 11px;
+  color: var(--ctp-yellow);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 8px;
+}
+.tok { font-size: 10px; color: var(--ctp-overlay0); text-align: right; padding: 0 10px 4px; }
 .warn-float code {
   display: block;
   white-space: pre-wrap;

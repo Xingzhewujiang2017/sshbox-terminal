@@ -291,6 +291,12 @@ const netTotals = computed(() => {
   )
 })
 
+/** 首帧速率没有基线（差值法要两帧），显示"采样中"而非 0 —— 不假装没流量 */
+const netReady = ref(false)
+watch(metrics, (m) => {
+  if (m && !netReady.value) netReady.value = true
+})
+
 /** Percent chart (fixed 0-100 axis). */
 function initPct(el: HTMLDivElement): echarts.ECharts {
   const p = chartPalette()
@@ -564,9 +570,14 @@ onBeforeUnmount(() => {
                         <div class="chart-box" ref="pingEl"></div>
                         <div class="ping-hint dim">时延 / 丢包 = 本机 → 默认网关路径（每 15 秒一档 · 悬停看图例数值 · 采到网关才有曲线）；速率 = 目标机网卡计数 —— 经跳板/隧道时不是端到端链路</div>
                 <div class="net-total">
-          <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
-          <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
-        </div>
+                          <template v-if="netReady">
+                            <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
+                            <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
+                          </template>
+                          <template v-else>
+                            <span class="dim">速率采样中…（首帧无基线）</span>
+                          </template>
+                        </div>
         <div class="chart-box" ref="netEl"></div>
         <div v-for="n in paged('net', metrics.net)" :key="n.name" class="net-if">
           <span class="ifname">{{ n.name }}</span>

@@ -602,6 +602,148 @@ pub fn net_error(url: &str, e: &reqwest::Error) -> String {
 // 上下文裁剪
 // ---------------------------------------------------------------------------
 
+/// 敏感内容打码：私钥块、`password=`/`token=`/`api_key=` 值、`Bearer xxx`。
+/// 打码不删除（保留结构，模型仍知道"这里有密码字段"），返回 (文本, 打码处数)。
+pub fn censor_sensitive(text: &str) -> (String, usize) {
+    let mut n = 0usize;
+    let mut s = String::with_capacity(text.len());
+    // 私钥块
+    let mut rest = text;
+    while let Some(pos) = rest.find("-----BEGIN") {
+        s.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some(end_rel) = after.find("-----END") {
+            let end_abs = end_rel + "-----END".len();
+            if let Some(line_end) = after[end_abs..].find('\n') {
+                let block = &after[..end_abs + line_end];
+                if block.contains("PRIVATE KEY") {
+                    s.push_str("-----BEGIN PRIVATE KEY-----\n**** 已脱敏 ****\n-----END PRIVATE KEY-----\n");
+                    n += 1;
+                    rest = &after[end_abs + line_end + 1..];
+                    continue;
+                }
+            }
+        }
+        s.push_str(after);
+        rest = "";
+        break;
+    }
+    s.push_str(rest);
+    if n > 0 {
+        return (s, n);
+    }
+    // 键值对（password=xxx / api_key:xxx / client_secret=yyy …）—— 纯字符串扫描，无 regex 依赖
+    const KEYS: [&str; 12] = [
+        "password", "passwd", "secret", "token", "api_key", "api-key", "apikey", "access_key",
+        "access-key", "accesskey", "client_secret", "client-secret",
+    ];
+    let lower = text.to_lowercase();
+    let lb = lower.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i + 3 < lb.len() {
+        let mut matched: Option<usize> = None; // 关键字长度
+        for k in KEYS {
+            let kb = k.as_bytes();
+            if lb.len() - i >= kb.len() && &lb[i..i + kb.len()] == kb {
+                let prev_ok = i == 0 || !(lb[i - 1].is_ascii_alphanumeric() || lb[i - 1] == b'_' || lb[i - 1] == b'-');
+                let mut j = i + kb.len();
+                while j < lb.len() && lb[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let sep_ok = j < lb.len() && (lb[j] == b'=' || lb[j] == b':');
+                if prev_ok && sep_ok {
+                    matched = Some(kb.len());
+                    break;
+                }
+            }
+        }
+        let Some(klen) = matched else {
+            i += 1;
+            continue;
+        };
+        let abs = i;
+        let mut j = abs + klen;
+        while j < lb.len() && lb[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < lb.len() && (lb[j] == b'=' || lb[j] == b':') {
+            j += 1;
+        }
+        while j < lb.len() && lb[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let vstart = j;
+        while j < lb.len() && !lb[j].is_ascii_whitespace() && !matches!(lb[j], b',' | b';' | b'"' | b'\'' | b'<' | b'>') {
+            j += 1;
+        }
+        let vlen = j - vstart;
+        out.push_str(&text[cursor..abs]);
+        if vlen >= 4 {
+            out.push_str(&text[abs..vstart]);
+            out.push_str("****");
+            n += 1;
+        } else {
+            out.push_str(&text[abs..j]);
+        }
+        cursor = j;
+        i = j;
+    }
+    out.push_str(&text[cursor..]);
+    // Bearer token（≥16 字符高熵）
+    let lower2 = out.to_lowercase();
+    let mut final_out = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    loop {
+        let Some(pos) = lower2_find_bearer(rest) else { break };
+        let (head, tail) = rest.split_at(pos);
+        final_out.push_str(head);
+        let after = &tail[6..];
+        let tok_end = after.find(char::is_whitespace).unwrap_or(after.len());
+        let tok = &after[..tok_end];
+        if tok.len() >= 16 {
+            final_out.push_str("Bearer ****");
+            n += 1;
+        } else {
+            final_out.push_str("Bearer ");
+            final_out.push_str(tok);
+        }
+        rest = &after[tok_end..];
+    }
+    final_out.push_str(rest);
+    (final_out, n)
+}
+
+/// 大小写不敏感的 "bearer " 定位（对剩余串，返回命中位置）
+fn lower2_find_bearer(rest: &str) -> Option<usize> {
+    let lower = rest.to_lowercase();
+    let mut idx = 0usize;
+    for _ in 0..rest.len() {
+        idx = 0;
+        for (p, ch) in rest.char_indices() {
+            let _ = p;
+            idx = 0;
+            break;
+        }
+        break;
+    }
+    let _ = idx;
+    lower.find("bearer ").or_else(|| {
+        // 行首/空白后的 Bearer 也要找（"bearer" 无尾空格情况极少，先覆盖带空格）
+        None
+    })
+}
+
+/// OpenAI 兼容流末尾（或非流式响应）里的 usage：{"prompt_tokens":N,"completion_tokens":M}
+pub fn parse_usage(data: &str) -> Option<(u64, u64)> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let u = v.get("usage")?;
+    let p = u.get("prompt_tokens")?.as_u64()?;
+    let c = u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0);
+    Some((p, c))
+}
+
 /// 按字符数粗略裁掉超长上下文（终端输出可能几万行）。
 ///
 /// 保留**头部**（主机/命令上下文）与**尾部**（最近的报错），中间省略 ——
@@ -734,17 +876,19 @@ pub async fn send_once(
 /// - 流中途断开**不丢已收到的内容** —— 部分回答也比一句「失败」有用；
 /// - 「干净地结束但一个字都没有」**重试一次**（提供方偶发空回复，见 `send_once`）；
 ///   只在还没有任何增量时重试，所以不会把文本吐两遍。
-pub async fn send_stream<F, G>(
+pub async fn send_stream<F, G, U>(
     profile: &AiProfile,
     key: Option<&str>,
     messages: &[ChatMessage],
     req_id: &str,
     mut on_delta: F,
     mut on_reasoning: G,
+    mut on_usage: U,
 ) -> Result<String>
 where
     F: FnMut(&str),
     G: FnMut(&str),
+    U: FnMut(u64, u64),
 {
     let proto = Protocol::parse(&profile.protocol);
     let mut acc = String::new();
@@ -794,6 +938,9 @@ where
                 }
                 if let Some(r) = parse_reasoning(proto, data) {
                     on_reasoning(&r);
+                }
+                if let Some(u) = parse_usage(data) {
+                    on_usage(u.0, u.1);
                 }
                 if let Some(text) = parse_delta(proto, data) {
                     acc.push_str(&text);

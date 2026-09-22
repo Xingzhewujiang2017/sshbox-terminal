@@ -460,7 +460,7 @@ onBeforeUnmount(() => {
     <div class="panel">
       <div class="head">
         <span class="title">历史回看</span>
-        <span class="sub">按本机时间 · 落盘数据来自监控采样</span>
+        <span class="sub">按本机时间 · 落盘数据来自监控采样（每 2 秒取一点，与实时视图口径不同；间隔可在设置里调）</span>
         <button class="close" @click="emit('close')">×</button>
       </div>
 

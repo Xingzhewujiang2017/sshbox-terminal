@@ -500,7 +500,8 @@ function ifaceSetup(manualNic: string, autoNic: string): string[] {
 
 function netemLine(rule: string): string {
   if (injectRecover.value && injectRecoverSecs.value > 0) {
-    return `"$TC" qdisc replace dev "$IFACE" root netem ${rule} && sleep ${injectRecoverSecs.value} && "$TC" qdisc del dev "$IFACE" root && echo '已自动恢复'`
+    // 恢复链 del 静默：恢复时若规则已被手动清除，不报错吓人
+    return `"$TC" qdisc replace dev "$IFACE" root netem ${rule} && sleep ${injectRecoverSecs.value} && "$TC" qdisc del dev "$IFACE" root 2>/dev/null || true && echo '已自动恢复'`
   }
   return `"$TC" qdisc replace dev "$IFACE" root netem ${rule}`
 }
@@ -576,7 +577,10 @@ function runInject() {
       if (injectNicMode.value === 'manual' && !nic) notes.push(`${t.label}: 未填网卡，该台中止`)
       return { t, cmd: buildInjectCmd({ sid: t.sid, key: keyOf(t.sid) }, installNic(nic, nicDefault[t.sid])), nic }
     })
-    for (const p of per) emit('command', { sid: p.t.sid, text: p.cmd })
+    for (const p of per) {
+      // clear 不走终端：pty 里恢复链/注入命令可能还在排，填进去会原地排队
+      if (injectType.value !== 'clear') emit('command', { sid: p.t.sid, text: p.cmd })
+    }
     if (injectType.value === 'clear') {
       // 清除：移除注入标记与效果检测；事件记"已清除"
       for (const t of targets) {
@@ -627,11 +631,41 @@ function installNic(nic: string, nicDefault: string): string {
 /** 注入效果检测跳过名单（非默认出口/blip），确认执行时沿用 */
 const injectEvalSkip = ref<Set<string>>(new Set())
 
-function confirmInjectExecute() {
+/** 清除类型确认后：**不走终端 pty**（恢复链 sleep 还占着终端时，pty 里的清除会
+ *  排队等到睡眠结束——用户看到的"清除没生效"根因）。改走独立 exec 通道立即
+ *  执行，直连每台目标清掉规则，不排队不等待。 */
+async function confirmInjectExecute() {
   const c = injectConfirm.value
   if (!c) return
-  for (const t of c.targets) emit('command', { sid: t.sid, text: t.cmd, execute: true })
   injectConfirm.value = null
+  if (injectType.value === 'clear') {
+    injectMsg.value = '正在直连清除各台规则…'
+    const results: Record<string, LabExec> = {}
+    await Promise.allSettled(
+      c.targets.map(async (t) => {
+        try {
+          results[t.sid] = await api.execBatch(t.sid, t.cmd, 30)
+        } catch (e) {
+          results[t.sid] = { sid: t.sid, ok: false, stdout: '', exit: -1, elapsed_ms: 0, error: String(e) }
+        }
+      })
+    )
+    execResults.value = results
+    for (const t of c.targets) {
+      delete recoverUntil.value[t.sid]
+      const s = series.value[t.sid]
+      if (s) s.inject = []
+      labEvents.value.push({
+        label: t.label, time: new Date().toTimeString().slice(0, 8),
+        kind: 'clear', recAt: '', note: '', status: results[t.sid]?.ok ? '已清除（直连执行成功）' : `清除失败：${results[t.sid]?.error ?? results[t.sid]?.stdout?.slice(0, 80) ?? '未知'}`,
+      })
+    }
+    const bad = c.targets.filter((t) => !results[t.sid]?.ok).map((t) => t.label)
+    injectMsg.value = bad.length ? `清除完成，${bad.length} 台失败：${bad.join('、')}（看输出块）` : `已直连清除 ${c.n} 台 —— 曲线将在下个采样周期回落`
+    void nextTick(() => updateCharts())
+    return
+  }
+  for (const t of c.targets) emit('command', { sid: t.sid, text: t.cmd, execute: true })
   armInjectWatch(c.targets, injectRecover.value ? injectRecoverSecs.value : 0, injectEvalSkip.value)
   injectMsg.value = `已向 ${c.n} 台主机下发执行 —— 观察底部趋势图`
 }
@@ -889,7 +923,7 @@ onBeforeUnmount(() => {
                 <summary>查看完整命令（逐台）</summary>
                 <pre class="inj-full">{{ injectConfirm.cmd }}</pre>
               </details>
-              <button class="btn danger" @click="confirmInjectExecute">⚠ 立即执行（{{ injectConfirm.n }} 台）</button>
+              <button class="btn danger" @click="confirmInjectExecute">{{ injectType === 'clear' ? '⚠ 立即清除（' + injectConfirm.n + ' 台，直连不排队）' : '⚠ 立即执行（' + injectConfirm.n + ' 台）' }}</button>
               <button class="btn ghost" style="margin-left: 6px" @click="injectConfirm = null">仅等待</button>
             </div>
           </template>

@@ -1232,6 +1232,15 @@ async fn ai_summary(d: &ReportData) -> Result<String> {
     );
     // 报告这条也留一行日志：之前它走 send_once 不打日志，出了"报告里少一段 AI 结论"
     // 只能靠猜（实测提供方偶发空回复，见 ai::send_once 的说明）。
+    // 报告含主机名/IP/磁盘路径/挂载卷名 —— 发往外置模型前先脱敏，与对话上下文同一规则。
+    let prompt = {
+        let (censored, n) = crate::ai::censor_sensitive(&prompt);
+        if n > 0 {
+            format!("{censored}\n（注：以上内容已脱敏 {n} 处敏感信息。）")
+        } else {
+            censored
+        }
+    };
     let t0 = std::time::Instant::now();
     let out = crate::ai::send_once(
         &profile,
