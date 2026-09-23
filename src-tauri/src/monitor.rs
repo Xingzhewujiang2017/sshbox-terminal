@@ -1655,7 +1655,7 @@ pub fn spawn(
                         }
                         let _ = app.emit(
                             "ssh://ping",
-                            serde_json::json!({ "sid": sid, "ping": pg }),
+                            serde_json::json!({ "sid": sid, "ping": pg, "ts": wall_secs() }),
                         );
                         // 落库（独立 ping 表）：只有慢采集才有值，15s 一档。
                         if settings.history_enabled {
@@ -1695,9 +1695,19 @@ pub fn spawn(
                     "ssh://metrics",
                     serde_json::json!({ "sid": sid, "metrics": m }),
                 );
-                for a in fired {
-                    log::info!("告警[{}]: {}", sid, a.body);
-                    let _ = app.emit("ssh://alert", serde_json::json!({ "sid": sid, "alert": a }));
+                for ev in fired {
+                    // 触发和解除都走同一个事件，前端靠 resolved 区分：
+                    // 解除事件让徽标熄灭 / 「告警 N」递减，否则一次冲高会亮到会话结束。
+                    log::info!(
+                        "告警[{}]: {} {}",
+                        sid,
+                        if ev.resolved { "解除" } else { "触发" },
+                        ev.alert.body
+                    );
+                    let _ = app.emit(
+                        "ssh://alert",
+                        serde_json::json!({ "sid": sid, "alert": ev.alert, "resolved": ev.resolved }),
+                    );
                 }
             }
         }

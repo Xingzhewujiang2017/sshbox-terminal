@@ -31,6 +31,19 @@ pub struct Alert {
     pub threshold: f64,
 }
 
+/// One alert event: either a new alert, or the **resolution** of a previous one.
+///
+/// Resolution has to be an event, not a frontend timeout: the UI keeps alerts
+/// per session, so without it a single CPU spike leaves a ⚠ badge lit (and
+/// "告警 N" permanently positive) until the session is closed — the alarm stops
+/// being a signal. Emitted exactly once per excursion, on the firing → re-armed
+/// transition (the same branch that already had to detect it for the cooldown).
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertEvent {
+    pub alert: Alert,
+    pub resolved: bool,
+}
+
 #[derive(Clone)]
 struct Entry {
     /// Currently above the line (and already reported).
@@ -57,8 +70,9 @@ fn state() -> MutexGuard<'static, HashMap<(SessionId, String), Entry>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Evaluate one sample. Returns the alerts that should be surfaced *now*.
-pub fn evaluate(sid: &SessionId, m: &Metrics, s: &Settings) -> Vec<Alert> {
+/// Evaluate one sample. Returns the alert events that should be surfaced *now*
+/// (new alerts, and resolutions of earlier ones).
+pub fn evaluate(sid: &SessionId, m: &Metrics, s: &Settings) -> Vec<AlertEvent> {
     if !s.alerts_enabled {
         forget(sid);
         return Vec::new();
@@ -120,7 +134,7 @@ pub fn evaluate(sid: &SessionId, m: &Metrics, s: &Settings) -> Vec<Alert> {
 }
 
 fn check(
-    out: &mut Vec<Alert>,
+    out: &mut Vec<AlertEvent>,
     sid: &SessionId,
     kind: &str,
     value: f64,
@@ -132,8 +146,26 @@ fn check(
     let e = st.entry((sid.clone(), kind.to_string())).or_default();
 
     if value < threshold - HYSTERESIS {
-        // Comfortably back to normal: re-arm for the next excursion.
-        e.firing = false;
+        // Comfortably back to normal: re-arm for the next excursion, and say so
+        // once — the badge the UI is showing is no longer true.
+        if e.firing {
+            e.firing = false;
+            out.push(AlertEvent {
+                alert: Alert {
+                    kind: kind.to_string(),
+                    title: format!("SSHBox 告警解除 · {}", kind_label(kind)),
+                    body: format!(
+                        "{} 已回落到阈值以下（当前 {:.0}，阈值 {:.0}）",
+                        kind_label(kind),
+                        value,
+                        threshold
+                    ),
+                    value,
+                    threshold,
+                },
+                resolved: true,
+            });
+        }
         return;
     }
     if value < threshold {
@@ -151,12 +183,15 @@ fn check(
     }
     e.firing = true;
     e.last_ts = ts;
-    out.push(Alert {
-        kind: kind.to_string(),
-        title: format!("SSHBox 告警 · {}", kind_label(kind)),
-        body,
-        value,
-        threshold,
+    out.push(AlertEvent {
+        alert: Alert {
+            kind: kind.to_string(),
+            title: format!("SSHBox 告警 · {}", kind_label(kind)),
+            body,
+            value,
+            threshold,
+        },
+        resolved: false,
     });
 }
 
@@ -228,7 +263,7 @@ mod tests {
         let s = settings();
         let first = evaluate(&sid, &metrics(100.0, 95.0, 10.0, 10.0), &s);
         assert_eq!(first.len(), 1, "首次越过阈值应告警");
-        assert_eq!(first[0].kind, "cpu");
+        assert_eq!(first[0].alert.kind, "cpu");
         // Still hot 2s later, and every 2s after that: silence.
         for i in 1..30 {
             let a = evaluate(&sid, &metrics(100.0 + i as f64 * 2.0, 99.0, 10.0, 10.0), &s);
@@ -245,8 +280,10 @@ mod tests {
             evaluate(&sid, &metrics(100.0, 95.0, 10.0, 10.0), &s).len(),
             1
         );
-        // Back to normal — must re-arm.
-        assert!(evaluate(&sid, &metrics(110.0, 10.0, 10.0, 10.0), &s).is_empty());
+        // Back to normal — must re-arm, and say the earlier alert is over.
+        let back = evaluate(&sid, &metrics(110.0, 10.0, 10.0, 10.0), &s);
+        assert_eq!(back.len(), 1, "回落到阈值以下应发一条解除事件");
+        assert!(back[0].resolved);
         // Hot again but inside the cooldown window: still quiet.
         assert!(evaluate(&sid, &metrics(150.0, 95.0, 10.0, 10.0), &s).is_empty());
         // Past the cooldown: fires again.
@@ -256,6 +293,56 @@ mod tests {
             &s,
         );
         assert_eq!(later.len(), 1, "冷却结束后应重新告警");
+        forget(&sid);
+    }
+
+    #[test]
+    fn recovery_emits_one_resolution_then_a_fresh_alert() {
+        let sid = "t-resolve".to_string();
+        let s = settings();
+        assert_eq!(
+            evaluate(&sid, &metrics(100.0, 95.0, 10.0, 10.0), &s).len(),
+            1
+        );
+        // 回落：正好一条解除事件，带得动 UI 需要的字段
+        let back = evaluate(&sid, &metrics(110.0, 5.0, 10.0, 10.0), &s);
+        assert_eq!(back.len(), 1, "回落只发一条解除");
+        assert!(back[0].resolved);
+        assert_eq!(back[0].alert.kind, "cpu");
+        assert!(
+            back[0].alert.body.contains("已回落"),
+            "解除文案要说明回落到哪里：{}",
+            back[0].alert.body
+        );
+        // 一直正常：不再重复发解除（UI 不该被无效事件刷屏）
+        for i in 1..20 {
+            assert!(
+                evaluate(&sid, &metrics(110.0 + i as f64 * 2.0, 5.0, 10.0, 10.0), &s).is_empty(),
+                "第 {} 次正常采样不该再有事件",
+                i
+            );
+        }
+        // 冷却过后再冲高：是一条**新告警**，不是解除
+        let again = evaluate(
+            &sid,
+            &metrics(110.0 + COOLDOWN_SECS + 2.0, 95.0, 10.0, 10.0),
+            &s,
+        );
+        assert_eq!(again.len(), 1);
+        assert!(!again[0].resolved);
+        forget(&sid);
+    }
+
+    #[test]
+    fn inside_the_band_nothing_is_resolved() {
+        let sid = "t-band-resolve".to_string();
+        let s = settings();
+        assert_eq!(
+            evaluate(&sid, &metrics(100.0, 95.0, 10.0, 10.0), &s).len(),
+            1
+        );
+        // 88% 落在迟滞带内：状态保持 —— 既不解除，也不重复告警
+        assert!(evaluate(&sid, &metrics(102.0, 88.0, 10.0, 10.0), &s).is_empty());
         forget(&sid);
     }
 
@@ -307,9 +394,9 @@ mod tests {
         let a = evaluate(&sid, &m, &s);
         assert_eq!(a.len(), 1);
         assert!(
-            a[0].body.contains("/data"),
+            a[0].alert.body.contains("/data"),
             "应报最满的挂载点: {}",
-            a[0].body
+            a[0].alert.body
         );
         forget(&sid);
     }

@@ -154,7 +154,9 @@ onMounted(async () => {
     const t = tabs.value.find((x) => x.sid === ev.payload.sid)
     if (t) markClosed(t)
   })
-  listen<{ sid: string; alert: Alert }>('ssh://alert', (ev) => {
+  listen<{ sid: string; alert: Alert; resolved?: boolean }>('ssh://alert', (ev) => {
+    // 解除事件不弹窗、不发系统通知：总览徽标熄灭 + 「告警 N」递减就是提示。
+    if (ev.payload.resolved) return
     const a = ev.payload.alert
     const tab = tabs.value.find((x) => x.sid === ev.payload.sid)
     toast('error', `${a.title}${tab ? ' · ' + tab.label : ''}：${a.body}`)

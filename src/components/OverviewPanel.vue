@@ -10,7 +10,7 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { api, type Alert, type HistoryHost, type HistoryRange, type HostsFile, type Metrics, type PingRange } from '../api'
-import { alertFor, fleetNow, sampleFor } from '../fleet'
+import { activeAlertFor, fleetNow, sampleFor } from '../fleet'
 
 const props = defineProps<{
   tabs: {
@@ -33,21 +33,61 @@ const emit = defineEmits<{
   (e: 'command', p: { sid: string; text: string; execute?: boolean }): void
 }>()
 
-// --- 实时趋势窗口（按 sid，60 点上限）：CPU/内存来自 ssh://metrics（约 1s 一档），
-// 时延/丢包来自 ssh://ping（15s 一档，采不到网关整次跳过，不画 0 骗人）。
-interface LiveTrend { cpu: number[]; mem: number[]; lat: number[]; loss: number[] }
-const liveTrend = ref<Record<string, LiveTrend>>({})
+// --- 实时趋势窗口（卡片视图）------------------------------------------------
+// 数据来自**后端环形缓冲**（monitor_recent：RECENT=150 点 / RECENT_PING=48 点），
+// 不是本组件自己攒的事件流：面板是 v-if 重建的，自己攒的窗口一关就归零，而隐藏
+// 会话是 5× 降频采样，靠事件重新攒满要几十分钟。挂载时 hydrate，之后增量追加。
+// 每条曲线带自己的 ts（采样端时钟），所以图例里的时间跨度是算出来的，不是写死的。
+interface Series { ts: number[]; v: (number | null)[] }
+interface Trend { cpu: Series; mem: Series; lat: Series; loss: Series }
+/** 与后端 RECENT / RECENT_PING 对齐：前端窗口不该比后端长。 */
+const TREND_MAX = 150
+const PING_MAX = 48
+const trend = ref<Record<string, Trend>>({})
+const hydrated = new Set<string>()
 let unLiveMet: (() => void) | null = null
 let unLivePing: (() => void) | null = null
-function pushLive(sid: string, k: keyof LiveTrend, v: number) {
-  let h = liveTrend.value[sid]
-  if (!h) { h = { cpu: [], mem: [], lat: [], loss: [] }; liveTrend.value[sid] = h }
-  h[k].push(Number.isFinite(v) ? v : 0)
-  if (h[k].length > 60) h[k].shift()
+const emptySeries = (): Series => ({ ts: [], v: [] })
+function trendOf(sid?: string): Trend | undefined {
+  return sid ? trend.value[sid] : undefined
 }
-function liveFor(sid?: string): LiveTrend | undefined {
-  return sid ? liveTrend.value[sid] : undefined
+/** 追加一个点：同 ts 只留一条（hydrate 与事件会重叠），非有限值留 NULL（断线）。 */
+function pushTrend(sid: string, k: keyof Trend, ts: number, v: number | null) {
+  let t = trend.value[sid]
+  if (!t) {
+    t = { cpu: emptySeries(), mem: emptySeries(), lat: emptySeries(), loss: emptySeries() }
+    trend.value[sid] = t
+  }
+  const s = t[k]
+  if (s.ts.length && ts <= s.ts[s.ts.length - 1]) return
+  s.ts.push(ts)
+  s.v.push(v != null && Number.isFinite(v) ? v : null)
+  const cap = k === 'lat' || k === 'loss' ? PING_MAX : TREND_MAX
+  while (s.ts.length > cap) {
+    s.ts.shift()
+    s.v.shift()
+  }
 }
+/** 用后端缓冲补齐窗口；同一 sid 只问一次。 */
+async function hydrateTrend(sid: string) {
+  if (!sid || hydrated.has(sid)) return
+  hydrated.add(sid)
+  try {
+    const r = await api.monitorRecent(sid)
+    for (const m of r.metrics) {
+      pushTrend(sid, 'cpu', m.ts, m.cpu_pct)
+      pushTrend(sid, 'mem', m.ts, m.mem_pct)
+    }
+    for (const pg of r.ping) {
+      pushTrend(sid, 'lat', pg.ts, pg.rtt_avg)
+      pushTrend(sid, 'loss', pg.ts, pg.loss_pct)
+    }
+  } catch {
+    // 会话刚关掉 / 后端重启：趋势留空，后续事件继续填
+    hydrated.delete(sid)
+  }
+}
+const hasTrend = (sid?: string) => (trendOf(sid)?.cpu.ts.length ?? 0) > 1
 
 type Freshness = 'fresh' | 'stale' | 'dead' | 'unknown'
 
@@ -169,7 +209,8 @@ const rows = computed<Row[]>(() => {
       metrics: m,
       ageSec,
       freshness: t.status === 'connected' ? freshnessOf(ageSec, t.sid) : 'unknown',
-      alert: alertFor(t.sid)?.alert,
+      // 只算未解除的告警：后端发过解除事件的不再计入徽标与「告警 N」。
+      alert: activeAlertFor(t.sid)?.alert,
     })
   }
 
@@ -340,6 +381,41 @@ function sparkPath(vals: number[], w: number, h: number): string {
     .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - 3 - (h - 8) * (v / max)).toFixed(1)}`)
     .join(' ')
 }
+/**
+ * 迷你折线（可断线）：NULL 处抬笔 —— 不补 0、也不把丢点挤掉（丢点会压平时间轴）。
+ * max 由调用方给定并写进图例：每张图各自一个标尺，恒定值不会被画成满格。
+ */
+function linePath(s: Series, w: number, h: number, max: number): string {
+  const n = s.ts.length
+  if (!n) return ''
+  const step = n > 1 ? w / (n - 1) : 0
+  let d = ''
+  let pen = false
+  for (let i = 0; i < n; i++) {
+    const v = s.v[i]
+    if (v == null) {
+      pen = false
+      continue
+    }
+    d += `${pen ? 'L' : 'M'}${(i * step).toFixed(1)},${(h - 3 - (h - 8) * Math.min(1, Math.max(0, v / max))).toFixed(1)} `
+    pen = true
+  }
+  return d.trim()
+}
+/** 曲线用到的标尺上限（下限由调用方给，避免除零）。 */
+function seriesMax(s: Series | undefined, floor: number): number {
+  let m = floor
+  for (const v of s?.v ?? []) if (v != null && v > m) m = v
+  return m
+}
+/** 真实时间跨度（采样端时钟）—— 图例写「近 X 分钟」，不写「N 点窗口」。 */
+function spanLabel(s?: Series): string {
+  if (!s || s.ts.length < 2) return '采样中'
+  const secs = Math.max(0, s.ts[s.ts.length - 1] - s.ts[0])
+  if (secs < 90) return `近 ${Math.round(secs)} 秒`
+  if (secs < 5400) return `近 ${Math.round(secs / 60)} 分钟`
+  return `近 ${(secs / 3600).toFixed(1)} 小时`
+}
 const cpuSeries = (r: HistoryRange) => r.buckets.map((b) => b.cpu_pct)
 const memSeries = (r: HistoryRange) => r.buckets.map((b) => b.mem_pct)
 const netSeries = (r: HistoryRange) => r.buckets.map((b) => b.net_rx)
@@ -347,11 +423,14 @@ const netTxSeries = (r: HistoryRange) => r.buckets.map((b) => b.net_tx)
 const diskRSeries = (r: HistoryRange) => r.buckets.map((b) => b.disk_r)
 const diskWSeries = (r: HistoryRange) => r.buckets.map((b) => b.disk_w)
 const loadSeries = (r: HistoryRange) => r.buckets.map((b) => b.load1)
-/** 时延/丢包：没测到网关的桶是 NULL，整点丢弃 —— 不画 0 ms 骗人。 */
-const latSeries = (r?: PingRange) =>
-  r?.buckets.filter((b) => b.latency_ms != null).map((b) => b.latency_ms as number) ?? []
-const lossSeries = (r?: PingRange) =>
-  r?.buckets.filter((b) => b.loss_pct != null).map((b) => b.loss_pct as number) ?? []
+/** 时延/丢包：没测到网关的桶是 NULL —— 保留 NULL 让折线断开，既不画 0 ms，
+ * 也不像以前那样把丢点挤掉（丢点越多、剩下的点被画得越密，时间轴就压平了）。 */
+const latSeries = (r?: PingRange) => r?.buckets.map((b) => b.latency_ms) ?? []
+const lossSeries = (r?: PingRange) => r?.buckets.map((b) => b.loss_pct) ?? []
+const pingPath = (vals: (number | null)[], w: number, h: number) => {
+  const s: Series = { ts: vals.map((_, i) => i), v: vals }
+  return linePath(s, w, h, seriesMax(s, 1))
+}
 const histEmpty = computed(
   () => (matrixMetric.value === 'ping' ? Object.keys(pingData.value) : Object.keys(histData.value)).length === 0,
 )
@@ -430,19 +509,31 @@ onMounted(async () => {
   await loadHistory()
   // Offline numbers drift, so refresh them while the panel is open.
   timer = setInterval(() => void loadHistory(), 30000)
-  // 实时趋势（卡片视图 4 线）：每台会话自己的事件流，按 sid 入窗。
+  // 实时趋势：先用后端环形缓冲补齐窗口（打开即有历史），再吃增量事件。
+  for (const t of props.tabs) if (t.status === 'connected') void hydrateTrend(t.sid)
   unLiveMet = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     const m = e.payload.metrics
-    pushLive(e.payload.sid, 'cpu', m.cpu_pct)
-        pushLive(e.payload.sid, 'mem', m.mem_pct)
+    pushTrend(e.payload.sid, 'cpu', m.ts, m.cpu_pct)
+    pushTrend(e.payload.sid, 'mem', m.ts, m.mem_pct)
   })
-  unLivePing = await listen<{ sid: string; ping: { rtt_avg: number; loss_pct: number } | null }>('ssh://ping', (e) => {
-      if (e.payload.ping) {
-        pushLive(e.payload.sid, 'lat', +e.payload.ping.rtt_avg.toFixed(2))
-        pushLive(e.payload.sid, 'loss', +e.payload.ping.loss_pct.toFixed(1))
-      }
-    })
+  unLivePing = await listen<{ sid: string; ping: { rtt_avg: number; loss_pct: number } | null; ts?: number }>(
+    'ssh://ping',
+    (e) => {
+      if (!e.payload.ping) return
+      // ts 由后端给（和环形缓冲同一把时钟），缺了才退回本地时钟。
+      const ts = e.payload.ts ?? Date.now() / 1000
+      pushTrend(e.payload.sid, 'lat', ts, +e.payload.ping.rtt_avg.toFixed(2))
+      pushTrend(e.payload.sid, 'loss', ts, +e.payload.ping.loss_pct.toFixed(1))
+    },
+  )
 })
+// 面板开着的时候新连上的会话：也补一次缓冲（hydrateTrend 保证只补一次）。
+watch(
+  () => props.tabs.map((t) => t.sid).join(','),
+  () => {
+    for (const t of props.tabs) if (t.status === 'connected') void hydrateTrend(t.sid)
+  },
+)
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
   unLiveMet?.()
@@ -540,14 +631,27 @@ onBeforeUnmount(() => {
             <div class="track"><div class="fill" :class="barClass(worstDisk(r.metrics))" :style="{ width: Math.min(100, worstDisk(r.metrics) ?? 0) + '%' }"></div></div>
             <span class="v">{{ fmtPct(worstDisk(r.metrics)) }}</span>
           </div>
-                    <div v-if="liveFor(r.sid)" class="card-spark">
-                      <svg viewBox="0 0 220 30" preserveAspectRatio="none" width="100%" height="30">
-                        <path :d="sparkPath(liveFor(r.sid)!.cpu, 220, 30)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.4" />
-                        <path :d="sparkPath(liveFor(r.sid)!.mem, 220, 30)" fill="none" stroke="var(--ctp-green)" stroke-width="1.4" stroke-dasharray="3 2" />
-                        <path :d="sparkPath(liveFor(r.sid)!.lat, 220, 30)" fill="none" stroke="var(--ctp-sky)" stroke-width="1.4" />
-                        <path :d="sparkPath(liveFor(r.sid)!.loss, 220, 30)" fill="none" stroke="var(--ctp-red)" stroke-width="1.4" stroke-dasharray="1 3" />
-                      </svg>
-                      <div class="card-legend dim">实时趋势：CPU ─· 内存 ─· 时延 ─ 丢包% ··（60 点窗口）</div>
+                    <div v-if="hasTrend(r.sid)" class="card-spark">
+                      <div class="spark-blk">
+                        <div class="spark-meta dim"><span>CPU ─· 内存 ┄ <b>0–100%</b></span><span>{{ spanLabel(trendOf(r.sid)!.cpu) }}</span></div>
+                        <svg viewBox="0 0 220 24" preserveAspectRatio="none" width="100%" height="24">
+                          <path :d="linePath(trendOf(r.sid)!.cpu, 220, 24, 100)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.4" />
+                          <path :d="linePath(trendOf(r.sid)!.mem, 220, 24, 100)" fill="none" stroke="var(--ctp-green)" stroke-width="1.4" stroke-dasharray="3 2" />
+                        </svg>
+                      </div>
+                      <div class="spark-blk">
+                        <div class="spark-meta dim"><span>时延 ─ <b>0–{{ seriesMax(trendOf(r.sid)!.lat, 1).toFixed(0) }}ms</b></span><span>{{ spanLabel(trendOf(r.sid)!.lat) }}</span></div>
+                        <svg viewBox="0 0 220 24" preserveAspectRatio="none" width="100%" height="24">
+                          <path :d="linePath(trendOf(r.sid)!.lat, 220, 24, seriesMax(trendOf(r.sid)!.lat, 1))" fill="none" stroke="var(--ctp-sky)" stroke-width="1.4" />
+                        </svg>
+                      </div>
+                      <div class="spark-blk">
+                        <div class="spark-meta dim"><span>丢包 ─ <b>0–{{ seriesMax(trendOf(r.sid)!.loss, 1).toFixed(0) }}%</b></span><span>{{ spanLabel(trendOf(r.sid)!.loss) }}</span></div>
+                        <svg viewBox="0 0 220 24" preserveAspectRatio="none" width="100%" height="24">
+                          <path :d="linePath(trendOf(r.sid)!.loss, 220, 24, seriesMax(trendOf(r.sid)!.loss, 1))" fill="none" stroke="var(--ctp-red)" stroke-width="1.4" stroke-dasharray="1 3" />
+                        </svg>
+                      </div>
+                      <div class="card-legend dim">数据来自后端缓冲（关掉重开不丢）· 折线断开处=当时没测到</div>
                     </div>
                     <div class="card-net dim">
                       <span v-if="r.metrics">↓ {{ fmtBytes(netTotals(r.metrics).rx) }} ↑ {{ fmtBytes(netTotals(r.metrics).tx) }} · 负载 {{ r.metrics.load?.[0]?.toFixed(2) ?? '—' }} · 进程 {{ r.metrics.proc_total }}</span>
@@ -669,8 +773,8 @@ onBeforeUnmount(() => {
                                             <path :d="sparkPath(loadSeries(r), 220, 58)" fill="none" stroke="var(--ctp-teal)" stroke-width="1.3" />
                                           </template>
                                           <template v-else>
-                                            <path :d="sparkPath(latSeries(pingData[hid]), 220, 58)" fill="none" stroke="var(--ctp-sky)" stroke-width="1.3" />
-                                            <path :d="sparkPath(lossSeries(pingData[hid]), 220, 58)" fill="none" stroke="var(--ctp-red)" stroke-width="1.3" stroke-dasharray="3 2" />
+                                            <path :d="pingPath(latSeries(pingData[hid]), 220, 58)" fill="none" stroke="var(--ctp-sky)" stroke-width="1.3" />
+                                            <path :d="pingPath(lossSeries(pingData[hid]), 220, 58)" fill="none" stroke="var(--ctp-red)" stroke-width="1.3" stroke-dasharray="3 2" />
                                           </template>
                                         </svg>
                                         <div class="cell-legend">
@@ -776,6 +880,9 @@ onBeforeUnmount(() => {
 .hist-title { font-weight: 600; }
 .card-spark { margin-top: 6px; }
 .card-spark svg { display: block; background: var(--ctp-mantle); border-radius: 6px; }
+.spark-blk { margin-top: 4px; }
+.spark-meta { display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 1px; }
+.spark-meta b { font-weight: 600; color: var(--ctp-subtext0); }
 .card-legend { font-size: 10px; margin-top: 2px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
 .cell { border: 1px solid var(--ctp-surface0); border-radius: 6px; padding: 6px 8px; }
