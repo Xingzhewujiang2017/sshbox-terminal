@@ -1,5 +1,5 @@
 /**
- * 命令块提示符清理的单测（src/ai.ts 的 stripPromptPrefix）。
+ * 命令块提示符清理的单测（src/cmdtext.ts 的 stripPromptPrefix）。
  * 跑法：npm run test:cmd（node --experimental-strip-types）。
  *
  * 为什么单独测：这个函数决定"插进终端的到底是什么" —— 多剥会把注释变成命令，
