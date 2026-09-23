@@ -4,7 +4,7 @@ import type { PingInfo } from '../api'
 import { listen } from '@tauri-apps/api/event'
 import * as echarts from 'echarts'
 import { chartPalette, themeVersion } from '../theme'
-import { api, type DiskUsage, type Metrics } from '../api'
+import { api, type DiskUsage, type Metrics, type RecentPing } from '../api'
 import Pager from './Pager.vue'
 
 interface StaticInfo {
@@ -94,7 +94,7 @@ const services = ref<ServiceInfo | null>(null)
 const hardware = ref<HardwareInfo | null>(null)
 const ping = ref<PingInfo | null>(null)
 /** 时延/丢包迷你趋势（#1）：15s 一档，最多 48 点。 */
-const pingHist = ref<{ lat: number[]; loss: number[]; t: string[] }>({ lat: [], loss: [], t: [] })
+const pingHist = ref<{ lat: number[]; loss: number[]; t: string[]; ts: number[] }>({ lat: [], loss: [], t: [], ts: [] })
 /** 传感器多起来（8 核 + 2 个 NVMe）会淹掉面板，默认只露最热的几个。 */
 const TEMP_SHOWN = 5
 const tempsExpanded = ref(false)
@@ -131,12 +131,16 @@ async function sampleNow() {
   }
 }
 
-// Rolling history: 5 min @ 2s = 150 points
+// Rolling history: 面板窗口 = MAX_POINTS × 采样间隔（默认 10s 一档 → 约 25 分钟，
+// 就是标题上写的"近 25 分钟"；间隔调到 1s 就只有 150 秒）。
+// `ts` 只用来去重/补齐（hydrate 与实时事件赛跑时同一条点不能画两遍），不参与画图。
 const MAX_POINTS = 150
+/** ping 迷你趋势点数（与后端环形缓冲 `RECENT_PING_MAX` 对齐）。 */
+const PING_POINTS = 48
 const history = ref<{
   t: string[]; cpu: number[]; mem: number[]
-  rx: number[]; tx: number[]; dread: number[]; dwrite: number[]
-}>({ t: [], cpu: [], mem: [], rx: [], tx: [], dread: [], dwrite: [] })
+  rx: number[]; tx: number[]; dread: number[]; dwrite: number[]; ts: number[]
+}>({ t: [], cpu: [], mem: [], rx: [], tx: [], dread: [], dwrite: [], ts: [] })
 
 let unlistenStatic: (() => void) | null = null
 let unlistenMetrics: (() => void) | null = null
@@ -405,6 +409,63 @@ function updateCharts() {
   ioChart?.setOption({ xAxis: { data: h.t }, series: [{ data: h.dread }, { data: h.dwrite }] })
 }
 
+/** 一条采样点进曲线。时间戳不比上一条新就丢：挂载时的 hydrate 与实时事件会撞上同一条。 */
+function pushMetricsPoint(m: Metrics) {
+  const h = history.value
+  if (h.ts.length && m.ts <= h.ts[h.ts.length - 1]) return
+  h.ts.push(m.ts)
+  h.t.push(new Date(m.ts * 1000).toTimeString().slice(0, 8))
+  h.cpu.push(+m.cpu_pct.toFixed(1))
+  h.mem.push(+m.mem_pct.toFixed(1))
+  const nt = m.net.reduce((a, n) => ({ rx: a.rx + n.rx_bps, tx: a.tx + n.tx_bps }), { rx: 0, tx: 0 })
+  h.rx.push(nt.rx)
+  h.tx.push(nt.tx)
+  const io = m.disk_io.reduce((a, d) => ({ r: a.r + d.read_bps, w: a.w + d.write_bps }), { r: 0, w: 0 })
+  h.dread.push(io.r)
+  h.dwrite.push(io.w)
+  while (h.ts.length > MAX_POINTS) {
+    h.ts.shift(); h.t.shift(); h.cpu.shift(); h.mem.shift()
+    h.rx.shift(); h.tx.shift(); h.dread.shift(); h.dwrite.shift()
+  }
+}
+
+/** 一条 ping 点进迷你趋势。`ts` 是本地墙钟（事件按收到的时刻打，hydrate 用后端的采集时刻）。 */
+function pushPingPoint(ts: number, rttAvg: number, lossPct: number) {
+  const h = pingHist.value
+  if (h.ts.length && ts <= h.ts[h.ts.length - 1]) return
+  h.ts.push(ts)
+  h.lat.push(+rttAvg.toFixed(2))
+  h.loss.push(+lossPct.toFixed(1))
+  h.t.push(new Date(ts * 1000).toTimeString().slice(0, 8))
+  if (h.ts.length > PING_POINTS) {
+    h.ts.shift(); h.lat.shift(); h.loss.shift(); h.t.shift()
+  }
+}
+
+/** 挂载时补齐曲线。
+ *
+ *  这个组件是按会话重建的（`App.vue` 的 `:key="activeTab.sid"`，防五个单-sid ref 串台），
+ *  重建后自己的缓冲从空攒：实测切过去 4s 内连图表容器都没有，第一个点要等 5.8–48.2s
+ *  （后台会话 ×5 降频），攒满 150 点要 25 分钟。后端采集循环留着同一批点
+ *  （`monitor_recent`，内存环形缓冲，与事件同源同口径），这里一次补上。
+ *
+ *  比"从历史库补拉"强的三点：同一来源不会两种口径混接、不碰 DB 锁、快速连接（临时 sid）也有。
+ *  只补老的：事件要是抢先到了，它比缓冲新，按 ts 去重即可。 */
+async function hydrateFromBackend() {
+  let rec: { metrics: Metrics[]; ping: RecentPing[] }
+  try {
+    rec = await api.monitorRecent(props.sid)
+  } catch {
+    return // 会话已断 / 还没采到：等事件
+  }
+  for (const m of rec.metrics) pushMetricsPoint(m)
+  for (const p of rec.ping) pushPingPoint(p.ts, p.rtt_avg, p.loss_pct)
+  // 数字卡片也立刻有值（不必等下一个事件），但别用旧数据盖掉刚收到的新数据。
+  const last = rec.metrics[rec.metrics.length - 1]
+  if (last && (!metrics.value || metrics.value.ts < last.ts)) metrics.value = last
+  if (rec.metrics.length || rec.ping.length) void refresh()
+}
+
 async function refresh() {
   await nextTick()
   ensureCharts()
@@ -439,39 +500,20 @@ onMounted(async () => {
     // 时延/丢包迷你趋势（#1）：慢采集 15s 一档，最多留 48 点（约 12 分钟）。
     // 没测到网关（null）时整次跳过 —— 不画 0ms 骗人。
     if (e.payload.ping) {
-          const h = pingHist.value
-          h.lat.push(+e.payload.ping.rtt_avg.toFixed(2))
-          h.loss.push(+e.payload.ping.loss_pct.toFixed(1))
-          h.t.push(new Date().toTimeString().slice(0, 8))
-          if (h.lat.length > 48) {
-            h.lat.shift()
-            h.loss.shift()
-            h.t.shift()
-          }
-          void refresh()
-        }
+      pushPingPoint(Date.now() / 1000, e.payload.ping.rtt_avg, e.payload.ping.loss_pct)
+      void refresh()
+    }
   })
   unlistenMetrics = await listen<{ sid: string; metrics: Metrics }>('ssh://metrics', (e) => {
     if (e.payload.sid !== props.sid) return
-    const m = e.payload.metrics
-    metrics.value = m
-    const h = history.value
-    const now = new Date(m.ts * 1000)
-    h.t.push(now.toTimeString().slice(0, 8))
-    h.cpu.push(+m.cpu_pct.toFixed(1))
-    h.mem.push(+m.mem_pct.toFixed(1))
-    const nt = m.net.reduce((a, n) => ({ rx: a.rx + n.rx_bps, tx: a.tx + n.tx_bps }), { rx: 0, tx: 0 })
-    h.rx.push(nt.rx)
-    h.tx.push(nt.tx)
-    const io = m.disk_io.reduce((a, d) => ({ r: a.r + d.read_bps, w: a.w + d.write_bps }), { r: 0, w: 0 })
-    h.dread.push(io.r)
-    h.dwrite.push(io.w)
-    while (h.t.length > MAX_POINTS) {
-      h.t.shift(); h.cpu.shift(); h.mem.shift()
-      h.rx.shift(); h.tx.shift(); h.dread.shift(); h.dwrite.shift()
-    }
+    metrics.value = e.payload.metrics
+    pushMetricsPoint(e.payload.metrics)
     void refresh()
   })
+
+  // 订阅之后再补拉（顺序不能反：反了会漏掉这中间的事件）。
+  // 切标签时 `App.vue` 会重建这个组件，缓冲从空攒 —— 靠这一步一次补齐。
+  void hydrateFromBackend()
 
   ro = new ResizeObserver(() => {
     cpuChart?.resize()

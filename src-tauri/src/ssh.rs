@@ -721,6 +721,16 @@ pub fn monitor_static(sid: SessionId) -> Option<StaticInfo> {
     monitor::cached_static(&sid)
 }
 
+/// 面板挂载时补齐曲线用：该会话最近采到的原始点（内存环形缓冲，**不是历史库**）。
+///
+/// 面板组件按会话重建（`:key="activeTab.sid"`），重建后自己的缓冲从空攒，
+/// 实测切过去要等 5.8–48.2s 才有点、攒满 150 点要 25 分钟。这里一次给全，
+/// 面板挂载时调一次即可；与事件同源同口径，所以前端按时间戳去重就够。
+#[tauri::command]
+pub fn monitor_recent(sid: SessionId) -> monitor::Recent {
+    monitor::recent(&sid)
+}
+
 #[tauri::command]
 pub fn monitor_set_visible(sid: SessionId, visible: bool) -> std::result::Result<(), String> {
     monitor::set_visible(&sid, visible);

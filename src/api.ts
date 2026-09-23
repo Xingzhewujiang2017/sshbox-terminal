@@ -225,6 +225,13 @@ export interface PingInfo {
   jitter: number
 }
 
+/** `monitor_recent` 里的一条 ping：面板画迷你图要时间标签，`PingInfo` 自身没有。 */
+export interface RecentPing {
+  ts: number
+  rtt_avg: number
+  loss_pct: number
+}
+
 export interface NetIf {
   name: string
   rx_bps: number
@@ -476,6 +483,9 @@ export const api = {
   monitorSetPaused: (sid: string, paused: boolean) => call<void>('monitor_set_paused', { sid, paused }),
   monitorPaused: (sid: string) => call<boolean>('monitor_paused', { sid }),
   monitorSampleNow: (sid: string) => call<void>('monitor_sample_now', { sid }),
+  /** 面板挂载时补齐曲线：该会话最近采到的原始点（后端内存环形缓冲，不是历史库）。 */
+  monitorRecent: (sid: string) =>
+    call<{ metrics: Metrics[]; ping: RecentPing[] }>('monitor_recent', { sid }),
 
   // history
   historyRange: (hostId: string, from: number, to: number, maxPoints?: number) =>

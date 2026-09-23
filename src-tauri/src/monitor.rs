@@ -6,7 +6,7 @@
 //! previous sample. No dependency on `top`/`vmstat` (format differs per distro,
 //! busybox images often lack them) and no disturbance to the user's PTY.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -42,6 +42,91 @@ static REGISTRY: LazyLock<StdMutex<HashMap<SessionId, TaskHandle>>> =
 /// because the panel mounts later). The panel now asks for this cache on mount.
 static STATIC_CACHE: LazyLock<StdMutex<HashMap<SessionId, StaticInfo>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// 每个会话最近采到的**原始点**（内存环形缓冲，不是历史库）。
+///
+/// 监控面板按会话重建（`App.vue` 的 `:key="activeTab.sid"`，为的是不让五个单-sid ref
+/// 串台），重建后面板自己的 `history` 从空攒：实测切过去 4s 内连图表容器都没渲染
+/// （`canvas=0`、数字全空），第一个点要等 5.8–48.2s，而攒满 150 点（默认 10s 一档 =
+/// 25 分钟）根本等不到 —— 用户看到的就是"切过去图是空的，过很久才慢慢长出来"。
+/// 所以采集循环顺手把这些点留一份在内存里，面板挂载时用 `monitor_recent` 一次补齐。
+///
+/// 为什么不用历史库补（`history_range`）：它是**按时间桶降采样**过的（历史 2s 一档），
+/// 和面板的原始点混接会出现同一条曲线前段桶平均、后段瞬时值，x 轴时间标签重复/回退；
+/// 快速连接（临时 sid）在库里根本没有行；`history_enabled=false` 时更是直接空。
+/// 内存缓冲天然同源同口径，进程活着才有（不会给出陈旧数据），断档的轮次本就没进缓冲
+/// （不会把"采失败"画成 0），也不碰 DB / 锁。
+static RECENT: LazyLock<StdMutex<HashMap<SessionId, RecentBuffer>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// 与面板侧的 `MAX_POINTS` / `PING_POINTS` 对齐：缓冲比面板能画的还长没意义，
+/// 短了则 hydrate 出来的曲线会被面板自己截掉（看起来像"少了一段"）。
+const RECENT_MAX: usize = 150;
+const RECENT_PING_MAX: usize = 48;
+
+#[derive(Default)]
+struct RecentBuffer {
+    metrics: VecDeque<Metrics>,
+    ping: VecDeque<RecentPing>,
+}
+
+/// 缓冲里的一条 ping。`PingInfo` 自身没有时间戳，而面板画 x 轴要时间标签，
+/// 所以这里单独记一个（用**本地**墙钟，和面板实时收到时打标签的口径一致）。
+#[derive(Debug, Serialize, Clone)]
+pub struct RecentPing {
+    pub ts: f64,
+    pub rtt_avg: f64,
+    pub loss_pct: f64,
+}
+
+/// `monitor_recent` 的返回值：面板挂载时补齐曲线用。老的在前，与面板数组同序。
+#[derive(Debug, Serialize)]
+pub struct Recent {
+    pub metrics: Vec<Metrics>,
+    pub ping: Vec<RecentPing>,
+}
+
+/// 满了丢最老的 —— 环形缓冲的唯一规则，单独抽出来是为了能单测。
+fn push_capped<T>(q: &mut VecDeque<T>, v: T, max: usize) {
+    q.push_back(v);
+    while q.len() > max {
+        q.pop_front();
+    }
+}
+
+fn push_recent(sid: &SessionId, m: &Metrics) {
+    let mut g = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    let b = g.entry(sid.clone()).or_default();
+    push_capped(&mut b.metrics, m.clone(), RECENT_MAX);
+}
+
+fn push_recent_ping(sid: &SessionId, p: &PingInfo) {
+    let mut g = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    let b = g.entry(sid.clone()).or_default();
+    b.ping.push_back(RecentPing {
+        ts: wall_secs(),
+        rtt_avg: p.rtt_avg,
+        loss_pct: p.loss_pct,
+    });
+    while b.ping.len() > RECENT_PING_MAX {
+        b.ping.pop_front();
+    }
+}
+
+/// 该会话最近采到的点。空 = 还没采到过，或会话已经断开（`forget` 清过）。
+pub fn recent(sid: &SessionId) -> Recent {
+    let g = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    match g.get(sid) {
+        Some(b) => Recent {
+            metrics: b.metrics.iter().cloned().collect(),
+            ping: b.ping.iter().cloned().collect(),
+        },
+        None => Recent {
+            metrics: Vec::new(),
+            ping: Vec::new(),
+        },
+    }
+}
 
 /// 会话 → SSH 客户端句柄。演练台（lab）的组播执行 / 快 ping 要从 tauri 命令侧
 /// 直接用句柄开一次性 channel，而采集任务内部才有句柄 —— 所以 spawn 时登记、stop/forget 时清除。
@@ -1564,6 +1649,10 @@ pub fn spawn(
                         // 时延/丢包跟慢采集同频：ping 一次约 1 秒 wall time，
                         // 塞进 2 秒的快循环会互相打架，而链路质量本来也不会秒级跳变。
                         let pg = parse_ping(&sec);
+                        // 顺手留一份给面板 hydrate（面板切回来时不用从零攒）。
+                        if let Some(p) = &pg {
+                            push_recent_ping(&sid, p);
+                        }
                         let _ = app.emit(
                             "ssh://ping",
                             serde_json::json!({ "sid": sid, "ping": pg }),
@@ -1586,6 +1675,9 @@ pub fn spawn(
             if let Some(m) = parse_metrics(&raw, &mut prev) {
                 // Evaluate alerts before moving `m` into the event payload.
                 let fired = crate::alerts::evaluate(&sid, &m, &settings);
+                // 面板 hydrate 用的环形缓冲：先留一份再发事件（顺序无所谓，
+                // 但先留保证"事件到了、缓冲里也一定有同一条"，前端去重才不打架）。
+                push_recent(&sid, &m);
                 // History is fire-and-forget: `record` hands the row to a
                 // dedicated thread and returns immediately, so a slow disk can
                 // never delay the next sample.
@@ -1643,6 +1735,9 @@ pub fn forget(sid: &SessionId) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sid);
+    // 环形缓冲也一起清：sid 不会再被复用，留着就是纯泄漏
+    // （面板的 `liveTrend` 就是只写不删的前车之鉴）。
+    RECENT.lock().unwrap_or_else(|e| e.into_inner()).remove(sid);
 }
 
 pub fn stop(sid: &SessionId) {
@@ -1655,6 +1750,13 @@ pub fn stop(sid: &SessionId) {
 pub fn set_visible(sid: &SessionId, visible: bool) {
     if let Some(t) = registry().get(sid) {
         t.visible.store(visible, Ordering::SeqCst);
+        // 切回标签时叫醒采集循环。后台会话是 ×5 降频的（默认 10s 一档 → 50s），
+        // 只改标志位的话用户要盯着空面板等最多一整个后台周期（实测 5.8–48.2s）
+        // 才等到第一个点 —— 和 `set_paused(false)` 对称，那里早就有这一句了。
+        // 面板 hydrate（`monitor_recent`）负责把历史补上，这句负责"立刻来一条新的"。
+        if visible {
+            t.wake.notify_one();
+        }
     }
 }
 
@@ -1923,6 +2025,66 @@ mod tests {
         assert_eq!(out, "woken");
         assert!(started.elapsed() < Duration::from_secs(2));
         registry().remove(&sid);
+    }
+
+    /// 切标签唤醒：`set_visible(true)` 必须叫醒采集循环，`set_visible(false)` 不该叫。
+    ///
+    /// 这条单测盯的是本 bug 的修法本身：后台会话 ×5 降频（默认 10s 一档 = 50s），
+    /// 只改标志位不唤醒 = 用户切回来盯着空面板等最多 50s（实测 5.8–48.2s）。
+    #[tokio::test]
+    async fn set_visible_wakes_the_loop_only_when_becoming_visible() {
+        let sid = "unit-test-visible-wake".to_string();
+        registry().insert(sid.clone(), dummy_handle());
+        let wake = registry().get(&sid).unwrap().wake.clone();
+
+        set_visible(&sid, false);
+        let quiet = tokio::time::timeout(Duration::from_millis(200), wake.notified()).await;
+        assert!(quiet.is_err(), "set_visible(false) 不该唤醒采集循环");
+
+        let waiter = tokio::spawn(async move { wake.notified().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        set_visible(&sid, true);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("set_visible(true) 未能在 2s 内唤醒采集循环")
+            .unwrap();
+        assert!(
+            registry().get(&sid).unwrap().visible.load(Ordering::SeqCst),
+            "可见标志应置位"
+        );
+        registry().remove(&sid);
+    }
+
+    /// 面板 hydrate 用的环形缓冲：满了丢最老的、顺序不变。
+    #[test]
+    fn recent_buffer_keeps_the_newest_points_in_order() {
+        let mut q: VecDeque<u32> = VecDeque::new();
+        for i in 0..(RECENT_MAX as u32 + 25) {
+            push_capped(&mut q, i, RECENT_MAX);
+        }
+        assert_eq!(q.len(), RECENT_MAX, "缓冲长度应封顶");
+        assert_eq!(*q.front().unwrap(), 25, "丢掉的应该是最老的 25 条");
+        assert_eq!(*q.back().unwrap(), RECENT_MAX as u32 + 24, "最后一条应是最新的");
+    }
+
+    /// 断开要连缓冲一起清：sid 不复用，留着就是只写不删的泄漏。
+    #[test]
+    fn recent_buffer_is_cleared_on_forget() {
+        let sid = "unit-test-recent-forget".to_string();
+        let raw = "@@TS@@ 100.0\n@@STAT@@\ncpu  100 0 100 800 0 0 0 0 0 0\n@@NET@@\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n@@END@@\n";
+        let mut prev = PrevSample::default();
+        let m = parse_metrics(raw, &mut prev).expect("样本应可解析");
+        push_recent(&sid, &m);
+        push_recent_ping(&sid, &PingInfo::default());
+        assert_eq!(recent(&sid).metrics.len(), 1);
+        assert_eq!(recent(&sid).ping.len(), 1);
+
+        forget(&sid);
+        let after = recent(&sid);
+        assert!(
+            after.metrics.is_empty() && after.ping.is_empty(),
+            "forget 后不该还留着缓冲"
+        );
     }
 
     #[test]
