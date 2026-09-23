@@ -287,7 +287,7 @@ for d in /proc/[0-9]*; do
   IFS= read -r st < "$d/stat" 2>/dev/null || continue
   comm=${st#*(}; comm=${comm%%)*}
   rest=${st##*) }
-  [ ext4 -n "$rest" ] || continue
+  [ -n "$rest" ] || continue
 
   set -- $rest
   # ${12} braces are mandatory: "$12" is $1 followed by a literal 2 in POSIX sh.
@@ -1820,6 +1820,166 @@ mod tests {
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `[ ... ]` 是 sh 内建 test。写坏了不会报语法错，只在**运行时**往 stderr 吐
+    /// `[: -n: binary operator expected`，然后被 `2>/dev/null` 或 `|| continue` 吃掉：
+    /// 采样照常返回，只是少了一整段数据。
+    ///
+    /// 为什么不能用解析测试兜住：解析测试喂的是**假数据**，假数据永远合法，走不到
+    /// 脚本那一层。所以只能直接审脚本文本。也不起真 shell 跑——测试机上 `bash`
+    /// 可能解析到 WSL 的 bash（`/c/...` 在那儿不存在），跨机器太脆。
+    fn lint_test_expressions(script: &str) -> Vec<(usize, String, String)> {
+        let mut out = Vec::new();
+        for (idx, line) in script.lines().enumerate() {
+            let b = line.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'[' {
+                    // 只有「前面是分隔符 + 后面跟空白」才是 test；`[[`、`[0-9]` 都不算。
+                    let at_start = i == 0 || matches!(b[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'(');
+                    let spaced = i + 1 < b.len() && matches!(b[i + 1], b' ' | b'\t');
+                    if at_start && spaced {
+                        if let Some(close) = line[i + 1..].find(" ]") {
+                            if let Some(bad) = stray_word_before_flag(&line[i + 1..i + 1 + close]) {
+                                out.push((idx + 1, line.trim().to_string(), bad));
+                            }
+                            i += 1 + close + 2;
+                            continue;
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// 走一遍 test 表达式的语法状态。`[ ext4 -n "$rest" ]` 的错在于：读完操作数
+    /// `ext4` 之后本该出现二元运算符，却来了个旗标 `-n`。
+    ///
+    /// 四态：Primary（等一个完整项）→ Operand（一元运算符吃它的操作数）
+    /// → Done（该项完整）；等运算符时碰上 `-a`/`-o` 回到 Primary。
+    fn stray_word_before_flag(inner: &str) -> Option<String> {
+        #[derive(PartialEq)]
+        enum St {
+            Primary,
+            Operand,
+            Binop,
+            Done,
+        }
+        const BIN: [&str; 12] = [
+            "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-nt", "-ot", "-ef",
+        ];
+        let mut st = St::Primary;
+        for t in test_tokens(inner) {
+            match st {
+                St::Primary => {
+                    if t == "!" || t == "(" || t == ")" {
+                        continue;
+                    }
+                    if t == "-a" || t == "-o" {
+                        return Some(t); // 连接词前面没有左操作数
+                    }
+                    // 以 `-` 开头 = 一元运算符，后面跟它的操作数；否则是裸操作数。
+                    st = if t.starts_with('-') { St::Operand } else { St::Binop };
+                }
+                St::Operand => st = St::Done,
+                St::Binop => {
+                    if t == "-a" || t == "-o" {
+                        st = St::Primary;
+                    } else if BIN.contains(&t.as_str()) {
+                        st = St::Operand;
+                    } else {
+                        return Some(t); // 该来二元运算符，却来了别的
+                    }
+                }
+                St::Done => {
+                    if t == "-a" || t == "-o" {
+                        st = St::Primary;
+                    } else {
+                        return Some(t); // 该项之后多出来的词
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 按空白切词，但引号内的空白不切——`[ "$a" = "b c" ]` 是三个词不是四个。
+    fn test_tokens(inner: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        for ch in inner.chars() {
+            match quote {
+                Some(q) => {
+                    cur.push(ch);
+                    if ch == q {
+                        quote = None;
+                    }
+                }
+                None if ch == '"' || ch == '\'' => {
+                    quote = Some(ch);
+                    cur.push(ch);
+                }
+                None if ch.is_whitespace() => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                None => cur.push(ch),
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    #[test]
+    fn lint_catches_a_stray_word_before_a_flag() {
+        // 回归锚点：45a21a1「grill 四轮修复全集」把 `[ -n "$rest" ]` 改成了
+        // `[ ext4 -n "$rest" ]`，进程列表整段消失，而 129 个测试全绿。
+        let bad = lint_test_expressions("  [ ext4 -n \"$rest\" ] || continue\n");
+        assert_eq!(bad.len(), 1, "自检必须抓到残留词，实际: {bad:?}");
+        assert_eq!(bad[0].2, "-n");
+
+        // 合法的写法一个都不许误报。
+        for ok in [
+            "  [ -n \"$rest\" ] || continue",
+            "  [ -r \"$f\" ] || continue",
+            "  [ \"$a\" = \"$b\" ]",
+            "  [ $n -gt 0 ]",
+            "  [ -f \"$f\" -a -r \"$g\" ]",
+            "  [ ! -r \"$f\" ]",
+            "  [ -z \"${a:-}\" ]",
+            "  [ -S /var/run/docker.sock ] && command -v docker",
+            "  case $x in [0-9]*) ;; esac", // 不是 test，别误伤
+        ] {
+            assert!(
+                lint_test_expressions(ok).is_empty(),
+                "误报: {ok} -> {:?}",
+                lint_test_expressions(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn scripts_have_no_malformed_test_expressions() {
+        for (name, text) in [
+            ("COLLECT_SCRIPT", COLLECT_SCRIPT),
+            ("SLOW_SCRIPT", SLOW_SCRIPT),
+            ("STATIC_SCRIPT", STATIC_SCRIPT),
+        ] {
+            let bad = lint_test_expressions(text);
+            assert!(
+                bad.is_empty(),
+                "{name} 里有写坏的 [ ... ] 测试: {bad:?}\n\
+                 这类错误 sh 不报语法错，只在运行时往 stderr 吐 \
+                 `[: -n: binary operator expected`，被 2>/dev/null 吞掉后整段数据静默消失。"
+            );
+        }
     }
 
     #[test]
