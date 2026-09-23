@@ -1479,6 +1479,7 @@ mod tests {
                     total_kb: 100 * 1024 * 1024,
                     used_kb: (100.0 * 1024.0 * 1024.0 * disk_pct / 100.0) as u64,
                     use_pct: disk_pct,
+                    virtual_fs: false,
                 }],
                 load: vec![1.2, 1.0, 0.8],
                 processes: vec![ProcInfo {

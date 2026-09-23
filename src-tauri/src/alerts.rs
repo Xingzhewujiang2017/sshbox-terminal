@@ -16,7 +16,7 @@ use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
 use serde::Serialize;
 
 use crate::monitor::Metrics;
-use crate::ssh::SessionId;
+use crate::ssh::{DiskUsage, SessionId};
 use crate::store::Settings;
 
 const HYSTERESIS: f64 = 3.0;
@@ -107,8 +107,17 @@ pub fn evaluate(sid: &SessionId, m: &Metrics, s: &Settings) -> Vec<AlertEvent> {
         m.ts,
     );
 
-    // The fullest mount is the one worth shouting about.
-    if let Some(d) = m.disks.iter().max_by(|a, b| {
+    // The fullest mount is the one worth shouting about — but only among real
+    // filesystems: a container overlay sits on the same physical disk as `/`,
+    // so letting it win means one full disk can raise two alerts (and the
+    // message would name a path the user cannot free up).
+    let real: Vec<&DiskUsage> = m.disks.iter().filter(|d| !d.virtual_fs).collect();
+    let pool: Vec<&DiskUsage> = if real.is_empty() {
+        m.disks.iter().collect()
+    } else {
+        real
+    };
+    if let Some(d) = pool.into_iter().max_by(|a, b| {
         a.use_pct
             .partial_cmp(&b.use_pct)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -250,6 +259,7 @@ mod tests {
                 total_kb: 100_000,
                 used_kb: 10_000,
                 use_pct: disk,
+                virtual_fs: false,
             }],
             load: vec![],
             processes: vec![],
@@ -390,12 +400,59 @@ mod tests {
             total_kb: 100_000,
             used_kb: 96_000,
             use_pct: 96.0,
+            virtual_fs: false,
         });
         let a = evaluate(&sid, &m, &s);
         assert_eq!(a.len(), 1);
         assert!(
             a[0].alert.body.contains("/data"),
             "应报最满的挂载点: {}",
+            a[0].alert.body
+        );
+        forget(&sid);
+    }
+
+    #[test]
+    fn container_overlay_does_not_win_the_disk_alert() {
+        // overlay 挂在根盘上、squashfs 是只读镜像：它报 99% 不代表「盘要满了」，
+        // 而且它赢的话，同一块物理盘会同时报根盘和叠加层两条。
+        let sid = "t-disk-overlay".to_string();
+        let s = settings();
+        let mut m = metrics(100.0, 1.0, 1.0, 50.0);
+        m.disks.push(DiskUsage {
+            mount: "/var/lib/docker/overlay2/abc".into(),
+            total_kb: 100_000,
+            used_kb: 99_000,
+            use_pct: 99.0,
+            virtual_fs: true,
+        });
+        assert!(
+            evaluate(&sid, &m, &s).is_empty(),
+            "叠加层不该触发磁盘告警"
+        );
+        forget(&sid);
+
+        // 反过来：真实盘 96% 必须报，而且报的是它（而不是没标记的叠加层）
+        let mut m2 = metrics(100.0, 1.0, 1.0, 50.0);
+        m2.disks.push(DiskUsage {
+            mount: "/var/lib/docker/overlay2/abc".into(),
+            total_kb: 100_000,
+            used_kb: 99_000,
+            use_pct: 99.0,
+            virtual_fs: true,
+        });
+        m2.disks.push(DiskUsage {
+            mount: "/data".into(),
+            total_kb: 100_000,
+            used_kb: 96_000,
+            use_pct: 96.0,
+            virtual_fs: false,
+        });
+        let a = evaluate(&sid, &m2, &s);
+        assert_eq!(a.len(), 1);
+        assert!(
+            a[0].alert.body.contains("/data"),
+            "该报真实盘: {}",
             a[0].alert.body
         );
         forget(&sid);

@@ -75,6 +75,10 @@ pub struct DiskUsage {
     pub total_kb: u64,
     pub used_kb: u64,
     pub use_pct: f64,
+    /// 容器叠加层 / 只读镜像（overlay、aufs、squashfs）。数据照样回传（面板要看得到），
+    /// 但它不是一块独立的盘：overlay 就躺在根盘上，squashfs 是只读镜像 ——
+    /// 拿它当「最满的盘」等于同一块物理盘算两遍（和网络里 br-* 重复计数同一类问题）。
+    pub virtual_fs: bool,
 }
 
 pub struct ClientHandler {

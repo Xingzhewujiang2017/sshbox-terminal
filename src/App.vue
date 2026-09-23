@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -374,6 +374,27 @@ function onKey(e: KeyboardEvent) {
   if (e.key === 'Escape' && broadcastOn.value) {
     toggleBroadcast()
     return
+  }
+  // Esc 关掉最上面那层浮层。总览/历史/设置/转发/SFTP 都是全屏浮层，只有鼠标能关
+  // （点遮罩或 ×）—— 键盘用户按 Esc 没反应，会以为界面卡住了。从最上层往下找。
+  if (e.key === 'Escape') {
+    if (reportPickOpen.value) {
+      reportPickOpen.value = false
+      return
+    }
+    for (const [open, close] of [
+      [settingsOpen, () => (settingsOpen.value = false)],
+      [overviewOpen, () => (overviewOpen.value = false)],
+      [historyOpen, () => (historyOpen.value = false)],
+      [forwardOpen, () => (forwardOpen.value = false)],
+      [sftpOpen, () => (sftpOpen.value = false)],
+    ] as [Ref<boolean>, () => void][]) {
+      if (open.value) {
+        close()
+        e.preventDefault()
+        return
+      }
+    }
   }
   if (!e.ctrlKey) return
   if (e.shiftKey && (e.key === 'B' || e.key === 'b')) {
@@ -1203,7 +1224,6 @@ function statusDot(t: Tab) {
           @close="overviewOpen = false"
                     @focus="focusTab"
                     @connect="connectFromOverview"
-                    @command="insertToTerminal"
                   />
 
     <HistoryPanel

@@ -212,6 +212,8 @@ export interface DiskUsage {
   total_kb: number
   used_kb: number
   use_pct: number
+  /** 容器叠加层 / 只读镜像（overlay、squashfs）：不是独立的盘，不参与「最满的盘」。 */
+  virtual_fs?: boolean
 }
 /// 到默认网关的时延/丢包。拿不到就是 null（没网关 / 没装 ping）。
 export interface PingInfo {
@@ -485,7 +487,9 @@ export const api = {
   monitorSampleNow: (sid: string) => call<void>('monitor_sample_now', { sid }),
   /** 面板挂载时补齐曲线：该会话最近采到的原始点（后端内存环形缓冲，不是历史库）。 */
   monitorRecent: (sid: string) =>
-    call<{ metrics: Metrics[]; ping: RecentPing[] }>('monitor_recent', { sid }),
+    call<{ metrics: Metrics[]; ping: RecentPing[]; interval_secs: number }>('monitor_recent', {
+      sid,
+    }),
 
   // history
   historyRange: (hostId: string, from: number, to: number, maxPoints?: number) =>

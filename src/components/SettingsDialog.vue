@@ -73,9 +73,11 @@ watch(
   { immediate: true },
 )
 function applyCustomInterval() {
+  // 上限跟后端对齐：采集循环把间隔 clamp 到 [1,60]（monitor.rs effective_interval），
+  // 这里放行 3600 只会让人以为真的 1 小时采一次，实际还是 60 秒。
   let v = customInterval.value
   if (!Number.isFinite(v) || v < 1) v = 1
-  if (v > 3600) v = 3600
+  if (v > 60) v = 60
   customInterval.value = v
   form.value.sample_interval_secs = v
 }
@@ -199,7 +201,7 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
                           v-model.number="customInterval"
                           type="number"
                           min="1"
-                          max="3600"
+                          max="60"
                           step="1"
                           @change="applyCustomInterval"
                           @focus="($event.target as HTMLInputElement).select()"
@@ -207,7 +209,7 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
                         <span>秒 自定义</span>
                       </label>
                     </div>
-        <div class="hintline">不可见标签页会自动降频到 5 倍间隔以省带宽。</div>
+        <div class="hintline">不可见标签页会自动降频到 5 倍间隔以省带宽。间隔上限 60 秒（后端实际生效值）。</div>
         <div v-if="form.sample_interval_secs <= 2" class="hintline warn">间隔 ≤2s 时每台每秒一条采集通道 —— 目标 ≥10 台建议加到 ≥3s，避免通道风暴。</div>
 
         <label class="check">

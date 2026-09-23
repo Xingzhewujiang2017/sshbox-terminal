@@ -30,7 +30,6 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'focus', sid: string): void
   (e: 'connect', hostId: string): void
-  (e: 'command', p: { sid: string; text: string; execute?: boolean }): void
 }>()
 
 // --- 实时趋势窗口（卡片视图）------------------------------------------------
@@ -45,6 +44,15 @@ const TREND_MAX = 150
 const PING_MAX = 48
 const trend = ref<Record<string, Trend>>({})
 const hydrated = new Set<string>()
+/**
+ * 后端**实际生效**的采样间隔，挂载时从 `monitor_recent` 带回来。
+ *
+ * 设置里填 300s 时后端其实 60s 就采一次（`effective_interval` clamp 到 [1,60]），
+ * 前端要是按 300s 算「数据是否陈旧」，阈值永远够不到 —— 一台死掉的机器在面板上
+ * 会一直显示成「新鲜」。所以判陈旧用生效值，不用设置里的原始值。
+ */
+const effInterval = ref<number | null>(null)
+const cadenceSecs = computed(() => effInterval.value ?? props.interval)
 let unLiveMet: (() => void) | null = null
 let unLivePing: (() => void) | null = null
 const emptySeries = (): Series => ({ ts: [], v: [] })
@@ -74,6 +82,7 @@ async function hydrateTrend(sid: string) {
   hydrated.add(sid)
   try {
     const r = await api.monitorRecent(sid)
+    if (r.interval_secs > 0) effInterval.value = r.interval_secs
     for (const m of r.metrics) {
       pushTrend(sid, 'cpu', m.ts, m.cpu_pct)
       pushTrend(sid, 'mem', m.ts, m.mem_pct)
@@ -166,7 +175,7 @@ function subtitleOf(id: string | null | undefined): string {
  */
 function freshnessOf(ageSec: number | undefined, sid: string | undefined): Freshness {
   if (ageSec == null) return 'unknown'
-  const cadence = sid && sid === props.activeSid ? props.interval : props.interval * 5
+  const cadence = sid && sid === props.activeSid ? cadenceSecs.value : cadenceSecs.value * 5
   if (ageSec <= cadence * 1.6 + 1) return 'fresh'
   if (ageSec <= Math.max(cadence * 4, 90)) return 'stale'
   return 'dead'
@@ -274,7 +283,9 @@ const summary = computed(() => {
     stale,
     alarmed,
     offline,
-    hosts: groupFilter.value ? list.length : props.tabs.length,
+    // 「台」= 视图里真实显示的行数。用 props.tabs.length 时，勾了「包含离线」会多出
+    // 历史行（数字偏小），选了组又会把离线行算成会话（数字偏大）—— 同一个位置两种口径。
+    hosts: list.length,
     group: !!groupFilter.value,
   }
 })
@@ -289,10 +300,32 @@ const groupLeaders = computed(() => {
   return { busy: sorted[0], idle: sorted[sorted.length - 1] }
 })
 
-/** Highest disk usage across mounts — what "is this box filling up" means. */
+/**
+ * 该拿哪些挂载点比「最满的盘」。
+ *
+ * 容器叠加层（overlay / squashfs）不是独立的盘 —— 它和根盘躺在同一块物理盘上，
+ * 拿它比大小等于同一块盘算两遍（和网络里把 br-* 网桥也加进去同一类错），
+ * 而且它常年 90%+，会把真正该关心的根盘盖住。数据保留（监控面板照样能看到），
+ * 只是不参与「最满」的评比。整机全是叠加层（容器里跑）时退回全部，不假装没盘。
+ */
+function diskPool(m?: Metrics): Metrics['disks'] {
+  const all = m?.disks ?? []
+  const real = all.filter((d) => !d.virtual_fs)
+  return real.length ? real : all
+}
+
+/** Highest disk usage across *real* mounts — what "is this box filling up" means. */
 function worstDisk(m?: Metrics): number | undefined {
-  if (!m?.disks?.length) return undefined
-  return Math.max(...m.disks.map((d) => d.use_pct))
+  const pool = diskPool(m)
+  if (!pool.length) return undefined
+  return Math.max(...pool.map((d) => d.use_pct))
+}
+
+/** 最满的那块盘叫什么 —— 卡片上给个 title，别让人猜这 92% 是哪块盘。 */
+function worstDiskMount(m?: Metrics): string | undefined {
+  const pool = diskPool(m)
+  if (!pool.length) return undefined
+  return pool.reduce((a, b) => (b.use_pct > a.use_pct ? b : a)).mount
 }
 function netTotals(m?: Metrics): { rx: number; tx: number } {
   if (!m?.net?.length) return { rx: 0, tx: 0 }
@@ -371,15 +404,40 @@ async function loadGroupHistory() {
 
 watch(groupFilter, () => void loadGroupHistory())
 watch(histKey, () => void loadGroupHistory())
+// 换视角后旧的导出提示就过期了（说的是上一份数据）
+watch([groupFilter, histKey], () => (exportMsg.value = ''))
 
-/** 迷你折线 path —— 自绘 SVG，不引 ECharts，小多图矩阵要的就是轻。 */
-function sparkPath(vals: number[], w: number, h: number): string {
+/**
+ * 迷你折线 path —— 自绘 SVG，不引 ECharts，小多图矩阵要的就是轻。
+ *
+ * `max` 省略 = 按自身峰值归一（各线各自一个标尺，量纲不同的线才画得出来）；
+ * 给了 = 固定标尺（CPU/内存都按 0–100%，两线高度才可比）。
+ * null = 抬笔断线：缺采样点不补 0、也不把丢点挤掉（时间轴不会被压平）。
+ */
+function sparkPath(vals: (number | null)[], w: number, h: number, max?: number): string {
   if (!vals.length) return ''
-  const max = Math.max(...vals, 1)
+  const scale = max ?? Math.max(...vals.map((v) => (v == null || !isFinite(v) ? 0 : v)), 1)
   const step = w / Math.max(1, vals.length - 1)
-  return vals
-    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(h - 3 - (h - 8) * (v / max)).toFixed(1)}`)
-    .join(' ')
+  let d = ''
+  let pen = false
+  for (let i = 0; i < vals.length; i++) {
+    const v = vals[i]
+    if (v == null || !isFinite(v)) {
+      pen = false
+      continue
+    }
+    const y = h - 3 - (h - 8) * Math.min(1, Math.max(0, v / scale))
+    d += `${pen ? 'L' : 'M'}${(i * step).toFixed(1)},${y.toFixed(1)} `
+    pen = true
+  }
+  return d.trim()
+}
+
+/** 一条曲线里的峰值 —— 小多图各自标尺，标尺数值得写进图例，否则读不出量级。 */
+function peakOf(vals: (number | null)[]): number {
+  let m = 0
+  for (const v of vals) if (v != null && isFinite(v) && v > m) m = v
+  return m
 }
 /**
  * 迷你折线（可断线）：NULL 处抬笔 —— 不补 0、也不把丢点挤掉（丢点会压平时间轴）。
@@ -437,6 +495,16 @@ const histEmpty = computed(
 
 // --- 导出 CSV（#4） ---
 const exportMsg = ref('')
+/**
+ * 导出提示只写不清，会一直挂在面板头上 —— 下次导出前你还以为那是新结果。
+ * 10 秒后自己消失；换组、换时间窗口时立刻清掉（旧提示说的是另一份数据）。
+ */
+let exportTimer: ReturnType<typeof setTimeout> | null = null
+function setExportMsg(msg: string) {
+  exportMsg.value = msg
+  if (exportTimer) clearTimeout(exportTimer)
+  exportTimer = setTimeout(() => (exportMsg.value = ''), 10000)
+}
 
 async function downloadCsv(filename: string, rows: (string | number)[][]) {
   const esc = (v: string | number) => {
@@ -453,9 +521,9 @@ async function downloadCsv(filename: string, rows: (string | number)[][]) {
   try {
     const r = await api.exportCsvText(filename, csv)
     const kb = (r.bytes / 1024).toFixed(1)
-    exportMsg.value = `已导出 ${r.rows} 行（${kb} KB）→ ${r.path}`
+    setExportMsg(`已导出 ${r.rows} 行（${kb} KB）→ ${r.path}`)
   } catch (e) {
-    exportMsg.value = `导出失败：${(e as Error).message}`
+    setExportMsg(`导出失败：${(e as Error).message}`)
   }
 }
 
@@ -467,7 +535,7 @@ function csvDate(): string {
 function exportSnapshotCsv() {
   const name = groupFilter.value === '__none' ? '未分组' : groupFilter.value || '全部'
   const rows: (string | number)[][] = [
-    ['主机', '分组', '状态', '年龄(秒)', 'CPU%', '内存%', '磁盘%', '网络↓B/s', '网络↑B/s', '负载1', '进程数'],
+    ['主机', '分组', '状态', '年龄(秒)', 'CPU%', '内存%', '磁盘%', '磁盘挂载点', '网络↓B/s', '网络↑B/s', '负载1', '进程数'],
   ]
   for (const r of filteredRows.value) {
     rows.push([
@@ -478,6 +546,7 @@ function exportSnapshotCsv() {
       r.metrics?.cpu_pct ?? r.lastCpu ?? '',
       r.metrics?.mem_pct ?? r.lastMem ?? '',
       worstDisk(r.metrics) ?? '',
+      worstDiskMount(r.metrics) ?? '',
       Math.round(netTotals(r.metrics).rx),
       Math.round(netTotals(r.metrics).tx),
       r.metrics?.load?.[0] ?? '',
@@ -490,7 +559,7 @@ function exportSnapshotCsv() {
 /** 只导出**当前已加载**的历史窗口（组内历史矩阵的数据），窗口见 histKey。 */
 function exportHistoryCsv() {
   if (!Object.keys(histData.value).length) {
-    exportMsg.value = '该组暂无历史数据 —— 先让组内主机在线跑一会儿，再点刷新'
+    setExportMsg('该组暂无历史数据 —— 先让组内主机在线跑一会儿，再点刷新')
     return
   }
   const rows: (string | number)[][] = [
@@ -535,6 +604,7 @@ watch(
   },
 )
 onBeforeUnmount(() => {
+  if (exportTimer) clearTimeout(exportTimer)
   if (timer) clearInterval(timer)
   unLiveMet?.()
   unLivePing?.()
@@ -559,7 +629,7 @@ onBeforeUnmount(() => {
               </select>
               <span class="stat">
                 <template v-if="summary.group">组内在线 <b>{{ summary.online }}</b> / {{ summary.hosts }} 台</template>
-                <template v-else>在线 <b>{{ summary.online }}</b> / {{ summary.hosts }} 个会话</template>
+                <template v-else>在线 <b>{{ summary.online }}</b> / 显示 {{ summary.hosts }} 台</template>
               </span>
               <template v-if="groupLeaders">
                 <span class="stat dim">最忙 {{ groupLeaders.busy.title }}（{{ fmtPct(rowCpu(groupLeaders.busy)) }}）</span>
@@ -600,12 +670,12 @@ onBeforeUnmount(() => {
 
                               <div v-if="historyError" class="err">历史库读取失败：{{ historyError }}</div>
 
-      <div v-if="!rows.length" class="empty">
+      <div v-if="!filteredRows.length" class="empty">
         当前没有已连接的会话。双击左侧主机连接，或勾选「包含离线」看历史最后状态。
       </div>
 
       <!-- 卡片视图（#3）：每台一块卡片，CPU/内存/磁盘条 + 网络 + 状态灯 -->
-      <div v-if="viewMode === 'cards' && rows.length" class="grid ov-cards">
+      <div v-if="viewMode === 'cards' && filteredRows.length" class="grid ov-cards">
         <div v-for="r in filteredRows" :key="r.key" class="ov-card" :class="[r.status, r.freshness]">
           <div class="card-top">
             <span class="dot" :class="[r.status, r.freshness]"></span>
@@ -627,7 +697,7 @@ onBeforeUnmount(() => {
             <span class="v">{{ fmtPct(r.metrics?.mem_pct ?? r.lastMem) }}</span>
           </div>
           <div class="m">
-            <span class="k">磁盘</span>
+            <span class="k" :title="worstDiskMount(r.metrics) ? '最满挂载点：' + worstDiskMount(r.metrics) : ''">磁盘</span>
             <div class="track"><div class="fill" :class="barClass(worstDisk(r.metrics))" :style="{ width: Math.min(100, worstDisk(r.metrics) ?? 0) + '%' }"></div></div>
             <span class="v">{{ fmtPct(worstDisk(r.metrics)) }}</span>
           </div>
@@ -702,7 +772,7 @@ onBeforeUnmount(() => {
               <span class="v">{{ fmtPct(r.metrics?.mem_pct ?? r.lastMem) }}</span>
             </div>
             <div class="m">
-              <span class="k">磁盘</span>
+              <span class="k" :title="worstDiskMount(r.metrics) ? '最满挂载点：' + worstDiskMount(r.metrics) : ''">磁盘</span>
               <div class="track"><div class="fill" :class="barClass(worstDisk(r.metrics))" :style="{ width: Math.min(100, worstDisk(r.metrics) ?? 0) + '%' }"></div></div>
               <span class="v">{{ fmtPct(worstDisk(r.metrics)) }}</span>
             </div>
@@ -758,8 +828,8 @@ onBeforeUnmount(() => {
                                         <div class="cell-name">{{ hostLabelOf(hid) }}</div>
                                         <svg viewBox="0 0 220 58" preserveAspectRatio="none" width="100%" height="58">
                                           <template v-if="matrixMetric === 'cpu'">
-                                            <path :d="sparkPath(cpuSeries(r), 220, 58)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
-                                            <path :d="sparkPath(memSeries(r), 220, 58)" fill="none" stroke="var(--ctp-green)" stroke-width="1.3" stroke-dasharray="3 2" />
+                                            <path :d="sparkPath(cpuSeries(r), 220, 58, 100)" fill="none" stroke="var(--ctp-blue)" stroke-width="1.3" />
+                                            <path :d="sparkPath(memSeries(r), 220, 58, 100)" fill="none" stroke="var(--ctp-green)" stroke-width="1.3" stroke-dasharray="3 2" />
                                           </template>
                                           <template v-else-if="matrixMetric === 'net'">
                                             <path :d="sparkPath(netSeries(r), 220, 58)" fill="none" stroke="var(--ctp-yellow)" stroke-width="1.3" />
@@ -778,11 +848,11 @@ onBeforeUnmount(() => {
                                           </template>
                                         </svg>
                                         <div class="cell-legend">
-                                          <template v-if="matrixMetric === 'cpu'"><span class="lg">─ CPU</span><span class="lg dim">┄ 内存</span></template>
-                                          <template v-else-if="matrixMetric === 'net'"><span class="lg">─ 收</span><span class="lg dim">┄ 发</span></template>
-                                          <template v-else-if="matrixMetric === 'disk'"><span class="lg">─ 读</span><span class="lg dim">┄ 写</span></template>
-                                          <template v-else-if="matrixMetric === 'load'"><span class="lg">─ 负载1</span></template>
-                                          <template v-else><span class="lg">─ 时延ms</span><span class="lg dim">┄ 丢包%</span></template>
+                                          <template v-if="matrixMetric === 'cpu'"><span class="lg">─ CPU</span><span class="lg dim">┄ 内存</span><span class="lg dim">0–100%</span></template>
+                                          <template v-else-if="matrixMetric === 'net'"><span class="lg">─ 收</span><span class="lg dim">┄ 发</span><span class="lg dim">峰 {{ fmtBytes(Math.max(peakOf(netSeries(r)), peakOf(netTxSeries(r)))) }}</span></template>
+                                          <template v-else-if="matrixMetric === 'disk'"><span class="lg">─ 读</span><span class="lg dim">┄ 写</span><span class="lg dim">峰 {{ fmtBytes(Math.max(peakOf(diskRSeries(r)), peakOf(diskWSeries(r)))) }}</span></template>
+                                          <template v-else-if="matrixMetric === 'load'"><span class="lg">─ 负载1</span><span class="lg dim">峰 {{ peakOf(loadSeries(r)).toFixed(2) }}</span></template>
+                                          <template v-else><span class="lg">─ 时延ms</span><span class="lg dim">┄ 丢包%</span><span class="lg dim">峰 {{ peakOf(latSeries(pingData[hid])).toFixed(0) }}ms / {{ peakOf(lossSeries(pingData[hid])).toFixed(0) }}%</span></template>
                                         </div>
                                       </div>
                                     </div>

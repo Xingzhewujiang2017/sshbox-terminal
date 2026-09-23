@@ -84,6 +84,16 @@ pub struct RecentPing {
 pub struct Recent {
     pub metrics: Vec<Metrics>,
     pub ping: Vec<RecentPing>,
+    /// 后端**实际生效**的采样间隔（设置值 clamp 之后）。前端算「数据是否陈旧」要用它：
+    /// 直接用设置里的原始值，用户把间隔设成 300s 时后端其实 60s 就采一次，
+    /// 前端按 300s 判陈旧 → 阈值永远够不到，面板看着永远「新鲜」。
+    pub interval_secs: u64,
+}
+
+/// 采样间隔的唯一口径：设置值 clamp 到 [1, 60]。循环里和 `recent()` 都调它，
+/// 免得两处各写一份 clamp（一份改了另一份不改，就是面板和采集各说各话）。
+pub fn effective_interval(secs: u64) -> u64 {
+    secs.clamp(1, 60)
 }
 
 /// 满了丢最老的 —— 环形缓冲的唯一规则，单独抽出来是为了能单测。
@@ -115,15 +125,18 @@ fn push_recent_ping(sid: &SessionId, p: &PingInfo) {
 
 /// 该会话最近采到的点。空 = 还没采到过，或会话已经断开（`forget` 清过）。
 pub fn recent(sid: &SessionId) -> Recent {
+    let iv = effective_interval(store::load_settings().sample_interval_secs);
     let g = RECENT.lock().unwrap_or_else(|e| e.into_inner());
     match g.get(sid) {
         Some(b) => Recent {
             metrics: b.metrics.iter().cloned().collect(),
             ping: b.ping.iter().cloned().collect(),
+            interval_secs: iv,
         },
         None => Recent {
             metrics: Vec::new(),
             ping: Vec::new(),
+            interval_secs: iv,
         },
     }
 }
@@ -505,6 +518,12 @@ fn keep_mount(device: &str, fstype: &str, mount: &str) -> bool {
         || device.contains("pool")
 }
 
+/// 容器叠加层 / 只读镜像判定。`overlay` 的 device 字面量就是 "overlay"，
+/// squashfs 挂在 /dev/loop* 上（snap、kiosk 镜像），df 里经常显示成 100% 满。
+fn is_virtual_fs(device: &str, fstype: &str) -> bool {
+    matches!(fstype, "overlay" | "aufs" | "squashfs") || device == "overlay"
+}
+
 fn parse_df(lines: Option<&Vec<String>>) -> Vec<DiskUsage> {
     let mut disks = Vec::new();
     if let Some(ls) = lines {
@@ -523,6 +542,7 @@ fn parse_df(lines: Option<&Vec<String>>) -> Vec<DiskUsage> {
                     total_kb: total,
                     used_kb: used,
                     use_pct: pct,
+                    virtual_fs: is_virtual_fs(f[0], f[1]),
                 });
             }
         }
@@ -1571,7 +1591,7 @@ pub fn spawn(
         let mut last_history: f64 = 0.0;
         loop {
             let settings = store::load_settings();
-            let interval = settings.sample_interval_secs.clamp(1, 60);
+            let interval = effective_interval(settings.sample_interval_secs);
             // Idle states (paused / monitor off) poll this often: cheap, no SSH
             // traffic, and it keeps "resume" feeling instant.
             const IDLE_POLL_MS: u64 = 400;
@@ -1909,6 +1929,35 @@ mod tests {
         assert!(!mounts.contains(&"/sys/fs/cgroup"));
         assert!(!mounts.iter().any(|m| m.starts_with("/var/lib/docker")));
         assert_eq!(disks.len(), 3, "got {:?}", mounts);
+
+        // 容器叠加层要打上标记（device 字面量 overlay）：数据留着，但不当「最满的盘」
+        let virt: Vec<&str> = disks
+            .iter()
+            .filter(|d| d.virtual_fs)
+            .map(|d| d.mount.as_str())
+            .collect();
+        assert_eq!(virt, vec!["/var/lib/containers"], "叠加层漏标记: {:?}", virt);
+        assert!(
+            !disks.iter().find(|d| d.mount == "/").unwrap().virtual_fs,
+            "根盘不是叠加层"
+        );
+    }
+
+    #[test]
+    fn squashfs_loop_mounts_are_virtual() {
+        // snap / kiosk 镜像：/dev/loop0 squashfs，df 里常年 100% 满
+        let rows = lines(&[
+            "Filesystem Type 1024-blocks Used Available Capacity Mounted on",
+            "/dev/loop0 squashfs 131072 131072 0 100% /var/lib/snapd/snap/core22/1",
+            "/dev/vda1 ext4 10485760 5242880 5242880 50% /",
+        ]);
+        let disks = parse_df(Some(&rows));
+        let core = disks
+            .iter()
+            .find(|d| d.mount.contains("core22"))
+            .expect("loop 挂载点不该被丢掉");
+        assert!(core.virtual_fs, "squashfs 是只读镜像，不该当最满的盘");
+        assert!(!disks.iter().find(|d| d.mount == "/").unwrap().virtual_fs);
     }
 
     #[test]
