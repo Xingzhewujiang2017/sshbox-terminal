@@ -100,8 +100,20 @@ defineExpose({
 
 const ctxMenu = ref<{ x: number; y: number } | null>(null)
 
+/**
+ * 右键：主界面直接把坐标 + 当前选中文本交给 App，由 App 弹那一份完整菜单
+ * （复制 / 粘贴 / 解释这段 / 用自然语言生成命令 / 全选 / 清屏）。
+ *
+ * 早先这里是先弹一个三项小菜单、点「解释这段」再让 App 弹完整菜单 ——
+ * 两级菜单里第二级又有一个「解释这段」，用户要的复制/清屏藏在第二级里。
+ * 演练台的终端没有 AI 入口（noAsk），就地弹两项快捷菜单。
+ */
 function onContext(e: MouseEvent) {
-  ctxMenu.value = { x: e.clientX, y: e.clientY }
+  if (props.noAsk) {
+    ctxMenu.value = { x: e.clientX, y: e.clientY }
+    return
+  }
+  emit('context', { x: e.clientX, y: e.clientY, selection: getSelection() })
 }
 
 function ctxCopy() {
@@ -113,12 +125,6 @@ function ctxPaste() {
   ctxMenu.value = null
   // 不自动回车 —— 由用户确认后再按，避免误执行剪贴板里的命令
   void pasteClipboard()
-}
-
-function ctxAskAI() {
-  const pos = ctxMenu.value
-  ctxMenu.value = null
-  if (pos) emit('context', { x: pos.x, y: pos.y, selection: getSelection() })
 }
 
 onMounted(() => {
@@ -252,11 +258,11 @@ onBeforeUnmount(() => {
         <button @click="pasteConfirm = null">取消</button>
       </div>
     </div>
+    <!-- 演练台终端的快捷菜单（noAsk）—— 主界面的右键菜单由 App 统一弹一份 -->
     <div v-if="ctxMenu" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
       <button @click="ctxCopy">📋 复制选中</button>
       <button @click="ctxPaste">📥 粘贴</button>
-      <button v-if="!noAsk" @click="ctxAskAI">🤖 解释这段（AI）</button>
-          </div>
+    </div>
   </div>
 </template>
 

@@ -19,6 +19,7 @@ import {
   clearTurns,
   loadAiSettings,
 } from '../ai'
+import { stripPromptPrefix } from '../cmdtext'
 
 const props = defineProps<{ sid?: string | null; activeLabel?: string }>()
 const emit = defineEmits<{
@@ -86,7 +87,9 @@ const DANGEROUS: { re: RegExp; hint: string }[] = [
   { re: /\bsudo\s+(rm|mkfs|dd)\b/, hint: 'sudo 高危命令' },
   { re: /\bchmod\s+-R\s+777\s+\//, hint: 'chmod -R 777 /' },
 ]
-const insertWarn = ref<{ text: string; hint: string } | null>(null)
+const insertWarn = ref<{ text: string; hint: string; sid: string } | null>(null)
+/** 「已复制」反馈：存被点那一个按钮的 key（命令框 box:i / 命令块 i:si），1.2s 后清空 */
+const copiedKey = ref('')
 
 // --- 一次性告知（c）：上下文会发往第三方模型；localStorage 记住，不每轮弹窗 ---
 const showNotice = ref(!localStorage.getItem('sshbox_ai_notice'))
@@ -109,11 +112,12 @@ onBeforeUnmount(() => unlistenUsage?.())
 
 function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
   if (t.streaming) return
-  const text = cleanCommand(t.content)
+  const text = stripPromptPrefix(cleanCommand(t.content))
   if (!text.trim()) return
   const hit = DANGEROUS.find((d) => d.re.test(text))
   if (hit) {
-    insertWarn.value = { text, hint: hit.hint }
+    // 带上 sid：用户可能先切了标签再点确认，命令仍要填回生成它的那台主机
+    insertWarn.value = { text, hint: hit.hint, sid: t.sid ?? '' }
     return
   }
   emit('insert', { text, sid: t.sid ?? '' })
@@ -122,13 +126,23 @@ function insertTurn(t: { content: string; sid?: string; streaming?: boolean }) {
 function confirmWarnedInsert() {
   const w = insertWarn.value
   insertWarn.value = null
-  if (w) emit('insert', { text: w.text, sid: '' })
+  if (w) emit('insert', { text: w.text, sid: w.sid })
 }
 
-/** 复制这一轮的命令到剪贴板。 */
-async function copyTurn(t: { content: string }) {
+/**
+ * 复制一段命令到剪贴板 —— 命令框和回复里的命令块**共用这一个**。
+ * 与「插入终端」走同一套清洗（提示符逐行剥掉），复制出来能直接粘进终端跑。
+ * key 只用来做「已复制」反馈（命令框 = `box:<回合号>`，命令块 = `<回合号>:<块号>`）。
+ */
+async function copyText(raw: string, key: string) {
+  const text = stripPromptPrefix(cleanCommand(raw))
+  if (!text.trim()) return
   try {
-    await navigator.clipboard.writeText(cleanCommand(t.content))
+    await navigator.clipboard.writeText(text)
+    copiedKey.value = key
+    window.setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = ''
+    }, 1200)
   } catch {
     /* 剪贴板不可用时用户还能手动选中 */
   }
@@ -238,17 +252,18 @@ function plainThink(s: string): string {
 
       <div v-for="(t, i) in turns" :key="i" class="turn" :class="t.role">
         <div class="who">{{ t.role === 'user' ? '你' : (profile?.name ?? 'AI') }}</div>
-        <div
-          v-if="t.role === 'assistant' && t.kind === 'command'"
-          class="cmd-box"
-          :title="t.streaming ? '正在生成…' : '双击命令直接填入终端（不会自动执行）'"
-          @dblclick="insertTurn(t)"
-        >
-          <code>{{ t.content || '…' }}</code>
-          <div class="cmd-actions">
+        <div v-if="t.role === 'assistant' && t.kind === 'command'" class="cmd-box">
+          <!-- 双击只绑命令文本：整块绑会把动作行也圈进去 —— 双击「复制」会连带
+               把命令插进终端一次（点两次 + 冒泡的 dblclick）。 -->
+          <code
+            :title="t.streaming ? '正在生成…' : '双击命令直接填入终端（不会自动执行）'"
+            @dblclick="insertTurn(t)"
+          >{{ t.content || '…' }}</code>
+          <div class="cmd-actions" @dblclick.stop>
             <button class="mini primary" @click="insertTurn(t)">插入终端</button>
-            <button class="mini" @click="copyTurn(t)">复制</button>
-            <span class="mini-hint">双击命令也能直接填入；不会自动执行，回车由你按</span>
+            <button class="mini copy" @click="copyText(t.content, 'box:' + i)">
+              {{ copiedKey === 'box:' + i ? '已复制' : '复制' }}
+            </button>
           </div>
         </div>
         <div v-else class="body">
@@ -262,13 +277,20 @@ function plainThink(s: string): string {
           <template v-for="(seg, si) in segments(t.content || '')" :key="si">
             <!-- 连续命令行合成一块：按行给按钮会把多行脚本拆成几条坏命令填进终端 -->
             <div v-if="seg.cmd" class="cmd-block">
-              <code class="cb-text">{{ seg.lines.join('\n') }}</code>
-              <div class="cb-actions">
+              <code
+                class="cb-text"
+                :title="t.streaming ? '正在生成…' : '双击这段直接填入终端（不会自动执行）'"
+                @dblclick="insertTurn({ content: seg.lines.join('\n'), sid: t.sid })"
+              >{{ seg.lines.join('\n') }}</code>
+              <div class="cmd-actions" @dblclick.stop>
                 <button
                   class="mini primary"
                   title="把这段填入终端（不会自动执行，回车由你按）"
                   @click="insertTurn({ content: seg.lines.join('\n'), sid: t.sid })"
                 >插入终端</button>
+                <button class="mini copy" @click="copyText(seg.lines.join('\n'), i + ':' + si)">
+                  {{ copiedKey === i + ':' + si ? '已复制' : '复制' }}
+                </button>
               </div>
             </div>
             <div v-else class="text-line">{{ seg.lines[0] || '\u00a0' }}</div>
@@ -432,8 +454,12 @@ function plainThink(s: string): string {
   color: var(--ctp-green);
   white-space: pre-wrap;
   word-break: break-all;
+  cursor: pointer;
 }
-.cmd-block .cb-actions { display: flex; gap: 6px; margin-top: 6px; }
+/* 与命令框同款的"这里能双击"暗示 */
+.cmd-block:hover { border-color: var(--ctp-green); }
+/* 动作行两块共用 .cmd-actions —— 命令框和回复里的命令块按钮位置/间距必须一样，
+   否则"同一个操作两处长得不同"会让人以为功能不同（原来这里另有一套 .cb-actions） */
 .cmd-box {
   background: var(--ctp-crust);
   border: 1px solid var(--ctp-surface1);
@@ -459,9 +485,12 @@ function plainThink(s: string): string {
   font-size: 11px;
   padding: 2px 8px;
   cursor: pointer;
+  /* 不被文字挤扁：动作行必须稳定在一行 */
+  flex: 0 0 auto;
 }
 .mini.primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
-.mini-hint { font-size: 10px; color: var(--ctp-overlay0); }
+/* 「复制」→「已复制」会变宽，锁住宽度免得动作行抖 */
+.mini.copy { min-width: 52px; }
 .think {
   margin: 0 0 8px;
   background: var(--ctp-crust);

@@ -256,7 +256,13 @@ async function pasteToTerm() {
   const sid = aiMenu.value?.sid ?? ''
   aiMenu.value = null
   const ok = await termRefs.get(sid)?.pasteClipboard?.()
-  termBanner(ok ? 'info' : 'error', ok ? '已粘贴（没有回车，确认后自己按）' : '剪贴板是空的，或系统不允许读取')
+  // pasteClipboard 返回 false 有三种原因：剪贴板空 / 系统不给读 / 广播模式下弹了确认框等用户点。
+  // 早先一律报「剪贴板是空的」—— 广播时那句话是假的，用户会以为剪贴板坏了。
+  const tab = tabs.value.find((t) => t.sid === sid)
+  const bc = !!tab && broadcastOn.value && broadcastSel.value.includes(tab.id)
+  if (ok) termBanner('info', '已粘贴（没有回车，确认后自己按）')
+  else if (bc) termBanner('info', '广播模式：粘贴只作用于当前终端，请在弹窗里点确认')
+  else termBanner('error', '剪贴板是空的，或系统不允许读取')
 }
 
 function selectAllInTerm() {
