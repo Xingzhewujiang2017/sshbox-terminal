@@ -412,11 +412,58 @@ impl Default for Settings {
     }
 }
 
+/// 读配置。**纯读，不写盘** —— 这个函数在采样路径上（`monitor::parse_metrics`
+/// 每条样本都调一次），一旦带写副作用就会每秒重写用户的配置文件，
+/// 连单元测试都会改到真实配置。
 pub fn load_settings() -> Settings {
-    match fs::read_to_string(settings_path()) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+    let mut s = match fs::read_to_string(settings_path()) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
         Err(_) => Settings::default(),
+    };
+    // 内存里就地升级：即使写回失败，本次运行也是新值。
+    migrate_settings(&mut s);
+    s
+}
+
+/// 启动时调用一次：把升级后的配置**写回磁盘**。写盘只发生在这里，
+/// 所以"配置文件什么时候被改的"永远能在启动日志里对上号。
+pub fn migrate_settings_file() {
+    let raw = match fs::read_to_string(settings_path()) {
+        Ok(t) => t,
+        Err(_) => return, // 还没有配置文件：新建时本来就是新默认值
+    };
+    let mut s: Settings = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(_) => return, // 解析不了就别动它，免得把用户配置覆盖成默认值
+    };
+    if migrate_settings(&mut s) {
+        match save_settings(&s) {
+            Ok(()) => log::info!(
+                "[settings] max_tokens 从旧默认值 {} 升到 {} 并写回（思考也算在额度里，1024 会被吃光、正文一个字不剩）",
+                crate::ai::LEGACY_MAX_TOKENS,
+                crate::ai::default_max_tokens()
+            ),
+            Err(e) => log::warn!("[settings] 迁移后写回失败（本次运行内存里已生效）：{e:#}"),
+        }
     }
+}
+
+/// 一次性迁移：`max_tokens` 的旧默认值 1024 对推理模型不可用 —— 思考也算在额度里，
+/// 1024 会被思考吃光、正文一个字不剩（实测 deepseek-v4-flash-0731 / qwen3.6-27b 都这样）。
+/// 改 `default_max_tokens()` 只影响新建配置，`#[serde(default)]` 对已写入文件的值无效，
+/// 所以这里在加载时把**恰好等于旧默认值**的配置升上去。
+fn migrate_settings(s: &mut Settings) -> bool {
+    let mut changed = false;
+    for p in s.ai.profiles.iter_mut() {
+        if p.max_tokens == crate::ai::LEGACY_MAX_TOKENS {
+            p.max_tokens = crate::ai::default_max_tokens();
+            changed = true;
+        }
+    }
+    // 这里**不打日志**：本函数在采样路径上每次读配置都会走一遍，
+    // 日志只留给真正写盘的那一处（migrate_settings_file），
+    // 否则写盘失败时会按采样频率刷屏。
+    changed
 }
 
 pub fn save_settings(s: &Settings) -> Result<()> {
@@ -429,6 +476,41 @@ pub fn save_settings(s: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrate_raises_only_legacy_max_tokens() {
+        let mut s = Settings::default();
+        // 默认配置里可能已带 profile，清掉才能用固定下标断言
+        s.ai.profiles.clear();
+        s.ai.profiles.push(crate::ai::AiProfile {
+            id: "legacy".into(),
+            name: "旧配置".into(),
+            protocol: "openai".into(),
+            base_url: "https://example.com".into(),
+            model: "m".into(),
+            temperature: 0.2,
+            max_tokens: crate::ai::LEGACY_MAX_TOKENS,
+            has_key: false,
+        });
+        s.ai.profiles.push(crate::ai::AiProfile {
+            id: "custom".into(),
+            name: "用户自定".into(),
+            protocol: "openai".into(),
+            base_url: "https://example.com".into(),
+            model: "m".into(),
+            temperature: 0.2,
+            max_tokens: 512,
+            has_key: false,
+        });
+        assert!(migrate_settings(&mut s), "应该报告发生了迁移");
+        assert_eq!(
+            s.ai.profiles[0].max_tokens,
+            crate::ai::default_max_tokens(),
+            "旧默认值应被升到新默认值"
+        );
+        assert_eq!(s.ai.profiles[1].max_tokens, 512, "用户自定义值不能被改");
+        assert!(!migrate_settings(&mut s), "第二次应无变化（幂等）");
+    }
 
     #[test]
     fn host_roundtrip_keeps_order_and_ids() {

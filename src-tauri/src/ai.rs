@@ -24,7 +24,11 @@ fn default_protocol() -> String {
 fn default_temperature() -> f32 {
     0.2
 }
-fn default_max_tokens() -> u32 {
+/// `max_tokens` 的历史默认值。改默认值只管**新建**配置 —— 已经写进 settings.json 的
+/// 1024 不会因为 `#[serde(default)]` 而变，所以 store 加载时要迁移（见 `migrate_settings`）。
+pub const LEGACY_MAX_TOKENS: u32 = 1024;
+
+pub fn default_max_tokens() -> u32 {
     // 4096 而不是 1024：推理模型的**思考过程也算在这份额度里**，1024 会被
     // 思考吃光、正文一个字不剩（实测 deepseek-v4-flash-0731 就这样）。
     4096
@@ -139,21 +143,82 @@ fn empty_reply_error(finish: &str, raw: &str, body: &str, max_tokens: u32) -> St
     }
 }
 
-/// 剥离自建模型写进正文的思考（Qwen3 / DeepSeek-R1 风格的"Here's a thinking process:"）。
+/// 剥离模型写进正文的思考。服务端没拆 reasoning 字段时，思考会混在 content 里。
 ///
-/// 服务端没拆 reasoning 字段时，思考会混在 content 正文里。规则（用真实样例定）：
-/// 1. 找思考标记行（中文/英文两种都认）；
-/// 2. 思考块 = 标记行起，到**最后一个编号项**（`1.` `2.`…）连同其后缩进的项目符号行；
-/// 3. 剥离是**搬移不是删除**：剥出的内容返回给上层折叠显示，用户展开永远能看到原文。
-/// 找不到编号项（不是编号结构的思考）就原样返回，宁可不剥也不误删正文。
+/// 两种格式（都用真实样例定，顺序即优先级）：
+/// 1. **标签式**：`...` / `...`。qwen3.6-27b 经中转 provider 时**只有闭合
+///    标签**、没有开始标签，且思考段能长达数百字（真实样本如此）——所以这种情形按
+///    "正文开头到闭合标签"整段搬走，不加行数限制。
+/// 2. **编号式**：`Here's a thinking process:` / `以下是思考过程：` 起头，到最后一个编号项。
+///    marker 只在前 10 行内认，避免解释这个功能时把正文误当思考。
+///
+/// 安全属性：剥离是**搬移不是删除** —— 剥出的内容进「思考过程」折叠栏，展开永远能看到原文。
+/// 找不到结构就原样返回，宁可不剥也不误删正文。
 pub fn strip_thinking(content: &str) -> (String, Option<String>) {
+    if let Some(r) = strip_tagged_thinking(content) {
+        return r;
+    }
+    strip_numbered_thinking(content)
+}
+
+/// 标签式思考。标签都是 ASCII，用 `to_ascii_lowercase()` 做不敏感查找**保持字节长度不变**，
+/// 切片索引才安全（中文正文不会被破坏）。
+fn strip_tagged_thinking(content: &str) -> Option<(String, Option<String>)> {
+    const OPEN: [&str; 2] = ["<think>", "<thinking>"];
+    const CLOSE: [&str; 3] = ["</think>", "</thinking>", "<｜end▁of▁thinking｜>"];
+    // 没有开始标签时，前缀短于这个长度就多半是**正文在讨论这个标签本身**，不是思考。
+    // 真实思考段是数百字（样例 1241 字），一句话讨论只有几十字 —— 宁可留着也不误删正文。
+    const MIN_TAGGED_THINK_CHARS: usize = 80;
+
+    let lc = content.to_ascii_lowercase();
+    // 位置升序；同位置取更长的那个（`</think>` 与 `</thinking>` 共享前缀）
+    let pick = |tags: &[&str]| {
+        tags.iter()
+            .filter_map(|t| lc.find(t).map(|i| (i, t.len())))
+            .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+    };
+
+    let (close_at, close_len) = pick(&CLOSE)?;
+    let open = pick(&OPEN).filter(|(i, _)| *i < close_at);
+
+    let (think, answer) = match open {
+        Some((open_at, open_len)) => (
+            content[open_at + open_len..close_at].to_string(),
+            format!(
+                "{}{}",
+                &content[..open_at],
+                &content[close_at + close_len..]
+            ),
+        ),
+        // 没有开始标签：开头到闭合标签之间整段是思考（qwen3.6-27b 经中转的真实形态）
+        None => {
+            if content[..close_at].chars().count() < MIN_TAGGED_THINK_CHARS {
+                return None;
+            }
+            (
+                content[..close_at].to_string(),
+                content[close_at + close_len..].to_string(),
+            )
+        }
+    };
+
+    let think = think.trim();
+    // 剥出空内容（例如正文以闭合标签开头）→ 不剥，别把正文清空
+    if think.is_empty() {
+        return None;
+    }
+    Some((answer, Some(think.to_string())))
+}
+
+fn strip_numbered_thinking(content: &str) -> (String, Option<String>) {
     let markers = [
         "here's a thinking process:",
         "以下是思考过程：",
         "思考过程：",
     ];
     let lines: Vec<&str> = content.split('\n').collect();
-    let mline = lines.iter().position(|l| {
+    // 只在前 10 行内认标记：思考总在开头，避免"解释这个功能"时把正文误当思考剥走
+    let mline = lines.iter().take(10).position(|l| {
         let t = l.to_ascii_lowercase();
         markers.iter().any(|m| t.contains(m))
     });
@@ -1264,8 +1329,48 @@ mod tests {
         assert_eq!(truncate_middle("short", 100), "short");
     }
 
-    /// 空回复的诊断必须分清「输出被截断」和「提供方偶发空回复」。
-    /// 前者重试必然同样失败，建议用户重试等于让他白试。
+    /// 共享样例（同一份 JSON 也给前端 think.test.ts 用）：改规则必须两边一起过。
+    #[test]
+    fn think_cases_from_fixture() {
+        let raw = include_str!("../tests/fixtures/think_cases.json");
+        let cases: Vec<serde_json::Value> = serde_json::from_str(raw).expect("fixture 是合法 JSON");
+        assert!(cases.len() >= 7, "样例被删了？");
+        for c in &cases {
+            let name = c["name"].as_str().unwrap_or("?");
+            let input = c["input"].as_str().expect("input");
+            let (answer, think) = strip_thinking(input);
+
+            if c["think_none"].as_bool() == Some(true) {
+                assert!(think.is_none(), "[{name}] 不该剥出思考，却剥了");
+                assert_eq!(answer, input, "[{name}] 不剥时应原样返回");
+            }
+            if let Some(arr) = c["think_has"].as_array() {
+                let t = think
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("[{name}] 应该剥出思考，但没有"));
+                for s in arr {
+                    let s = s.as_str().unwrap();
+                    assert!(t.contains(s), "[{name}] 思考里缺「{s}」");
+                }
+            }
+            if let Some(arr) = c["answer_has"].as_array() {
+                for s in arr {
+                    let s = s.as_str().unwrap();
+                    assert!(
+                        answer.contains(s),
+                        "[{name}] 正文里缺「{s}」\n--- 正文 ---\n{answer}"
+                    );
+                }
+            }
+            if let Some(arr) = c["answer_has_not"].as_array() {
+                for s in arr {
+                    let s = s.as_str().unwrap();
+                    assert!(!answer.contains(s), "[{name}] 正文里不该有「{s}」");
+                }
+            }
+        }
+    }
+
     /// 剥离器用**真实样例**做夹具（Qwen3.6-27B 的思考块，用户提供）。
     /// 手写夹具漏过"思考块以编号项结尾 + 项目符号子行"的真实结构。
     #[test]

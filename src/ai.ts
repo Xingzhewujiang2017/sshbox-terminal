@@ -248,7 +248,10 @@ export async function ask(
       finalizeTurn(t)
     }
     if (kind === 'command') {
-      ai.pendingCommand = cleanCommand(full)
+      // 必须用剥离后的正文（t.content）：qwen3.6-27b 经中转会把思考写进 content，
+      // 直接用 full 会把整段思考连 <｜end▁of▁thinking｜> 标签一起填进终端。
+      const forCommand = t && t.role === 'assistant' ? t.content : full
+      ai.pendingCommand = cleanCommand(forCommand)
       ai.pendingSid = opts.sid ?? ''
     }
   } catch (e) {

@@ -78,7 +78,8 @@ function startNew() {
     base_url: 'http://127.0.0.1:11434/v1',
     model: '',
     temperature: 0.2,
-    max_tokens: 1024,
+    // 与后端 default_max_tokens() 对齐：1024 会被推理模型的思考吃光
+    max_tokens: 4096,
     has_key: false,
   }
   keyInput.value = ''
@@ -284,6 +285,9 @@ async function toggleSummary() {
           <input v-model.number="editing.max_tokens" type="number" min="64" max="32000" />
         </label>
       </div>
+      <div class="hintline">
+        推理模型（Qwen3 / DeepSeek-R1 等）的思考也占这份额度：1024 常被思考吃光，正文一个字不剩。建议 ≥4096。
+      </div>
       <div class="form-acts">
         <button class="mini" @click="cancelEdit">取消</button>
         <button class="mini primary" :disabled="busy === 'save'" @click="save">
@@ -311,6 +315,7 @@ async function toggleSummary() {
 
 <style scoped>
 .pane { display: flex; flex-direction: column; gap: 10px; }
+.hintline { font-size: 11px; color: var(--ctp-overlay0); line-height: 1.6; }
 .lead { font-size: 11.5px; color: var(--ctp-subtext0); line-height: 1.6; }
 .lead code, .note code { background: var(--ctp-crust); padding: 1px 4px; border-radius: 3px; }
 .alert { font-size: 11.5px; padding: 6px 8px; border-radius: 5px; line-height: 1.5; }

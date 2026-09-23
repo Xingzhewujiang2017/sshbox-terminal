@@ -125,6 +125,9 @@ pub fn run() {
             // Writer thread first: samples may start arriving as soon as a
             // session connects.
             history::init();
+            // 存量配置里 max_tokens=1024 对推理模型不可用（思考会把额度吃光），
+            // 这里一次性升上去并写回 —— 写盘只在这一处，便于排查配置何时被改。
+            store::migrate_settings_file();
             log::info!(
                 "SSHBox {} 启动，配置目录 {}",
                 env!("CARGO_PKG_VERSION"),

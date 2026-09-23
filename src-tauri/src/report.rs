@@ -383,7 +383,13 @@ fn fmt_rate(bps: f64) -> String {
 }
 
 /// Markdown 报告。`ai_summary` 为 None 时不出现"AI 结论"这一节。
-pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
+/// 另外带上从正文剥离出的模型思考。报告侧过去只把它写进日志、内容直接丢，
+/// 与 `think.ts` 声明的"搬移不是删除"矛盾 —— 现在放进折叠块，结论正文不受干扰。
+pub fn render_markdown(
+    d: &ReportData,
+    ai_summary: Option<&str>,
+    ai_thinking: Option<&str>,
+) -> String {
     let s = &d.static_info;
     let m = &d.metrics;
     let mut o = String::new();
@@ -401,15 +407,27 @@ pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
     }
     o.push('\n');
 
-    if let Some(ai) = ai_summary.filter(|a| !a.trim().is_empty()) {
+    let ai_text = ai_summary.filter(|a| !a.trim().is_empty());
+    let think_text = ai_thinking.filter(|t| !t.trim().is_empty());
+    let has_ai = ai_text.is_some() || think_text.is_some();
+    if has_ai {
         o.push_str("## 二、AI 结论\n\n");
-        o.push_str(ai.trim());
-        o.push_str("\n\n");
+        if let Some(ai) = ai_text {
+            o.push_str(ai.trim());
+            o.push_str("\n\n");
+        }
+        if let Some(th) = think_text {
+            o.push_str(&format!(
+                "<details><summary>模型思考（已自动剥离，{} 字）</summary>\n\n{}\n\n</details>\n\n",
+                th.chars().count(),
+                th.trim()
+            ));
+        }
     }
 
     o.push_str(&format!(
         "## {}、主机与系统\n\n",
-        if ai_summary.is_some() { "三" } else { "二" }
+        if has_ai { "三" } else { "二" }
     ));
     o.push_str("| 项 | 值 |\n|---|---|\n");
     o.push_str(&format!("| 主机名 | {} |\n", s.hostname));
@@ -637,7 +655,12 @@ pub fn render_markdown(d: &ReportData, ai_summary: Option<&str>) -> String {
 }
 
 /// 自包含 HTML（可直接发给同事，双击就能看）。
-pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
+/// 另外带一个"模型思考"折叠块（默认收起）。
+pub fn render_html(
+    d: &ReportData,
+    ai_summary: Option<&str>,
+    ai_thinking: Option<&str>,
+) -> String {
     let s = &d.static_info;
     let m = &d.metrics;
     let mut o = String::new();
@@ -654,6 +677,9 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
          .crit{border-color:#d20f39}.warn{border-color:#df8e1d}.info{border-color:#1e66f5}.ok{border-color:#40a02b}\
          code{background:#8882;padding:1px 4px;border-radius:3px}\
          .meta{color:#888;font-size:12px}\
+         .think{margin:8px 0;border:1px solid #8883;border-radius:4px;padding:6px 10px;background:#8881}\
+         .think summary{cursor:pointer;color:#888;font-size:12px}\
+         .think pre{white-space:pre-wrap;font:12px/1.55 ui-monospace,SFMono-Regular,monospace;margin:6px 0 0}\
          </style></head><body>",
     );
     o.push_str(&format!("<h1>巡检报告 · {}</h1>", esc(&d.host_label)));
@@ -672,9 +698,20 @@ pub fn render_html(d: &ReportData, ai_summary: Option<&str>) -> String {
         ));
     }
 
-    if let Some(ai) = ai_summary.filter(|a| !a.trim().is_empty()) {
+    let ai_text = ai_summary.filter(|a| !a.trim().is_empty());
+    let think_text = ai_thinking.filter(|t| !t.trim().is_empty());
+    if ai_text.is_some() || think_text.is_some() {
         o.push_str("<h2>AI 结论</h2>");
-        o.push_str(&format!("<div>{}</div>", esc(ai.trim()).replace('\n', "<br>")));
+        if let Some(ai) = ai_text {
+            o.push_str(&format!("<div>{}</div>", esc(ai.trim()).replace('\n', "<br>")));
+        }
+        if let Some(th) = think_text {
+            o.push_str(&format!(
+                "<details class=\"think\"><summary>模型思考（已自动剥离，{} 字）</summary><pre>{}</pre></details>",
+                th.chars().count(),
+                esc(th.trim())
+            ));
+        }
     }
 
     o.push_str("<h2>主机与系统</h2><table>");
@@ -1193,7 +1230,8 @@ async fn chart_ping_series(
 }
 
 /// 让 AI 写一段结论。失败**不影响报告**：返回 Err 由调用方记进 ai_error。
-async fn ai_summary(d: &ReportData) -> Result<String> {
+/// 返回（结论正文，从正文剥离出的思考）。思考不再被丢弃 —— 调用方把它放进报告折叠块。
+async fn ai_summary(d: &ReportData) -> Result<(String, Option<String>)> {
     let settings = crate::store::load_settings();
     let ai = &settings.ai;
     let id = ai.active_profile_id.trim();
@@ -1268,16 +1306,16 @@ async fn ai_summary(d: &ReportData) -> Result<String> {
             t0.elapsed().as_millis()
         ),
     }
-    // 自建模型（Qwen3 风格）常把思考写进正文且服务端不拆字段 → 剥离后再进报告
+    // 自建模型（Qwen3 风格）/ 中转不拆字段时常把思考写进正文 → 剥离后进报告
     out.map(|t| {
         let (answer, think) = crate::ai::strip_thinking(&t);
         if let Some(th) = &think {
             log::info!(
-                "[ai] 报告结论：从正文剥离思考 {} 字（模型把思考写进了 content）",
+                "[ai] 报告结论：从正文剥离思考 {} 字（模型把思考写进了 content，已放进报告折叠块）",
                 th.chars().count()
             );
         }
-        answer
+        (answer, think)
     })
 }
 
@@ -1345,18 +1383,20 @@ pub async fn report_generate(
     let mut ai_used = false;
     let mut ai_error: Option<String> = None;
     let mut summary: Option<String> = None;
+    let mut ai_thinking: Option<String> = None;
     if crate::store::load_settings().ai.report_ai_summary {
         match ai_summary(&data).await {
-            Ok(text) => {
+            Ok((text, think)) => {
                 summary = Some(text);
+                ai_thinking = think;
                 ai_used = true;
             }
             Err(e) => ai_error = Some(format!("{e:#}")),
         }
     }
 
-    let md = render_markdown(&data, summary.as_deref());
-    let html = render_html(&data, summary.as_deref());
+    let md = render_markdown(&data, summary.as_deref(), ai_thinking.as_deref());
+    let html = render_html(&data, summary.as_deref(), ai_thinking.as_deref());
     let dir = dest_dir
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
@@ -1556,13 +1596,13 @@ mod tests {
     #[test]
     fn markdown_has_every_section_and_the_ai_part_is_optional() {
         let d = mk(40.0, 30.0, 0, 2);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None, None);
         for want in ["# 巡检报告", "## 一、结论", "主机与系统", "当前负载", "## 磁盘", "服务与端口"] {
             assert!(md.contains(want), "缺小节 {want}");
         }
         assert!(!md.contains("AI 结论"), "没传 AI 结论就不该出现这一节");
 
-        let with_ai = render_markdown(&d, Some("整体正常。"));
+        let with_ai = render_markdown(&d, Some("整体正常。"), None);
         assert!(with_ai.contains("## 二、AI 结论"));
         assert!(with_ai.contains("整体正常。"));
         // 加了 AI 小节后，后续章节编号要跟着挪
@@ -1572,7 +1612,7 @@ mod tests {
     #[test]
     fn markdown_numbers_come_from_the_data() {
         let d = mk(77.0, 42.0, 0, 3);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None, None);
         assert!(md.contains("77%"), "磁盘百分比要出现: {md}");
         assert!(md.contains("42.0%"), "内存百分比要出现");
         assert!(md.contains("41"), "进程数要出现");
@@ -1593,7 +1633,7 @@ mod tests {
                 [1300.0, 20.0, 31.0, 2.0, 3.0, 0.0, 0.0, 0.6],
             ],
         }];
-        let html = render_html(&d, None);
+        let html = render_html(&d, None, None);
         assert!(html.contains("const SERIES="), "趋势数据要内嵌");
         assert!(html.contains("12.5"), "数据点要真的在文件里");
         assert!(html.contains("id=\"charts\""), "要有图表容器");
@@ -1604,14 +1644,14 @@ mod tests {
         // 没有历史数据时不该出现空的图表区
         let mut d2 = mk(10.0, 10.0, 0, 0);
         d2.series = vec![];
-        assert!(!render_html(&d2, None).contains("id=\"charts\""));
+        assert!(!render_html(&d2, None, None).contains("id=\"charts\""));
     }
 
     /// 网络速率要按网卡求和（多网卡机器取单个字段会少算）。
     #[test]
     fn network_section_sums_interfaces() {
         let d = mk(10.0, 10.0, 0, 1);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None, None);
         assert!(md.contains("## 网络"), "{md}");
         assert!(md.contains("网卡合计"), "要说清是合计: {md}");
     }
@@ -1627,7 +1667,7 @@ mod tests {
             ProcInfo { pid: 2, name: "mem-hog".into(), state: "S".into(), cpu_pct: 1.0, rss_kb: 3 * 1024 * 1024 },
             ProcInfo { pid: 3, name: "idle".into(), state: "S".into(), cpu_pct: 0.0, rss_kb: 512 },
         ];
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None, None);
         assert!(md.contains("## 进程"), "{md}");
         assert!(md.contains("共 3 个进程"));
         assert!(md.contains("cpu-hog") && md.contains("mem-hog"));
@@ -1638,7 +1678,7 @@ mod tests {
         let mem_part = md.split("内存占用最高").nth(1).unwrap_or("");
         assert!(mem_part.find("mem-hog").unwrap_or(9999) < mem_part.find("cpu-hog").unwrap_or(9999));
 
-        let html = render_html(&d, None);
+        let html = render_html(&d, None, None);
         assert!(html.contains("<h2>进程</h2>"));
         assert!(html.contains("cpu-hog"));
         // 进程名为空也不能渲染出破表
@@ -1660,18 +1700,36 @@ mod tests {
             rtt_max: 0.06,
             jitter: 0.007,
         });
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None, None);
         assert!(md.contains("链路质量"), "{md}");
         assert!(md.contains("0.05"), "平均时延要显示出来");
         assert!(md.contains("丢包"), "丢包要显示");
-        let html = render_html(&d, None);
+        let html = render_html(&d, None, None);
         assert!(html.contains("链路质量") && html.contains("172.20.0.1"));
 
         // 拿不到 ping（没网关/没装 ping）→ 整块不出现
         let mut d2 = mk(10.0, 10.0, 0, 0);
         d2.ping = None;
-        assert!(!render_markdown(&d2, None).contains("链路质量"));
-        assert!(!render_html(&d2, None).contains("链路质量"));
+        assert!(!render_markdown(&d2, None, None).contains("链路质量"));
+        assert!(!render_html(&d2, None, None).contains("链路质量"));
+    }
+
+    #[test]
+    fn report_keeps_ai_thinking_in_details_block() {
+        let d = mk(10.0, 30.0, 0, 4);
+        let think = "用户想要查询各个桶的状态。\n这里的桶指 Namespace。";
+        let md = render_markdown(&d, Some("整体状况良好。"), Some(think));
+        let html = render_html(&d, Some("整体状况良好。"), Some(think));
+        for (name, doc) in [("markdown", &md), ("html", &html)] {
+            assert!(doc.contains("模型思考（已自动剥离"), "{name} 缺少思考折叠块标题");
+            assert!(doc.contains("这里的桶指 Namespace。"), "{name} 把思考内容丢了");
+            assert!(doc.contains("整体状况良好。"), "{name} 丢了结论正文");
+        }
+        assert!(html.contains("class=\"think\""), "html 思考块要可折叠");
+        assert!(!html.contains("cdn."), "报告不引 CDN");
+        // 不传思考时不能凭空多出折叠块
+        let plain = render_html(&d, Some("整体状况良好。"), None);
+        assert!(!plain.contains("模型思考"), "无思考时不该出现折叠块");
     }
 
     #[test]
@@ -1697,11 +1755,11 @@ mod tests {
                 [600.0, 5.0, 1.0, 0.0],
             ],
         }];
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None, None);
         assert!(md.contains("时延趋势（最近 24h，3 个采样）"), "{md}");
         assert!(md.contains("均值 11.7 ms"), "（10+20+5）/3 = 11.7：{md}");
         assert!(md.contains("丢包峰值（最近 24h） | 10%"), "{md}");
-        let html = render_html(&d, None);
+        let html = render_html(&d, None, None);
         assert!(html.contains("PINGERIES"), "HTML 要内嵌时延序列");
         assert!(html.contains("时延（实线）"), "HTML 要有时延/抖动趋势图");
         assert!(html.contains("丢包率"), "HTML 要有丢包趋势图");
@@ -1721,7 +1779,7 @@ mod tests {
     fn html_is_self_contained_and_escapes_input() {
         let mut d = mk(40.0, 30.0, 0, 1);
         d.static_info.hostname = "<script>alert(1)</script>".into();
-        let html = render_html(&d, None);
+        let html = render_html(&d, None, None);
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(!html.contains("<script>alert"), "必须转义，否则报告能当 XSS 载体");
         assert!(html.contains("&lt;script&gt;"));
