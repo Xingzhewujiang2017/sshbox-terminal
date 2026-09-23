@@ -1,14 +1,16 @@
 {
   "name": "sshbox",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.6.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:think": "node --experimental-strip-types tests/think.test.ts"
+    "test:think": "node --experimental-strip-types tests/think.test.ts",
+    "test:cmd": "node --experimental-strip-types tests/cmd.test.ts",
+    "test:ts": "npm run test:think && npm run test:cmd"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

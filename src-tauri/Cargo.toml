@@ -1,6 +1,6 @@
 [package]
 name = "sshbox"
-version = "0.6.1"
+version = "0.6.2"
 description = "SSH terminal with real-time VM monitoring"
 authors = ["sshbox contributors"]
 edition = "2021"
