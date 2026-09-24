@@ -62,6 +62,11 @@ pub struct AiSettings {
     /// 留空 = 还没选（AI 入口禁用并提示去设置里挑一个）
     #[serde(default)]
     pub active_profile_id: String,
+    /// 「解释这段」单独用的接入点。留空 = 跟 `active_profile_id` 一样。
+    /// 存在的理由：解释终端报错是高频又便宜的任务，可以丢给本地小模型，
+    /// 把贵的模型留给生成命令/报告。
+    #[serde(default)]
+    pub explain_profile_id: String,
     /// 字段缺失时给预设；显式写成 `[]`（用户删光了）就尊重空列表。
     #[serde(default = "presets")]
     pub profiles: Vec<AiProfile>,
@@ -76,6 +81,7 @@ impl Default for AiSettings {
         // 不会出现「点一下报一堆错」的首次体验。
         AiSettings {
             active_profile_id: String::new(),
+            explain_profile_id: String::new(),
             profiles: presets(),
             report_ai_summary: true,
         }
@@ -932,7 +938,7 @@ pub async fn send_once(
 /// - 流中途断开**不丢已收到的内容** —— 部分回答也比一句「失败」有用；
 /// - 「干净地结束但一个字都没有」**重试一次**（提供方偶发空回复，见 `send_once`）；
 ///   只在还没有任何增量时重试，所以不会把文本吐两遍。
-pub async fn send_stream<F, G, U>(
+pub async fn send_stream<F, G, U, R>(
     profile: &AiProfile,
     key: Option<&str>,
     messages: &[ChatMessage],
@@ -940,16 +946,20 @@ pub async fn send_stream<F, G, U>(
     mut on_delta: F,
     mut on_reasoning: G,
     mut on_usage: U,
+    mut on_retry: R,
 ) -> Result<String>
 where
     F: FnMut(&str),
     G: FnMut(&str),
     U: FnMut(u64, u64),
+    // (HTTP 状态码, 这次退避多少毫秒) —— 面板据此显示「正在重试」
+    R: FnMut(u16, u64),
 {
     let proto = Protocol::parse(&profile.protocol);
     let mut acc = String::new();
     let mut raw_tail = String::new();
-    for attempt in 0..2 {
+    let mut empty_retried = false;
+    for attempt in 0..MAX_ATTEMPTS {
         let built = build_request(profile, key, messages, true);
         let mut resp = apply_headers(client()?.post(&built.url), &built.headers)
             .json(&built.body)
@@ -958,7 +968,30 @@ where
             .map_err(|e| anyhow!(net_error(&built.url, &e)))?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
+            // 必须在 `resp.text()` 之前取头：text() 会吃掉整个响应。
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let text = resp.text().await.unwrap_or_default();
+            // 只在**状态码阶段**重试。流中途断开不重试 —— 那会把已经显示出来的内容再吐一遍。
+            if retryable_status(status) && attempt + 1 < MAX_ATTEMPTS {
+                let delay = retry_delay(retry_after.as_deref(), attempt);
+                log::warn!(
+                    "[ai] HTTP {status} 可重试，{} 秒后第 {} 次尝试：{}",
+                    delay.as_secs(),
+                    attempt + 2,
+                    built.url
+                );
+                on_retry(status, delay.as_millis() as u64);
+                if !sleep_cancellable(delay, req_id).await {
+                    // 退避期间用户点了停止 —— 不再发下一次请求
+                    clear_cancel(req_id);
+                    return Ok(acc);
+                }
+                continue;
+            }
             return Err(anyhow!(extract_error(proto, status, &built.url, &text)));
         }
 
@@ -1020,13 +1053,16 @@ where
             clear_cancel(req_id);
             return Err(anyhow!("模型没有返回任何内容（连接可能被中断）"));
         }
-        if attempt == 0 {
-            log::warn!(
-                "[ai] 模型返回空内容，重试一次：{}（原始流尾巴：{}）",
-                built.url,
-                raw_tail.chars().take(200).collect::<String>()
-            );
+        if empty_retried {
+            // 空回复**只重试一次**：再来一次还是空就直接给最终诊断，别把同一份额度烧三遍
+            break;
         }
+        empty_retried = true;
+        log::warn!(
+            "[ai] 模型返回空内容，重试一次：{}（原始流尾巴：{}）",
+            built.url,
+            raw_tail.chars().take(200).collect::<String>()
+        );
     }
     clear_cancel(req_id);
     if acc.trim().is_empty() {
@@ -1041,6 +1077,43 @@ where
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
+
+/// 一次请求最多尝试几次（首次 + 最多 2 次重试）。
+const MAX_ATTEMPTS: usize = 3;
+
+/// 这些状态码值得退避重试：限流 + 临时服务端错误。401 / 404 / 400 重试没有意义。
+fn retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// 下一次重试前等多久：**优先听服务端的 `Retry-After`**（秒数形式），没有就用默认
+/// 1s / 3s。上限 30 秒 —— 中转偶尔给很大的值，等太久不如让用户自己决定要不要重试。
+/// HTTP-date 形式不解析（退回默认），为此多引一个时间解析依赖不划算。
+pub fn retry_delay(header: Option<&str>, attempt: usize) -> Duration {
+    const CAP: u64 = 30;
+    let fallback = if attempt == 0 { 1 } else { 3 };
+    let secs = header
+        .and_then(|h| h.trim().parse::<u64>().ok())
+        .unwrap_or(fallback)
+        .clamp(1, CAP);
+    Duration::from_secs(secs)
+}
+
+/// 可被「停止」打断的等待：每 100ms 查一次取消标志。
+/// 返回 false = 被取消，调用方不要再发下一次请求。
+async fn sleep_cancellable(total: Duration, req_id: &str) -> bool {
+    let step = Duration::from_millis(100);
+    let mut left = total;
+    while left > Duration::ZERO {
+        if is_cancelled(req_id) {
+            return false;
+        }
+        let s = left.min(step);
+        tokio::time::sleep(s).await;
+        left -= s;
+    }
+    !is_cancelled(req_id)
+}
 
 /// 这个 profile 最终会请求到哪个 URL —— 日志和"测试连接"都要显示它。
 /// 三种协议的路径拼法不同（Gemini 把模型放进路径），所以只能在这里统一算。
@@ -1454,5 +1527,46 @@ journalctl -u <服务名> --no-pager
         assert_eq!(Protocol::parse("gemini"), Protocol::Gemini);
         assert_eq!(Protocol::parse(""), Protocol::OpenAi);
         assert_eq!(Protocol::parse("whatever"), Protocol::OpenAi);
+    }
+
+    /// 退避时长：服务端的 `Retry-After` 优先，其次默认 1s / 3s，两端都有夹紧。
+    #[test]
+    fn retry_after_beats_default_backoff() {
+        assert_eq!(retry_delay(Some("5"), 0).as_secs(), 5, "服务端说了算");
+        assert_eq!(retry_delay(Some(" 12 "), 1).as_secs(), 12, "前后空格要能吃");
+        assert_eq!(retry_delay(Some("999"), 0).as_secs(), 30, "上限 30 秒");
+        assert_eq!(retry_delay(Some("0"), 0).as_secs(), 1, "下限 1 秒");
+        assert_eq!(retry_delay(None, 0).as_secs(), 1, "没头就用默认 1s");
+        assert_eq!(retry_delay(None, 1).as_secs(), 3, "第二次默认 3s");
+        // HTTP-date 形式不解析（不为此引时间依赖），退回默认值而不是崩
+        assert_eq!(
+            retry_delay(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 0).as_secs(),
+            1
+        );
+    }
+
+    #[test]
+    fn only_rate_limit_and_server_errors_are_retryable() {
+        assert!(retryable_status(429));
+        assert!(retryable_status(500));
+        assert!(retryable_status(503));
+        // 这些重试没有意义：密钥/地址/模型名不对，重试只会让用户多等
+        assert!(!retryable_status(400));
+        assert!(!retryable_status(401));
+        assert!(!retryable_status(403));
+        assert!(!retryable_status(404));
+    }
+
+    /// 「解释槽」是新增字段：旧 settings.json 没有它也要能读，且默认=跟 active 一样。
+    #[test]
+    fn explain_slot_defaults_to_empty() {
+        let s: AiSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.explain_profile_id.is_empty(), "缺字段要能读成空");
+        assert!(AiSettings::default().explain_profile_id.is_empty());
+        // 显式写过的值要能存下来（序列化往返）
+        let mut d = AiSettings::default();
+        d.explain_profile_id = "local".into();
+        let back: AiSettings = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.explain_profile_id, "local");
     }
 }

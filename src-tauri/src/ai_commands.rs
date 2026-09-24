@@ -71,6 +71,7 @@ pub fn ai_profile_save(profile: AiProfile, key: Option<String>) -> Result<AiSett
 pub fn ai_profile_delete(id: String) -> Result<AiSettings, String> {
     let mut settings = store::load_settings();
     settings.ai.profiles.retain(|p| p.id != id);
+    clear_explain_if_deleted(&mut settings.ai, &id);
     let _ = store::delete_secret(&ai::key_entry(&id));
     if active_id(&settings.ai).as_deref() == Some(id.as_str()) {
         // 删掉正在用的那个就**留空**，而不是自动挑下一个：
@@ -86,6 +87,23 @@ pub fn ai_profile_delete(id: String) -> Result<AiSettings, String> {
 pub fn ai_set_active(id: String) -> Result<AiSettings, String> {
     let mut settings = store::load_settings();
     settings.ai.active_profile_id = id;
+    store::save_settings(&settings).map_err(|e| format!("{e:#}"))?;
+    Ok(ai_settings())
+}
+
+/// 删掉某个接入点时，把指向它的「解释槽」一起清空 —— 否则会留一个指向不存在
+/// 接入点的悬空 id，解释这段时后端报"没有这个模型配置"（用户完全不知道去哪改）。
+pub fn clear_explain_if_deleted(s: &mut AiSettings, id: &str) {
+    if s.explain_profile_id == id {
+        s.explain_profile_id = String::new();
+    }
+}
+
+#[tauri::command]
+pub fn ai_set_explain_profile(id: String) -> Result<AiSettings, String> {
+    let mut settings = store::load_settings();
+    // 传空字符串 = 回到"跟当前使用的一样"
+    settings.ai.explain_profile_id = id.trim().to_string();
     store::save_settings(&settings).map_err(|e| format!("{e:#}"))?;
     Ok(ai_settings())
 }
@@ -213,6 +231,8 @@ pub async fn ai_chat(
     let app3 = app.clone();
     let rid_u = req_id.clone();
     let app4 = app.clone();
+    let rid_t = req_id.clone();
+    let app5 = app.clone();
     let result = ai::send_stream(
         &p,
         key.as_deref(),
@@ -234,6 +254,13 @@ pub async fn ai_chat(
             let _ = app4.emit(
                 "ssh://ai/usage",
                 serde_json::json!({ "req_id": rid_u, "prompt_tokens": p, "completion_tokens": c, "total": p + c }),
+            );
+        },
+        // 429 / 5xx 退避重试：面板据此显示"正在重试"，否则用户以为卡住了
+        move |status, delay_ms| {
+            let _ = app5.emit(
+                "ssh://ai/retry",
+                serde_json::json!({ "req_id": rid_t, "status": status, "delay_ms": delay_ms }),
             );
         },
     )
@@ -482,6 +509,22 @@ pub async fn ai_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 删接入点要把指向它的「解释槽」一起清掉，且不能误伤别人。
+    #[test]
+    fn deleting_a_profile_clears_only_its_explain_slot() {
+        let mut s = AiSettings {
+            explain_profile_id: "local".into(),
+            ..AiSettings::default()
+        };
+        clear_explain_if_deleted(&mut s, "cloud");
+        assert_eq!(s.explain_profile_id, "local", "指向别人时不能动");
+        clear_explain_if_deleted(&mut s, "local");
+        assert!(s.explain_profile_id.is_empty(), "指向被删的那个要清空");
+        // 空槽不受影响
+        clear_explain_if_deleted(&mut s, "whatever");
+        assert!(s.explain_profile_id.is_empty());
+    }
 
     /// 一份采集到的静态信息（字段和真机一致，用来钉住 host_brief 的内容）
     fn statics() -> crate::ssh::StaticInfo {

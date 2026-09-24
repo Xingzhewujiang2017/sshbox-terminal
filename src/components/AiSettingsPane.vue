@@ -192,6 +192,16 @@ async function restorePresets() {
   }
 }
 
+async function setExplain(id: string) {
+  if (!settings.value) return
+  try {
+    settings.value = await api.aiSetExplainProfile(id)
+    emit('changed')
+  } catch (e) {
+    err.value = (e as Error).message
+  }
+}
+
 async function toggleSummary() {
   if (!settings.value) return
   const next = !settings.value.report_ai_summary
@@ -296,13 +306,30 @@ async function toggleSummary() {
       </div>
     </div>
 
+    <label class="slot">
+      解释这段用哪个模型
+      <select
+        :value="settings?.explain_profile_id ?? ''"
+        :disabled="!!busy"
+        @change="setExplain(($event.target as HTMLSelectElement).value)"
+      >
+        <option value="">跟「当前使用」的一样</option>
+        <option v-for="p in settings?.profiles ?? []" :key="p.id" :value="p.id">
+          {{ p.name || p.model }}
+        </option>
+      </select>
+    </label>
+    <div class="hintline">
+      「解释这段」是高频又便宜的任务，可以单独丢给本地小模型；生成命令与报告仍用「当前使用」那个。
+    </div>
+
     <label class="check">
       <input
         type="checkbox"
         :checked="settings?.report_ai_summary ?? false"
         @change="toggleSummary"
       />
-      <span>巡检报告里附一段 AI 写的结论（关掉后报告完全由规则生成）</span>
+      <span>巡检报告里附一段 AI 写的结论（关掉后完全由规则生成）</span>
     </label>
 
     <div class="note">
@@ -316,6 +343,8 @@ async function toggleSummary() {
 <style scoped>
 .pane { display: flex; flex-direction: column; gap: 10px; }
 .hintline { font-size: 11px; color: var(--ctp-overlay0); line-height: 1.6; }
+.slot { font-size: 11px; color: var(--ctp-subtext0); display: flex; flex-direction: column; gap: 3px; }
+.slot select { padding: 3px 6px; }
 .lead { font-size: 11.5px; color: var(--ctp-subtext0); line-height: 1.6; }
 .lead code, .note code { background: var(--ctp-crust); padding: 1px 4px; border-radius: 3px; }
 .alert { font-size: 11.5px; padding: 6px 8px; border-radius: 5px; line-height: 1.5; }

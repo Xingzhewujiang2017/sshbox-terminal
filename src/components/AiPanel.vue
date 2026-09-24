@@ -20,6 +20,7 @@ import {
   loadAiSettings,
 } from '../ai'
 import { stripPromptPrefix } from '../cmdtext'
+import AiThink from './AiThink.vue'
 
 const props = defineProps<{ sid?: string | null; activeLabel?: string }>()
 const emit = defineEmits<{
@@ -41,14 +42,6 @@ const ready = computed(() => aiReady())
 const reason = computed(() => aiDisabledReason())
 const profile = computed(() => activeProfile())
 const profiles = computed(() => ai.settings?.profiles ?? [])
-
-/** 本地端点不需要密钥（判断口径与设置页一致）。 */
-function needsKey(p: { base_url: string }) {
-  return !/127\.0\.0\.1|localhost|\[::1\]/i.test(p.base_url)
-}
-function keyMissing(p: { base_url: string; has_key: boolean }) {
-  return needsKey(p) && !p.has_key
-}
 
 /** 面板里直接换模型：写回后端 → 重读设置，AI 入口的可用状态跟着变。 */
 async function switchModel(id: string) {
@@ -185,10 +178,6 @@ function looksLikeCommand(line: string): boolean {
   if (!t) return false
   return /^[$#>]\s/.test(t) || /^(sudo|systemctl|journalctl|ss|df|du|ps|top|grep|cat|tail|curl|docker|apt|yum|kill|netstat|lsof|find|awk|sed)\b/.test(t)
 }
-/** 思考文本的展示清洗：只去掉 markdown 加粗星号，不渲染、不砍内容。 */
-function plainThink(s: string): string {
-  return s.split('**').join('')
-}
 </script>
 
 <template>
@@ -206,7 +195,7 @@ function plainThink(s: string): string {
       >
         <option value="" disabled>未选择模型</option>
         <option v-for="p in profiles" :key="p.id" :value="p.id">
-          {{ p.name }} · {{ p.model }}{{ keyMissing(p) ? '（缺密钥）' : '' }}
+          {{ p.name }} · {{ p.model }}
         </option>
       </select>
       <span v-else class="badge off">未配置</span>
@@ -267,13 +256,7 @@ function plainThink(s: string): string {
           </div>
         </div>
         <div v-else class="body">
-          <!-- 思考过程：默认折叠（模型可能吐几千字），标题给字数，展开才看 -->
-          <details v-if="t.reasoning" class="think">
-            <summary>
-              <span class="tk">思考过程</span> {{ t.reasoning.length }} 字<span v-if="t.streaming" class="thinking">正在思考…</span>
-            </summary>
-            <pre>{{ plainThink(t.reasoning) }}</pre>
-          </details>
+          <AiThink v-if="t.reasoning" :text="t.reasoning" :streaming="t.streaming" />
           <template v-for="(seg, si) in segments(t.content || '')" :key="si">
             <!-- 连续命令行合成一块：按行给按钮会把多行脚本拆成几条坏命令填进终端 -->
             <div v-if="seg.cmd" class="cmd-block">
@@ -297,6 +280,15 @@ function plainThink(s: string): string {
           </template>
           <span v-if="t.streaming" class="caret">▋</span>
         </div>
+        <!-- 命令轮：思考栏在**命令框下方** —— 第一眼要的是命令本身；
+             而"它假设的是哪台机器、有没有核对安全"恰好是判断要不要按回车的关键。
+             注意必须放在 v-if/v-else 这对相邻兄弟之后，否则会打断它们。 -->
+        <AiThink
+          v-if="t.role === 'assistant' && t.kind === 'command' && t.reasoning"
+          :text="t.reasoning"
+          :streaming="t.streaming"
+        />
+        <div v-if="t.retry" class="retry">{{ t.retry }}</div>
         <div v-if="t.error" class="turn-err">{{ t.error }}</div>
       </div>
     </div>
@@ -491,28 +483,8 @@ function plainThink(s: string): string {
 .mini.primary { background: var(--ctp-blue); color: var(--on-accent); border: none; font-weight: 600; }
 /* 「复制」→「已复制」会变宽，锁住宽度免得动作行抖 */
 .mini.copy { min-width: 52px; }
-.think {
-  margin: 0 0 8px;
-  background: var(--ctp-crust);
-  border-left: 3px solid var(--ctp-surface2);
-  border-radius: 0 6px 6px 0;
-  padding: 6px 10px;
-}
-.think summary {
-  font-size: 10.5px; color: var(--ctp-overlay0); cursor: pointer; user-select: none; list-style: none;
-}
-.think summary:hover { color: var(--ctp-subtext0); }
-.think summary::-webkit-details-marker { display: none; }
-.think summary::before { content: '▸ '; }
-.think[open] summary::before { content: '▾ '; }
-.tk { color: var(--ctp-subtext0); font-weight: 600; }
-.think pre {
-  margin: 8px 0 0; padding-top: 8px; border-top: 1px dashed var(--ctp-surface0);
-  white-space: pre-wrap; word-break: break-word;
-  font-family: ui-monospace, monospace; font-size: 10.5px;
-  color: var(--ctp-overlay0); line-height: 1.6;
-}
-.thinking { color: var(--ctp-blue); margin-left: 6px; }
+/* 429/5xx 退避重试的一行状态：不显示的话用户会以为卡住了 */
+.retry { font-size: 10.5px; color: var(--ctp-yellow); margin-top: 4px; }
 .caret { color: var(--ctp-blue); animation: blink 1s steps(2) infinite; }
 @keyframes blink { to { opacity: 0; } }
 .turn-err { font-size: 11px; color: var(--ctp-red); margin-top: 4px; line-height: 1.5; }

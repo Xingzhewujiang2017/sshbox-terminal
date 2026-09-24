@@ -60,6 +60,7 @@ pub fn run() {
             ai_commands::ai_profile_delete,
             ai_commands::ai_set_active,
             ai_commands::ai_set_report_summary,
+            ai_commands::ai_set_explain_profile,
             ai_commands::ai_key_has,
             ai_commands::ai_key_delete,
             ai_commands::ai_presets,

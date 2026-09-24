@@ -370,6 +370,8 @@ export interface AiProfile {
 export interface AiSettings {
   /** 留空 = 还没选（AI 入口禁用） */
   active_profile_id: string
+  /** 「解释这段」单独用的接入点；留空 = 跟 active_profile_id 一样 */
+  explain_profile_id: string
   profiles: AiProfile[]
   /** 巡检报告里附一段 AI 结论 */
   report_ai_summary: boolean
@@ -576,6 +578,7 @@ export const api = {
     call<AiSettings>('ai_profile_save', { profile, key: key ?? null }),
   aiProfileDelete: (id: string) => call<AiSettings>('ai_profile_delete', { id }),
   aiSetActive: (id: string) => call<AiSettings>('ai_set_active', { id }),
+  aiSetExplainProfile: (id: string) => call<AiSettings>('ai_set_explain_profile', { id }),
   aiSetReportSummary: (on: boolean) => call<void>('ai_set_report_summary', { on }),
   aiKeyHas: (id: string) => call<boolean>('ai_key_has', { id }),
   aiKeyDelete: (id: string) => call<void>('ai_key_delete', { id }),

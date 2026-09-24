@@ -26,6 +26,8 @@ export interface AiTurn {
   sid?: string
   /** 思考过程（deepseek 系模型会先吐一大段）。面板默认折叠，展开才看。 */
   reasoning?: string
+  /** 正在退避重试（429/5xx）的一行状态；收到正文或收尾时清掉 */
+  retry?: string
   at: number
 }
 
@@ -116,26 +118,28 @@ export function activeProfile(): AiProfile | null {
 }
 
 /**
- * AI 是否可用。**没配好就明确禁用**，而不是让用户点了才报错。
- * 本地 Ollama 这类不需要密钥的端点，has_key 为 false 也算可用。
+ * AI 是否可用。**只看有没有选接入点** —— 密钥不再是门禁。
+ *
+ * 理由（用户拍板）：本地 / 局域网 / 自建端点本来就不需要密钥，"没填密钥"不该
+ * 提前把输入框锁死；云端真缺密钥时，发送会拿到 401，文案本身已经说清
+ * （见 `ai.rs::extract_error` 的 401 分支）。所以这里不再拿 has_key 做判断，
+ * 面板上也不再出现任何密钥相关的提示。
  */
 export function aiReady(): boolean {
-  const p = activeProfile()
-  if (!p) return false
-  if (needsKey(p) && !p.has_key) return false
-  return true
-}
-
-/** 只有本地/回环地址才允许没有密钥（云端不带 key 一定是配置没填完）。 */
-export function needsKey(p: AiProfile): boolean {
-  return !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(p.base_url.trim())
+  return activeProfile() !== null
 }
 
 export function aiDisabledReason(): string {
-  const p = activeProfile()
-  if (!p) return '还没选择模型 —— 去 设置 → AI 模型 里挑一个'
-  if (needsKey(p) && !p.has_key) return `「${p.name}」还没填 API 密钥 —— 去 设置 → AI 模型 里补上`
-  return ''
+  return activeProfile() ? '' : '还没选择模型 —— 去 设置 → AI 模型 里挑一个'
+}
+
+/**
+ * **仅供设置页的标签使用**（判断这个接入点看起来需不需要密钥）。
+ * 不参与 AI 面板的门禁 —— 面板已按"没密钥也能输入、不提示"处理。
+ * 口径只认回环地址：局域网/自建的端点在这里会被标成"缺密钥"，只是标签，不拦人。
+ */
+export function needsKey(p: AiProfile): boolean {
+  return !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(p.base_url.trim())
 }
 
 export async function loadAiSettings() {
@@ -157,6 +161,7 @@ export async function initAi() {
     const t = arr[arr.length - 1]
     if (!t || t.role !== 'assistant' || !t.streaming) return
     t.content += e.payload.text
+    t.retry = undefined // 已经开始出正文了，别让"正在重试"继续挂着
   })
   // 思考过程单独一条流：面板默认折叠，展开才看
   await listen<{ req_id: string; text: string }>('ssh://ai/reasoning', (e) => {
@@ -166,12 +171,22 @@ export async function initAi() {
     if (!t || t.role !== 'assistant' || !t.streaming) return
     t.reasoning = (t.reasoning ?? '') + e.payload.text
   })
+  // 429 / 5xx 退避重试：给面板一行状态，否则用户以为卡住了
+  await listen<{ req_id: string; status: number; delay_ms: number }>('ssh://ai/retry', (e) => {
+    const slot = slotOfReq(e.payload.req_id)
+    const arr = ai.turnsByTab[slot] ?? []
+    const t = arr[arr.length - 1]
+    if (!t || t.role !== 'assistant' || !t.streaming) return
+    const secs = Math.max(1, Math.round(e.payload.delay_ms / 1000))
+    t.retry = `HTTP ${e.payload.status} —— 正在重试（等 ${secs} 秒）`
+  })
   await listen<{ req_id: string }>('ssh://ai/done', (e) => {
     const slot = slotOfReq(e.payload.req_id)
     const arr = ai.turnsByTab[slot] ?? []
     const t = arr[arr.length - 1]
     if (t && t.role === 'assistant') {
       t.streaming = false
+      t.retry = undefined
       finalizeTurn(t)
     }
     ai.streamingByTab[slot] = false
@@ -231,10 +246,14 @@ export async function ask(
   const reqId = newReqId()
   ai.reqId = reqId
   trackReq(reqId)
+  // 「解释这段」可以单独指定接入点（留空 = 跟当前使用的一样）。
+  // 解释报错是高频又便宜的任务，可以丢给本地小模型，把贵的留给生成命令/报告。
+  const explainId = ai.settings?.explain_profile_id?.trim() ?? ''
   try {
     const full = await api.aiAsk({
       reqId,
       kind,
+      profileId: kind === 'explain' && explainId ? explainId : null,
       sid: opts.sid ?? null,
       selection: opts.selection ?? null,
       ask: opts.prompt ?? null,
