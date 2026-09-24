@@ -1362,7 +1362,7 @@ mod tests {
         }
     }
 
-    /// 剥离器用**真实样例**做夹具（Qwen3.6-27B 的思考块，用户提供）。
+    /// 剥离器用**真实样例**做夹具（某推理模型经中转输出的思考块，用户提供）。
     /// 手写夹具漏过"思考块以编号项结尾 + 项目符号子行"的真实结构。
     #[test]
     fn strip_thinking_detaches_reasoning_but_never_loses_it() {
@@ -1370,7 +1370,7 @@ mod tests {
  
 1.  **Analyze User Input:**
    - User asks: \"如何查询日志\"
-   - Context: SSH client, target host root@172.22.134.88, K8s node.
+   - Context: SSH client, target host root@10.0.0.5, K8s node.
 2.  **Identify Key Log Locations:**
    - System: journalctl, /var/log/messages
    - K8s: kubectl logs, /var/log/pods/

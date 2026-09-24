@@ -1,5 +1,5 @@
 /**
- * 剥离模型写进正文的思考（Qwen3 / DeepSeek-R1 / qwen3.6-27b 经中转 provider）。
+ * 剥离模型写进正文的思考（Qwen3 / DeepSeek-R1 这类，或经中转的推理模型）。
  *
  * 与 src-tauri/src/ai.rs 的 strip_thinking 是**同一规则的两份实现**：
  * 后端管报告 AI 结论（非流式），这里管对话/生成命令/解释（流式在收尾时剥）。
