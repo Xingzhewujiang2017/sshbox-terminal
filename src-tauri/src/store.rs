@@ -449,7 +449,7 @@ pub fn migrate_settings_file() {
 }
 
 /// 一次性迁移：`max_tokens` 的旧默认值 1024 对推理模型不可用 —— 思考也算在额度里，
-/// 1024 会被思考吃光、正文一个字不剩（实测 deepseek-v4-flash-0731 / qwen3.6-27b 都这样）。
+/// 1024 会被思考吃光、正文一个字不剩（实测走中转和自建的推理模型都这样）。
 /// 改 `default_max_tokens()` 只影响新建配置，`#[serde(default)]` 对已写入文件的值无效，
 /// 所以这里在加载时把**恰好等于旧默认值**的配置升上去。
 fn migrate_settings(s: &mut Settings) -> bool {

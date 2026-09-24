@@ -238,7 +238,7 @@ async function toggleSummary() {
 
     <div class="row-actions">
       <button class="mini" @click="startNew">＋ 添加自定义接入点</button>
-      <button class="mini" @click="restorePresets">补齐预设（Ollama / SiliconFlow / aiaaa.cc）</button>
+      <button class="mini" @click="restorePresets">补齐预设（Ollama / SiliconFlow）</button>
     </div>
 
     <!-- 编辑表单 -->

@@ -30,7 +30,7 @@ pub const LEGACY_MAX_TOKENS: u32 = 1024;
 
 pub fn default_max_tokens() -> u32 {
     // 4096 而不是 1024：推理模型的**思考过程也算在这份额度里**，1024 会被
-    // 思考吃光、正文一个字不剩（实测 deepseek-v4-flash-0731 就这样）。
+    // 思考吃光、正文一个字不剩（实测推理模型就这样）。
     4096
 }
 fn default_true() -> bool {
@@ -72,7 +72,7 @@ pub struct AiSettings {
 
 impl Default for AiSettings {
     fn default() -> Self {
-        // 三个预设都放上，但**默认不选**：没配好之前 AI 入口保持禁用，
+        // 两个预设都放上，但**默认不选**：没配好之前 AI 入口保持禁用，
         // 不会出现「点一下报一堆错」的首次体验。
         AiSettings {
             active_profile_id: String::new(),
@@ -82,7 +82,8 @@ impl Default for AiSettings {
     }
 }
 
-/// 开箱预设。base_url / model 都填好，只有需要密钥的那两家要用户补 key。
+/// 开箱预设。base_url / model 都填好，只有 SiliconFlow 需要用户补 key。
+/// 其它服务（自建、中转、局域网）用「新建接入点」自己加。
 pub fn presets() -> Vec<AiProfile> {
     vec![
         AiProfile {
@@ -101,16 +102,6 @@ pub fn presets() -> Vec<AiProfile> {
             protocol: "openai".into(),
             base_url: "https://api.siliconflow.cn/v1".into(),
             model: "deepseek-ai/DeepSeek-V3".into(),
-            temperature: default_temperature(),
-            max_tokens: default_max_tokens(),
-            has_key: false,
-        },
-        AiProfile {
-            id: "aiaaa".into(),
-            name: "aiaaa.cc".into(),
-            protocol: "openai".into(),
-            base_url: "https://aiaaa.cc/v1".into(),
-            model: "deepseek-v4-flash-0731".into(),
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             has_key: false,
@@ -552,7 +543,7 @@ pub fn extract_text(proto: Protocol, body: &serde_json::Value) -> Option<String>
 /// - Anthropic：`content_block_delta` 且 `delta.type == "thinking_delta"` → `delta.thinking`
 /// - Gemini：`candidates[0].content.parts[*]` 里 `thought == true` 的那部分
 ///
-/// 不接的话思考内容会被整个丢掉（实测 aiaaa.cc 的 deepseek-v4-flash-0731 就是
+/// 不接的话思考内容会被整个丢掉（实测某中转的推理模型就是
 /// 全程 `content:""` + `reasoning_content:"…"`，正文最后才出现）。
 pub fn parse_reasoning(proto: Protocol, data: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(data).ok()?;
@@ -875,7 +866,7 @@ fn apply_headers(
 
 /// 非流式请求：用于「测试连接」和报告结论段（要的就是完整一句话）。
 ///
-/// **空回复会重试一次**。实测 aiaaa.cc 大约每 3 次就有 1 次返回 `content: ""`
+/// **空回复会重试一次**。实测某中转大约每 3 次就有 1 次返回 `content: ""`
 /// （HTTP 200、没有 error 字段、耗时正常）—— 当成功处理的话，用户只会看到
 /// 报告里少一段、对话框里空一格，而且完全不知道为什么。
 pub async fn send_once(
@@ -1120,7 +1111,7 @@ mod tests {
         assert!(r.body["max_tokens"].is_number(), "max_tokens 必填");
     }
 
-    /// 真实抓到的形状（aiaaa.cc 的 deepseek-v4-flash-0731）：正文全程为空、
+    /// 真实抓到的形状（某中转的推理模型）：正文全程为空、
     /// 思考在 `reasoning_content` 里，正文最后才出现。三家字段名都不同，逐个钉住。
     #[test]
     fn reasoning_is_parsed_for_each_protocol() {
@@ -1440,11 +1431,11 @@ journalctl -u <服务名> --no-pager
     fn settings_default_ships_presets_but_selects_none() {
         let s = AiSettings::default();
         assert!(s.active_profile_id.is_empty(), "默认不选，AI 入口保持禁用");
-        assert_eq!(s.profiles.len(), 3);
+        assert_eq!(s.profiles.len(), 2);
         assert!(s.report_ai_summary);
         // 旧 settings.json 没有 ai 字段也要能读
         let parsed: AiSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.profiles.len(), 3);
+        assert_eq!(parsed.profiles.len(), 2);
     }
 
     #[test]
