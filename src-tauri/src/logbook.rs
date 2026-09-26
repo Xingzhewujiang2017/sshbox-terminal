@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::os::windows::process::CommandExt; // creation_flags(CREATE_NO_WINDOW)：控制台命令静默
+
 use chrono::{Datelike, Local, Timelike};
 
 /// 日志目录，setup 里由 `app.path().app_log_dir()` 解出。
@@ -140,6 +142,9 @@ pub fn mark_stopped(dir: &Path) {
 fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        // CREATE_NO_WINDOW：GUI 程序跑控制台命令默认会弹一个可见终端窗口
+        // （Windows Terminal 宿主），启动时还偶发连弹多次 —— 必须静默。
+        .creation_flags(0x08000000)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
         .unwrap_or(true)
@@ -150,6 +155,7 @@ fn pid_alive(pid: u32) -> bool {
 pub fn os_version() -> String {
     match std::process::Command::new("cmd")
         .args(["/c", "ver"])
+        .creation_flags(0x08000000)
         .output()
     {
         Ok(o) => {
@@ -188,6 +194,7 @@ pub fn webview2_version() -> String {
         let key = format!("{root}{KEY}");
         let Ok(o) = std::process::Command::new("reg")
             .args(["query", &key, "/v", "pv"])
+            .creation_flags(0x08000000)
             .output()
         else {
             continue;
