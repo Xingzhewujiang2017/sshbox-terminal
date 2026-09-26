@@ -1443,7 +1443,7 @@ mod tests {
  
 1.  **Analyze User Input:**
    - User asks: \"如何查询日志\"
-   - Context: SSH client, target host root@10.0.0.5, K8s node.
+   - Context: SSH client, target host root@192.0.2.5, K8s node.
 2.  **Identify Key Log Locations:**
    - System: journalctl, /var/log/messages
    - K8s: kubectl logs, /var/log/pods/

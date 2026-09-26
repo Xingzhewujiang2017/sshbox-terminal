@@ -1,6 +1,10 @@
 {
   "name": "sshbox",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Xingzhewujiang2017/sshbox-terminal"
+  },
   "version": "0.7.2",
   "type": "module",
   "scripts": {
