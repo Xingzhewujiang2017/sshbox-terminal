@@ -4,6 +4,17 @@ import type { AppPaths, KnownHostEntry, Settings } from '../api'
 import type { ThemeMode } from '../theme'
 import AiSettingsPane from './AiSettingsPane.vue'
 import { getVersion } from '@tauri-apps/api/app'
+import { setLogLevel } from '../api'
+
+/** C2 日志级别开关：当前生效级别（后端返回；初始 info，因为重启后回到 Info）。 */
+const logLevel = ref('info')
+async function setLevel(lv: 'info' | 'debug' | 'warn' | 'error') {
+  try {
+    logLevel.value = await setLogLevel(lv)
+  } catch {
+    // 后端命令失败不弹窗：级别开关只是诊断辅助，静默失败即可
+  }
+}
 
 /** 版本号从打包信息读，不在前端硬编码 —— 免得"关于页写的版本"和"装出来的版本"不一致。 */
 const version = ref('…')
@@ -267,10 +278,23 @@ defineExpose({ setIoMsg: (m: string) => (ioMsg.value = m) })
           />
         </div>
         <div class="hintline">
-          默认每次采样都落盘（2 秒）。调大间隔可省磁盘：10 秒约省 5 倍空间。数据在本机，导出走「历史」面板。
-        </div>
+                  默认每次采样都落盘（2 秒）。调大间隔可省磁盘：10 秒约省 5 倍空间。数据在本机，导出走「历史」面板。
+                </div>
 
-        <div class="btns">
+                <label>日志级别</label>
+                <div class="seg">
+                  <button
+                    v-for="lv in ['info', 'debug', 'warn']"
+                    :key="lv"
+                    :class="{ sel: logLevel === lv }"
+                    @click="setLevel(lv)"
+                  >{{ lv }}</button>
+                </div>
+                <div class="hintline">
+                  改完立刻生效（不落盘），重启后回到 Info。「Debug」会记录更多内部细节，噪音也更大。
+                </div>
+
+                <div class="btns">
           <button class="ghost" @click="emit('restartMonitor')">重启监控任务</button>
           <button class="primary" @click="save">保存设置</button>
         </div>

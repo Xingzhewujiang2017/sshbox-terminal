@@ -239,3 +239,21 @@ pub fn ui_log(msg: String, level: Option<String>) {
         _ => log::info!("[ui] {}", msg),
     }
 }
+
+/// C2 级别开关：运行时切换日志级别（真实闸门是 `log::set_max_level`，fern
+/// dispatch 已放行 Trace）。**不落盘** —— 重启后 setup 里自动回到 Info，
+/// 避免用户忘了关 Debug 把日志冲爆。
+#[tauri::command]
+pub fn log_set_level(level: String) -> Result<String, String> {
+    let lv = match level.as_str() {
+        "debug" => log::LevelFilter::Debug,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info,
+    };
+    let name = format!("{lv}").to_lowercase();
+    // 先记再切：切到 Error 之后这条 info 就进不去了
+    log::info!("[ui] 日志级别设为 {}（重启后回到 Info）", name);
+    log::set_max_level(lv);
+    Ok(name)
+}

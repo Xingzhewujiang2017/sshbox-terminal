@@ -64,6 +64,11 @@ export function uiLog(msg: string, level: 'info' | 'warn' | 'error' | 'debug' = 
   return invoke<void>('ui_log', { msg, level }).catch(() => {})
 }
 
+/** C2：运行时切换日志级别（不落盘，重启回 Info；后端返回实际生效的级别名）。 */
+export function setLogLevel(level: 'info' | 'debug' | 'warn' | 'error'): Promise<string> {
+  return call<string>('log_set_level', { level })
+}
+
 // --- types mirroring the Rust structs -------------------------------------
 
 export type AuthMode = 'password' | 'key'

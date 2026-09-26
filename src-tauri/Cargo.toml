@@ -1,6 +1,6 @@
 [package]
 name = "sshbox"
-version = "0.7.0"
+version = "0.7.1"
 description = "SSH terminal with real-time VM monitoring"
 authors = ["sshbox contributors"]
 edition = "2021"
@@ -8,6 +8,14 @@ edition = "2021"
 [lib]
 name = "sshbox_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# 生产构建必需（官方模板自带，本项目曾缺）：tauri 的 build.rs 用
+# `dev = !custom_protocol` 判定——不开这个 feature，release 构建也会
+# 被 `cfg(dev)` 误导导航到 devUrl（localhost:1420），整页 ERR_CONNECTION_REFUSED。
+# `npm run tauri build` 会自动传 `--features custom-protocol`；裸 cargo build 要用
+# `--features custom-protocol` 或 `tauri/custom-protocol`。
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
