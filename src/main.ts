@@ -5,6 +5,7 @@ import './assets/main.css'
 import './assets/theme.css'
 import { primeTheme } from './theme'
 import { uiLog } from './api'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 
 // 首帧前定色：settings.json 要异步读，先用上次的解析结果，避免闪一下深色再变白。
 primeTheme()
@@ -42,3 +43,17 @@ window.addEventListener('unhandledrejection', (e) => {
 })
 
 app.use(createPinia()).mount('#app')
+
+// 白屏优化：窗口初始隐藏（tauri.conf visible:false），页面就绪后再显示——
+// WebView2 渲染进程冷启动要 5–7 秒，窗口先显示就是白屏 + 闪烁。
+// mount 同步完成首帧渲染，此刻显示即「内容已就绪」。
+const win = getCurrentWindow()
+let shown = false
+const showOnce = () => {
+  if (shown) return
+  shown = true
+  void win.show()
+}
+showOnce()
+// 兜底：万一页面异常永远起不来，5 秒后强制显示窗口，避免「窗口永不出现」。
+setTimeout(showOnce, 5000)
