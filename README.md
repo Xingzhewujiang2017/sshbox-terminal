@@ -4,6 +4,8 @@
 
 Tauri 2 + Vue 3 + Rust 构建的原生桌面应用，安装包约 5 MB，内存占用远低于 Electron 系终端。
 
+![SSHBox 主界面](docs/screenshots/main.png)
+
 ## 功能
 
 - **SSH 终端**：多会话标签页、保存主机、一键连接、命令只填入终端不自动执行（回车由你按）
