@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch, type Ref } from 'vue'
+import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -240,6 +240,22 @@ function toggleAi() {
 function onTermContext(payload: { x: number; y: number; selection: string }, sid: string) {
   aiMenu.value = { ...payload, sid }
 }
+
+const aiMenuEl = ref<HTMLElement>()
+
+// 菜单定位后按视口边界回移：终端靠边/靠底右键时菜单别被切掉一半
+watch(aiMenu, async (v) => {
+  if (!v) return
+  await nextTick()
+  const el = aiMenuEl.value
+  if (!el) return
+  const r = el.getBoundingClientRect()
+  const pad = 8
+  let { x, y } = v
+  if (x + r.width > window.innerWidth - pad) x = window.innerWidth - r.width - pad
+  if (y + r.height > window.innerHeight - pad) y = window.innerHeight - r.height - pad
+  if (x !== v.x || y !== v.y) aiMenu.value = { ...v, x, y }
+})
 
 function termBanner(kind: 'error' | 'info', text: string) {
   banner.value = { kind, text }
@@ -1176,18 +1192,19 @@ function statusDot(t: Tab) {
     </div>
 
     <div
-      v-if="aiMenu"
-      class="ai-ctx"
-      :style="{ left: aiMenu.x + 'px', top: aiMenu.y + 'px' }"
-      @click.stop
-    >
+          v-if="aiMenu"
+          ref="aiMenuEl"
+          class="ai-ctx"
+          :style="{ left: aiMenu.x + 'px', top: aiMenu.y + 'px' }"
+          @click.stop
+        >
       <!-- 复制粘贴是基本盘，永远排在最上面；AI 是增强，永远在分隔线下面。
            没选中时「复制」置灰并说明原因，不做一个点了没反应的按钮。 -->
       <div class="ai-ctx-item" :class="{ dim: !aiMenu.selection.trim() }" @click="copyFromTerm()">
-        复制<span class="ai-ctx-key">Ctrl+Shift+C</span>
+        复制<span class="ai-ctx-key">Ctrl+C</span>
       </div>
       <div class="ai-ctx-item" @click="pasteToTerm()">
-        粘贴<span class="ai-ctx-key">Ctrl+Shift+V</span>
+        粘贴<span class="ai-ctx-key">Ctrl+V</span>
       </div>
       <div class="ai-ctx-sep"></div>
       <div class="ai-ctx-item" @click="explainSelection()">

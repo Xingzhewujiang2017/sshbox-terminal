@@ -7,6 +7,8 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
+// 剪贴板走原生插件（与 TerminalPane 一致）：避免 WebView 权限框与焦点丢失。
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { api } from '../api'
 import {
   ai,
@@ -131,7 +133,7 @@ async function copyText(raw: string, key: string) {
   const text = stripPromptPrefix(cleanCommand(raw))
   if (!text.trim()) return
   try {
-    await navigator.clipboard.writeText(text)
+    await writeText(text)
     copiedKey.value = key
     window.setTimeout(() => {
       if (copiedKey.value === key) copiedKey.value = ''

@@ -46,6 +46,9 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        // 剪贴板走原生：WebView 的 navigator.clipboard 在全新配置目录下会弹系统权限框，
+        // 且异步调用期间会夺走键盘焦点（粘贴后按 Enter 无反应）。原生插件两条都避开。
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(ssh::SessionManager::default())
         .manage(sftp::SftpManager::default())
         .manage(forward::ForwardManager::default())

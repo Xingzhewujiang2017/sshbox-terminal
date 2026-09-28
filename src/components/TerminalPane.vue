@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { api } from '../api'
 import { listen } from '@tauri-apps/api/event'
+// 剪贴板走原生插件：不走 WebView 的 navigator.clipboard（新配置目录下会弹系统权限框，
+// 且异步期间会夺走键盘焦点，导致粘贴后按回车无反应）。
+import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { terminalTheme, themeVersion } from '../theme'
 
 const props = defineProps<{ sid: string; active: boolean; noAsk?: boolean; broadcastCount?: number }>()
@@ -48,7 +51,9 @@ async function copySelection(): Promise<boolean> {
   const text = term?.getSelection() ?? ''
   if (!text) return false
   try {
-    await navigator.clipboard.writeText(text)
+    await writeText(text)
+    // 原生插件调用也可能让 WebView 把键盘焦点让给 body；稳妥起见抢回来。
+    term?.focus()
     return true
   } catch {
     return false
@@ -58,7 +63,7 @@ async function copySelection(): Promise<boolean> {
 /** 把剪贴板内容粘进终端。**不自动回车** —— 由用户确认后再按。 */
 async function pasteClipboard(): Promise<boolean> {
   try {
-    const text = await navigator.clipboard.readText()
+    const text = await readText()
     if (!text) return false
     // 广播模式：粘贴只作用于当前终端（键盘输入才广播）。提示而不是静默 ——
     // 用户十有八九想贴到多台，这里把事实讲清楚，避免"以为全贴了、回车只动一台"。
@@ -67,6 +72,8 @@ async function pasteClipboard(): Promise<boolean> {
       return false
     }
     term?.paste(text)
+    // 原生调用期间焦点可能被让给 body；贴完按回车没反应，所以抢回来。
+    term?.focus()
     return true
   } catch {
     return false
@@ -77,7 +84,10 @@ const pasteConfirm = ref<{ text: string; n: number } | null>(null)
 function confirmPaste() {
   const p = pasteConfirm.value
   pasteConfirm.value = null
-  if (p && term) term.paste(p.text)
+  if (p && term) {
+    term.paste(p.text)
+    term.focus()
+  }
 }
 
 function selectAllText() {
@@ -99,6 +109,21 @@ defineExpose({
 })
 
 const ctxMenu = ref<{ x: number; y: number } | null>(null)
+const ctxMenuEl = ref<HTMLElement>()
+
+// 演练台快捷菜单同样按视口边界回移（少量项，高度小，但靠底时同样会被切）
+watch(ctxMenu, async (v) => {
+  if (!v) return
+  await nextTick()
+  const el = ctxMenuEl.value
+  if (!el) return
+  const r = el.getBoundingClientRect()
+  const pad = 8
+  let { x, y } = v
+  if (x + r.width > window.innerWidth - pad) x = window.innerWidth - r.width - pad
+  if (y + r.height > window.innerHeight - pad) y = window.innerHeight - r.height - pad
+  if (x !== v.x || y !== v.y) ctxMenu.value = { x, y }
+})
 
 /**
  * 右键：主界面直接把坐标 + 当前选中文本交给 App，由 App 弹那一份完整菜单
@@ -177,20 +202,44 @@ onMounted(async () => {
   term.open(termEl.value!)
   fit.fit()
 
-  // Ctrl+Shift+C/V 是终端里的复制/粘贴别名。**Ctrl+C 必须原样放行** ——
-  // 在终端里它是中断信号，抢过来做复制会让正在跑的命令停不下来。
-  term.attachCustomKeyEventHandler((e) => {
-    if (e.type !== 'keydown') return true
-    if (e.ctrlKey && e.shiftKey && (e.key === 'C' || e.key === 'c')) {
-      void copySelection()
-      return false
-    }
-    if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
+  // Ctrl+Shift+C/V 与 Ctrl+C/V 都是终端里的复制/粘贴（Windows Terminal 同款 UX）：
+    // - Ctrl+C：有选中文本 → 复制；无选中 → **原样放行**（终端里是中断信号 SIGINT，
+    //   抢过来做复制会让正在跑的命令停不下来）
+    // - Ctrl+V / Ctrl+Shift+V：粘贴（不自动回车）
+    // - 拦截时除了 return false，还必须 preventDefault —— 否则系统仍会把按键
+    //   转成原生 paste 事件喂给 xterm 的隐藏 textarea，同一段文本被粘两次
+    //   （曾实测 Ctrl+Shift+V 双粘，根因就在这）。
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true
+      const ctrlOnly = e.ctrlKey && !e.shiftKey && !e.altKey
+      const ctrlShift = e.ctrlKey && e.shiftKey && !e.altKey
+      if (ctrlOnly && (e.key === 'C' || e.key === 'c')) {
+        if (term?.getSelection()) {
+          e.preventDefault()
+          void copySelection()
+          return false
+        }
+        return true // 无选中：SIGINT 放行
+      }
+      if ((ctrlOnly || ctrlShift) && (e.key === 'V' || e.key === 'v')) {
+        e.preventDefault()
+        void pasteClipboard()
+        return false
+      }
+      if (ctrlShift && (e.key === 'C' || e.key === 'c')) {
+        e.preventDefault()
+        void copySelection()
+        return false
+      }
+      return true
+    })
+
+    // 兜底：拦掉到达隐藏 textarea 的原生 paste 事件（来源可能是键盘、右键、菜单），
+    // 粘贴统一走 pasteClipboard 一条路径，从根上杜绝双粘。
+    termEl.value?.addEventListener('paste', (ev) => {
+      ev.preventDefault()
       void pasteClipboard()
-      return false
-    }
-    return true
-  })
+    })
 
   term.onData((data) => {
     if (!currentSid) return
@@ -259,7 +308,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <!-- 演练台终端的快捷菜单（noAsk）—— 主界面的右键菜单由 App 统一弹一份 -->
-    <div v-if="ctxMenu" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
+    <div v-if="ctxMenu" ref="ctxMenuEl" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
       <button @click="ctxCopy">📋 复制选中</button>
       <button @click="ctxPaste">📥 粘贴</button>
     </div>
