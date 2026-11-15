@@ -107,6 +107,10 @@ export interface QuickCommand {
 
 export interface Settings {
   sample_interval_secs: number
+  /** 总览面板上次用的视图 */
+  overview_view?: 'table' | 'cards'
+  /** AI 侧栏宽度（像素，320–720） */
+  ai_panel_width?: number
   monitor_enabled: boolean
   auto_reconnect: boolean
   reconnect_max_attempts: number
@@ -243,6 +247,8 @@ export interface NetIf {
   name: string
   rx_bps: number
   tx_bps: number
+  /** 虚拟网卡（网桥/veth/隧道）：明细仍显示，但不计入顶部合计 */
+  virtual_nic?: boolean
 }
 export interface DiskIo {
   name: string

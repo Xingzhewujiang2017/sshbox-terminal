@@ -24,7 +24,28 @@ pub fn run() {
         .and_then(|v| v.trim().parse::<u128>().ok())
         .unwrap_or(5 * 1024 * 1024);
 
-    tauri::Builder::default()
+    // v0.8 单实例锁：第二个实例不再白屏（WebView2 0x8007139F），
+    // 而是把已有窗口顶到前面，然后自己退出。
+    // 逃生门：调试与冒烟要同时跑 debug(:9223) 与 release(:9224)，两者 app identifier
+    // 相同、会被互踢 —— 传 --allow-multi 或设 SSHBOX_ALLOW_MULTI=1 即跳过锁。
+    let allow_multi = std::env::args().any(|a| a == "--allow-multi")
+        || std::env::var("SSHBOX_ALLOW_MULTI")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+    let mut builder = tauri::Builder::default();
+    if !allow_multi {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            log::warn!("[single-instance] 已有实例在运行：本次启动已退出，已把旧窗口顶到前面");
+        }));
+    }
+
+    builder
         .plugin(
             tauri_plugin_log::Builder::new()
                 // C2 级别开关的接法（grill 致命修正 #2）：

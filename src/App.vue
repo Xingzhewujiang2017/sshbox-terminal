@@ -889,6 +889,21 @@ function toggleTheme() {
   setTheme(resolvedTheme.value === 'dark' ? 'light' : 'dark')
 }
 
+/** 拖动侧栏 / 切总览视图这类高频动作：静默落盘，不弹「设置已保存」。 */
+async function persistQuiet(patch: Partial<Settings>) {
+  if (!settings.value) return
+  const next = { ...settings.value, ...patch }
+  settings.value = next
+  try {
+    await api.settingsSet(next)
+  } catch {
+    // 落盘失败不回滚 UI（用户刚拖完就跳回去更糟），下次改动会再试
+  }
+}
+
+const persistAiWidth = (w: number) => persistQuiet({ ai_panel_width: w })
+const persistOverviewView = (v: 'table' | 'cards') => persistQuiet({ overview_view: v })
+
 async function saveSettings(s: Settings) {
   try {
     await api.settingsSet(s)
@@ -1144,7 +1159,9 @@ function statusDot(t: Tab) {
                   v-if="ai.open"
                   :sid="activeTab?.sid"
                   :active-label="activeTab?.label"
+                  :initial-width="settings?.ai_panel_width ?? 380"
                   @insert="insertToTerminal"
+                  @resize="persistAiWidth"
                   @close="ai.open = false"
                 />
 
@@ -1238,9 +1255,11 @@ function statusDot(t: Tab) {
           :hosts="hosts"
           :interval="settings?.sample_interval_secs ?? 2"
           :active-sid="activeTab?.sid"
+          :initial-view="settings?.overview_view"
           @close="overviewOpen = false"
                     @focus="focusTab"
                     @connect="connectFromOverview"
+                    @view-change="persistOverviewView"
                   />
 
     <HistoryPanel

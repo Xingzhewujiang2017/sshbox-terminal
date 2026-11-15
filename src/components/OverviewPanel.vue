@@ -24,12 +24,16 @@ const props = defineProps<{
   /** Live sample interval; hidden tabs sample at 5× this. */
   interval: number
   activeSid?: string
+  /** 上次用的视图（v0.8）：挂载时读一次，之后由用户切换 */
+  initialView?: 'table' | 'cards'
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'focus', sid: string): void
   (e: 'connect', hostId: string): void
+  /** 视图切换 → App 落盘（下次打开沿用） */
+  (e: 'view-change', view: 'table' | 'cards'): void
 }>()
 
 // --- 实时趋势窗口（卡片视图）------------------------------------------------
@@ -125,7 +129,13 @@ const historyError = ref('')
 // '' = 全部主机；组名 = 只看该组；'__none' = 未分组（含临时连接）。
 const groupFilter = ref('')
 /** 总览主视图：表格（默认）/ 卡片网格（#3，组内状态一眼看）。 */
-const viewMode = ref<'table' | 'cards'>('table')
+const viewMode = ref<'table' | 'cards'>(props.initialView === 'cards' ? 'cards' : 'table')
+/** 切视图时同时上报，让 App 写进 settings —— 否则每次打开都要重新点。 */
+function setView(v: 'table' | 'cards') {
+  if (viewMode.value === v) return
+  viewMode.value = v
+  emit('view-change', v)
+}
 const groupOfHost = (id: string | null | undefined): string | null => {
   if (!id) return null
   const h = props.hosts.hosts.find((x) => x.id === id)
@@ -652,8 +662,8 @@ onBeforeUnmount(() => {
                               <option value="status">按状态</option>
                             </select>
                             <span class="view-seg">
-                              <button :class="{ on: viewMode === 'table' }" @click="viewMode = 'table'">表格</button>
-                              <button :class="{ on: viewMode === 'cards' }" @click="viewMode = 'cards'">卡片</button>
+                              <button :class="{ on: viewMode === 'table' }" @click="setView('table')">表格</button>
+                              <button :class="{ on: viewMode === 'cards' }" @click="setView('cards')">卡片</button>
                             </span>
               <button class="btn ghost" @click="loadHistory">⟳ 刷新离线数据</button>
                                     <button class="btn ghost" @click="exportSnapshotCsv" title="导出当前实时视图为 CSV（快照型：当前窗口/矩阵数据，非历史全量；要历史范围请用历史页导出）">导出 CSV（当前视图）</button>

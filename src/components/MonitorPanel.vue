@@ -287,9 +287,12 @@ function fmtRateShort(b: number): string {
 /** 迷你折线 path（#1 时延趋势用）：自绘 SVG，归一化到各自最大值。 */
 /** spark() 已无调用者，删除。 */
 
+/** 顶部合计只算物理网卡：br-/veth/docker 与物理网卡是同一份流量的两次计数（B1）。 */
+const physNet = <T extends { virtual_nic?: boolean }>(net: T[]) => net.filter((n) => !n.virtual_nic)
+
 const netTotals = computed(() => {
   if (!metrics.value) return { rx: 0, tx: 0 }
-  return metrics.value.net.reduce(
+  return physNet(metrics.value.net).reduce(
     (a, n) => ({ rx: a.rx + n.rx_bps, tx: a.tx + n.tx_bps }),
     { rx: 0, tx: 0 }
   )
@@ -417,7 +420,7 @@ function pushMetricsPoint(m: Metrics) {
   h.t.push(new Date(m.ts * 1000).toTimeString().slice(0, 8))
   h.cpu.push(+m.cpu_pct.toFixed(1))
   h.mem.push(+m.mem_pct.toFixed(1))
-  const nt = m.net.reduce((a, n) => ({ rx: a.rx + n.rx_bps, tx: a.tx + n.tx_bps }), { rx: 0, tx: 0 })
+  const nt = physNet(m.net).reduce((a, n) => ({ rx: a.rx + n.rx_bps, tx: a.tx + n.tx_bps }), { rx: 0, tx: 0 })
   h.rx.push(nt.rx)
   h.tx.push(nt.tx)
   const io = m.disk_io.reduce((a, d) => ({ r: a.r + d.read_bps, w: a.w + d.write_bps }), { r: 0, w: 0 })
@@ -611,7 +614,13 @@ onBeforeUnmount(() => {
                         </div>
                         <div class="chart-box" ref="pingEl"></div>
                         <div class="ping-hint dim">时延 / 丢包 = 本机 → 默认网关路径（每 15 秒一档 · 悬停看图例数值 · 采到网关才有曲线）；速率 = 目标机网卡计数 —— 经跳板/隧道时不是端到端链路</div>
-                <div class="net-total">
+                <!-- data-nics / data-rows：合计只算物理网卡，冒烟 C23 靠这两个属性判定口径
+                     （不读速率数值，所以 veth 有没有流量都不影响结论） -->
+                <div
+                  class="net-total"
+                  :data-rows="metrics.net.length"
+                  :data-nics="physNet(metrics.net).length"
+                >
                           <template v-if="netReady">
                             <span class="down">↓ {{ fmtBytes(netTotals.rx) }}</span>
                             <span class="up">↑ {{ fmtBytes(netTotals.tx) }}</span>
@@ -623,6 +632,12 @@ onBeforeUnmount(() => {
         <div class="chart-box" ref="netEl"></div>
         <div v-for="n in paged('net', metrics.net)" :key="n.name" class="net-if">
           <span class="ifname">{{ n.name }}</span>
+          <span
+            v-if="n.virtual_nic"
+            class="virt-tag"
+            title="虚拟网卡（网桥 / 容器 veth / 隧道），不计入顶部合计"
+            >虚拟</span
+          >
           <span>↓{{ fmtBytes(n.rx_bps) }}</span>
           <span>↑{{ fmtBytes(n.tx_bps) }}</span>
         </div>
@@ -849,6 +864,7 @@ onBeforeUnmount(() => {
 .net-total { display: flex; gap: 16px; font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 .net-quality { display: flex; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .net-quality .bad { color: #e5484d; font-weight: 600; }
+.net-if .virt-tag { font-size: 10px; line-height: 15px; padding: 0 4px; border-radius: 3px; background: var(--ctp-surface1); color: var(--muted); }
 .ping-hint { font-size: 10px; color: var(--ctp-overlay0); margin: 4px 0 2px; }
 .ping-hint.warn { color: var(--ctp-red); }
 .down { color: var(--ctp-green); } .up { color: var(--ctp-blue); }

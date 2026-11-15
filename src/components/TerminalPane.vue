@@ -2,6 +2,7 @@
 import { nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { SearchAddon } from '@xterm/addon-search'
 import { api } from '../api'
 import { listen } from '@tauri-apps/api/event'
 // 剪贴板走原生插件：不走 WebView 的 navigator.clipboard（新配置目录下会弹系统权限框，
@@ -163,6 +164,69 @@ let unlisten: (() => void) | null = null
 let ro: ResizeObserver | null = null
 let resizeTimer: number | undefined
 let currentSid = ''
+let search: SearchAddon | null = null
+
+/** 终端内搜索（Ctrl+F）：浮层状态只属于当前这个终端，切标签各记各的。 */
+const searchOpen = ref(false)
+const searchInput = ref('')
+const searchHits = ref({ index: -1, count: 0 })
+const searchEl = ref<HTMLInputElement>()
+
+// 不传 `decorations`：xterm 的装饰器属于 **proposed API**，终端没开
+// `allowProposedApi` 时 findNext 会直接抛「You must set the allowProposedApi
+// option to true」—— 一抛，定位和计数全废（C24 就卡在这）。不传装饰器则只做
+// 选中 + 滚动；命中总数我们自己扫缓冲数，代价是不做全量高亮，但不会再抛异常，
+// 也不会像 onDidChangeResults 那样恒报 0/0 骗人。
+
+/**
+ * 自己数命中数，不用 `onDidChangeResults`。
+ *
+ * 实测（xterm 6 + addon-search 0.16）：那个事件里的 resultCount 恒为 0 ——
+ * 装饰器明明上色了、匹配也选中了，计数栏却显示 `0/0`。与其显示一个假数字，
+ * 不如直接扫回滚缓冲自己数：慢一点（万行级 ~ms），但不会骗人。
+ */
+function countMatches(q: string): number {
+  const buf = term?.buffer.active
+  if (!buf || !q) return 0
+  const needle = q.toLowerCase()
+  let n = 0
+  for (let i = 0; i < buf.length; i++) {
+    const hay = (buf.getLine(i)?.translateToString(true) ?? '').toLowerCase()
+    let at = hay.indexOf(needle)
+    while (at >= 0) {
+      n++
+      at = hay.indexOf(needle, at + needle.length)
+    }
+  }
+  return n
+}
+
+function runSearch(dir: 1 | -1) {
+  if (!search) return
+  const q = searchInput.value
+  if (!q) {
+    search.clearDecorations()
+    searchHits.value = { index: -1, count: 0 }
+    return
+  }
+  const opts = { incremental: true }
+  if (dir > 0) search.findNext(q, opts)
+  else search.findPrevious(q, opts)
+  searchHits.value = { index: -1, count: countMatches(q) }
+}
+
+function openSearch() {
+  searchOpen.value = true
+  void nextTick(() => searchEl.value?.select())
+}
+
+function closeSearch() {
+  searchOpen.value = false
+  searchInput.value = ''
+  searchHits.value = { index: -1, count: 0 }
+  search?.clearDecorations()
+  term?.focus()
+}
 
 // 主题切换：xterm 的配色是创建时传的，但支持运行时改，所以不用重建终端
 // （重建会丢掉回滚缓冲和当前会话状态）。
@@ -199,6 +263,8 @@ onMounted(async () => {
   })
   fit = new FitAddon()
   term.loadAddon(fit)
+  search = new SearchAddon()
+  term.loadAddon(search)
   term.open(termEl.value!)
   fit.fit()
 
@@ -229,6 +295,13 @@ onMounted(async () => {
       if (ctrlShift && (e.key === 'C' || e.key === 'c')) {
         e.preventDefault()
         void copySelection()
+        return false
+      }
+      // Ctrl+F：终端内搜索。xterm 默认会把 Ctrl+F 当普通按键吃进 PTY（远端 shell
+      // 收到 ^F 会前移一个字符），所以必须在这里拦下并 preventDefault。
+      if (ctrlOnly && (e.key === 'f' || e.key === 'F')) {
+        e.preventDefault()
+        openSearch()
         return false
       }
       return true
@@ -299,6 +372,23 @@ onBeforeUnmount(() => {
 <template>
   <div class="term-wrap" v-show="active" @contextmenu.prevent="onContext">
     <div ref="termEl" class="term"></div>
+    <!-- 终端内搜索（Ctrl+F）。Esc 关闭，Enter 下一个，Shift+Enter 上一个 -->
+    <div v-if="searchOpen" class="term-search" @click.stop>
+      <input
+        ref="searchEl"
+        v-model="searchInput"
+        class="term-search-input"
+        placeholder="在终端里搜索…"
+        @input="runSearch(1)"
+        @keydown.enter.exact.prevent="runSearch(1)"
+        @keydown.shift.enter.prevent="runSearch(-1)"
+        @keydown.esc.prevent="closeSearch"
+      />
+      <span class="term-search-hits">{{ searchInput ? (searchHits.count ? `共 ${searchHits.count} 处` : '无命中') : '' }}</span>
+      <button title="上一个（Shift+Enter）" @click="runSearch(-1)">↑</button>
+      <button title="下一个（Enter）" @click="runSearch(1)">↓</button>
+      <button title="关闭（Esc）" @click="closeSearch">✕</button>
+    </div>
     <!-- 右键菜单：复制 / 粘贴 / 解释这段（终端里 Ctrl+Shift+C/V 同效） -->
     <div v-if="pasteConfirm" class="ctx-menu paste-confirm" :style="{ left: '40%', top: '40%' }" @click.stop>
       <div class="dim">⚠ 广播模式中（{{ pasteConfirm.n }} 台）—— 粘贴<b>只作用于当前终端</b>，键盘输入才会广播。要继续？</div>
@@ -347,6 +437,47 @@ onBeforeUnmount(() => {
   height: 100%;
   width: 100%;
   background: var(--ctp-base);
+  position: relative;
+}
+.term-search {
+  position: absolute;
+  top: 8px;
+  right: 18px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: var(--ctp-surface0);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+.term-search-input {
+  width: 180px;
+  padding: 2px 6px;
+  font-size: 12px;
+  color: var(--ctp-text);
+  background: var(--ctp-base);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 4px;
+  outline: none;
+}
+.term-search-hits {
+  min-width: 34px;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+.term-search button {
+  width: 22px;
+  height: 20px;
+  font-size: 12px;
+  color: var(--ctp-text);
+  background: var(--ctp-surface1);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
 }
 .term {
   height: 100%;

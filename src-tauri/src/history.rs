@@ -179,8 +179,10 @@ impl Row {
             cpu_pct: finite(m.cpu_pct),
             mem_pct: finite(m.mem_pct),
             mem_used_kb: m.mem_used_kb as i64,
-            net_rx: finite_sum(m.net.iter().map(|n| n.rx_bps)),
-            net_tx: finite_sum(m.net.iter().map(|n| n.tx_bps)),
+            // 虚拟网卡（网桥/veth）与物理网卡是同一份流量的两次计数，
+            // 落库时必须用与界面相同的口径，否则趋势图和报告会被放大。
+            net_rx: finite_sum(m.net.iter().filter(|n| !n.virtual_nic).map(|n| n.rx_bps)),
+            net_tx: finite_sum(m.net.iter().filter(|n| !n.virtual_nic).map(|n| n.tx_bps)),
             disk_r: finite_sum(m.disk_io.iter().map(|d| d.read_bps)),
             disk_w: finite_sum(m.disk_io.iter().map(|d| d.write_bps)),
             load1: finite(m.load.first().copied().unwrap_or(0.0)),
@@ -1060,6 +1062,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn from_metrics_excludes_virtual_nics() {
+        // 桥/容器网卡不能进库：同一份流量在物理网卡上已经计过一次，
+        // 落库口径必须和界面合计一致，否则趋势图与报告会被放大。
+        let m = metrics(
+            10.0,
+            50.0,
+            vec![
+                NetIf {
+                    name: "eth0".into(),
+                    rx_bps: 1000.0,
+                    tx_bps: 200.0,
+                    virtual_nic: false,
+                },
+                NetIf {
+                    name: "br-abc".into(),
+                    rx_bps: 900.0,
+                    tx_bps: 180.0,
+                    virtual_nic: true,
+                },
+            ],
+            vec![],
+        );
+        let r = Row::from_metrics("h1", &m, 1_700_000_000.0);
+        assert_eq!(r.net_rx, 1000.0, "虚拟网卡不该进 net_rx");
+        assert_eq!(r.net_tx, 200.0, "虚拟网卡不该进 net_tx");
+    }
+
     fn row(host: &str, ts: f64, cpu: f64, mem: f64) -> Row {
         Row {
             host_id: host.to_string(),
@@ -1092,18 +1122,22 @@ mod tests {
                     name: "eth0".into(),
                     rx_bps: 1000.0,
                     tx_bps: 200.0,
+                    virtual_nic: false,
                 },
                 NetIf {
                     name: "eth1".into(),
                     rx_bps: 500.0,
                     tx_bps: 50.0,
+                    virtual_nic: false,
                 },
                 // A zero-width delta window can produce inf; it must not reach
                 // SQLite (which would store NULL and poison every later AVG).
                 NetIf {
+                    // 故意保持物理：这里测的是 inf/NaN 守卫，不是虚拟网卡过滤
                     name: "veth0".into(),
                     rx_bps: f64::INFINITY,
                     tx_bps: f64::NAN,
+                    virtual_nic: false,
                 },
             ],
             vec![

@@ -106,7 +106,10 @@ pub fn settings_get() -> store::Settings {
 }
 
 #[tauri::command]
-pub fn settings_set(settings: store::Settings) -> Result<(), String> {
+pub fn settings_set(mut settings: store::Settings) -> Result<(), String> {
+    // AI 侧栏宽度只在 UI 拖动时产生；手改 settings.json 的越界值（0 或 5000）
+    // 会让侧栏消失或撑满窗口，而且下次启动还是那样 —— 统一在落盘前收敛。
+    settings.ai_panel_width = settings.ai_panel_width.clamp(320, 720);
     store::save_settings(&settings).map_err(e)
 }
 

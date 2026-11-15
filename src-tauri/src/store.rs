@@ -374,6 +374,21 @@ pub struct Settings {
     /// entry = `ai:<profile-id>`，所以 settings.json 可以随便备份/导出。
     #[serde(default)]
     pub ai: crate::ai::AiSettings,
+    /// 总览面板上次用的视图（v0.8）："table" | "cards"。下次打开沿用，
+    /// 免得每次都得重新点一下「卡片」。
+    #[serde(default = "default_overview_view")]
+    pub overview_view: String,
+    /// AI 侧栏宽度（像素，320–720）。拖动产生，写入前在 settings_set 里收敛。
+    #[serde(default = "default_ai_panel_width")]
+    pub ai_panel_width: u32,
+}
+
+fn default_overview_view() -> String {
+    "table".to_string()
+}
+
+fn default_ai_panel_width() -> u32 {
+    380
 }
 
 fn default_history_interval() -> u64 {
@@ -408,6 +423,8 @@ impl Default for Settings {
             history_interval_secs: default_history_interval(),
             history_retention_days: default_retention(),
             ai: crate::ai::AiSettings::default(),
+            overview_view: default_overview_view(),
+            ai_panel_width: default_ai_panel_width(),
         }
     }
 }

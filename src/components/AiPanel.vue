@@ -24,12 +24,40 @@ import {
 import { stripPromptPrefix } from '../cmdtext'
 import AiThink from './AiThink.vue'
 
-const props = defineProps<{ sid?: string | null; activeLabel?: string }>()
+const props = defineProps<{ sid?: string | null; activeLabel?: string; initialWidth?: number }>()
 const emit = defineEmits<{
   /** 把命令填进终端；sid = 这条命令是为哪个会话生成的（填回同一台主机） */
   (e: 'insert', payload: { text: string; sid: string }): void
   (e: 'close'): void
+  /** 拖宽结束 → App 落盘（下次打开沿用） */
+  (e: 'resize', width: number): void
 }>()
+
+// --- 侧栏宽度（v0.8）：320–720，拖完才落盘 -------------------------------
+const MIN_W = 320
+const MAX_W = 720
+const clampW = (w: number) => Math.min(MAX_W, Math.max(MIN_W, Math.round(w)))
+/** 手改过 settings.json 的越界值也在这里收敛，别让侧栏 0 宽或撑满窗口。 */
+const drawerWidth = ref(clampW(props.initialWidth ?? 380))
+const resizing = ref(false)
+
+function startResize(e: PointerEvent) {
+  // 侧栏贴右边：指针往左移 = 变宽
+  const startX = e.clientX
+  const startW = drawerWidth.value
+  resizing.value = true
+  const move = (ev: PointerEvent) => {
+    drawerWidth.value = clampW(startW + (startX - ev.clientX))
+  }
+  const up = () => {
+    resizing.value = false
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    emit('resize', drawerWidth.value)
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+}
 
 /** 当前槽（跟随活动标签）的对话与流式状态 */
 const turns = computed(() => ai.turnsByTab[ai.activeTabId] ?? [])
@@ -183,7 +211,14 @@ function looksLikeCommand(line: string): boolean {
 </script>
 
 <template>
-  <aside class="ai-drawer">
+  <aside class="ai-drawer" :style="{ width: drawerWidth + 'px' }">
+    <!-- 左边缘拖拽把手：调宽（拖动期间盖住边框，避免选中文本） -->
+    <div
+      class="drag-handle"
+      :class="{ on: resizing }"
+      title="拖动调整宽度"
+      @pointerdown.prevent="startResize"
+    ></div>
     <div class="head">
       <span class="title">AI 助手</span>
       <span class="spacer"></span>
@@ -328,8 +363,21 @@ function looksLikeCommand(line: string): boolean {
 </template>
 
 <style scoped>
+.drag-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 6;
+}
+.drag-handle:hover,
+.drag-handle.on {
+  background: var(--ctp-surface1);
+}
 .ai-drawer {
-  width: 380px;
+  position: relative;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;

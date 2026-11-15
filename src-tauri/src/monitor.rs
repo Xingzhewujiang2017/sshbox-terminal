@@ -246,6 +246,9 @@ pub struct NetIf {
     pub name: String,
     pub rx_bps: f64,
     pub tx_bps: f64,
+    /// 虚拟网卡（网桥/容器 veth/隧道）。仍出现在明细里（用户要看到），
+    /// 但**不计入顶部合计** —— 否则同一份流量会被物理网卡和网桥各算一次。
+    pub virtual_nic: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -274,7 +277,18 @@ for f in /sys/class/net/*/operstate; do
   IFS= read -r st < "$f" 2>/dev/null
   # type 772 = ARPHRD_LOOPBACK：WSL 的环回叫 loopback0 而不是 lo，光比名字会漏
   IFS= read -r ty < "/sys/class/net/$n/type" 2>/dev/null
-  echo "$n $st ${ty:-0}"
+  # B1 虚拟网卡判定：网桥目录存在，或名字命中容器/隧道前缀。
+  # 不能只看 /sys/class/net/<if>/device —— WSL 的 eth0 有的版本没有 device 链接，
+  # 那样会把真网卡判成虚拟、把顶部合计清零。vlan/bond 走 lower_*，按"继承物理"保留。
+  v=0
+  if [ -d "/sys/class/net/$n/bridge" ]; then
+    v=1
+  else
+    case "$n" in
+      br-*|veth*|docker*|cni*|flannel*|tun*|tap*|virbr*|vnet*|dummy*) v=1 ;;
+    esac
+  fi
+  echo "$n $st ${ty:-0} $v"
 done
 echo "@@DISKIO@@"; cat /proc/diskstats 2>/dev/null
 echo "@@DF@@"; df -P -T -k 2>/dev/null
@@ -1313,12 +1327,18 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
     // through while it carries the localhost-relayed traffic (i.e. this app's
     // own SSH session), which then dominates the header totals.
     let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut virtuals: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(ns) = s.get("NETSTATE") {
         for line in ns {
             let mut it = line.split_whitespace();
             let Some(name) = it.next() else { continue };
             let state = it.next().unwrap_or("");
             let ty = it.next().unwrap_or("0");
+            // 第 4 列是虚拟标记（老版本脚本没有这一列 → 默认物理）
+            let is_virt = it.next().unwrap_or("0") == "1";
+            if is_virt {
+                virtuals.insert(name.to_string());
+            }
             let is_loopback = ty == "772" || name == "lo" || name.starts_with("loopback");
             if is_loopback || state.eq_ignore_ascii_case("down") {
                 hidden.insert(name.to_string());
@@ -1355,10 +1375,12 @@ fn parse_metrics(raw: &str, prev: &mut PrevSample) -> Option<Metrics> {
                 (0.0, 0.0)
             };
             prev.net.insert(name.clone(), (rx, tx));
+            let virtual_nic = virtuals.contains(&name);
             net.push(NetIf {
                 name,
                 rx_bps,
                 tx_bps,
+                virtual_nic,
             });
         }
         // Busiest first: on a real host the active NIC must not sit below
@@ -2168,6 +2190,33 @@ mod tests {
             "rx={}",
             m2.net[0].rx_bps
         );
+    }
+
+    #[test]
+    fn net_marks_virtual_but_keeps_it_listed() {
+        // 起着的 veth 会出现在 /proc/net/dev，且与物理网卡重复计流量。
+        // 明细要保留（用户得看到它），但打 virtual_nic，前端据此把它排除出顶部合计。
+        let raw1 = "@@TS@@ 100.0\n@@STAT@@\ncpu  100 0 100 800 0 0 0 0 0 0\n@@NET@@\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  veth-s0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up 1 0\nveth-s0 up 1 1\n@@END@@\n";
+        let raw2 = "@@TS@@ 102.0\n@@STAT@@\ncpu  600 0 600 1800 0 0 0 0 0 0\n@@NET@@\n  eth0: 15000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n  veth-s0: 9000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up 1 0\nveth-s0 up 1 1\n@@END@@\n";
+        let mut prev = PrevSample::default();
+        let _ = parse_metrics(raw1, &mut prev).unwrap();
+        prev.mono_ts = mono_secs() - 2.0;
+        let m2 = parse_metrics(raw2, &mut prev).unwrap();
+        let eth0 = m2.net.iter().find(|n| n.name == "eth0").expect("eth0 应在明细");
+        let veth = m2.net.iter().find(|n| n.name == "veth-s0").expect("veth 仍在明细");
+        assert!(!eth0.virtual_nic, "eth0 是物理网卡");
+        assert!(veth.virtual_nic, "veth-s0 应标虚拟");
+        assert!((veth.rx_bps - 4500.0).abs() < 1.0, "rx={}", veth.rx_bps);
+    }
+
+    #[test]
+    fn net_state_without_virtual_column_stays_physical() {
+        // 老脚本只有三列（name state type）→ 解析不能崩，且默认按物理处理
+        let raw = "@@TS@@ 100.0\n@@STAT@@\ncpu  100 0 100 800 0 0 0 0 0 0\n@@NET@@\n  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n@@NETSTATE@@\neth0 up\n@@END@@\n";
+        let mut prev = PrevSample::default();
+        let m = parse_metrics(raw, &mut prev).unwrap();
+        assert_eq!(m.net.len(), 1);
+        assert!(!m.net[0].virtual_nic);
     }
 
     #[test]

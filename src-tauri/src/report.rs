@@ -468,8 +468,9 @@ pub fn render_markdown(
     o.push_str(&format!("| 进程数 | {} |\n", m.proc_total));
     o.push_str(&format!("| 监听端口 | {} |\n", d.services.port_total));
     if !m.net.is_empty() {
-        let rx: f64 = m.net.iter().map(|n| n.rx_bps).sum();
-        let tx: f64 = m.net.iter().map(|n| n.tx_bps).sum();
+        // 与面板/历史库同一口径：虚拟网卡（网桥/veth）不计入合计，否则同一份流量算两次
+        let rx: f64 = m.net.iter().filter(|n| !n.virtual_nic).map(|n| n.rx_bps).sum();
+        let tx: f64 = m.net.iter().filter(|n| !n.virtual_nic).map(|n| n.tx_bps).sum();
         o.push_str(&format!(
             "| 网络 | ↓ {} ↑ {} |\n",
             fmt_rate(rx),
@@ -506,11 +507,12 @@ pub fn render_markdown(
     o.push_str("## 网络\n\n");
     o.push_str("| 项 | ↓ 接收 | ↑ 发送 |\n|---|---|---|\n");
     {
-        let rx: f64 = m.net.iter().map(|n| n.rx_bps).sum();
-        let tx: f64 = m.net.iter().map(|n| n.tx_bps).sum();
+        let phys: Vec<&crate::monitor::NetIf> = m.net.iter().filter(|n| !n.virtual_nic).collect();
+        let rx: f64 = phys.iter().map(|n| n.rx_bps).sum();
+        let tx: f64 = phys.iter().map(|n| n.tx_bps).sum();
         o.push_str(&format!(
             "| 当前（{} 个网卡合计） | {} | {} |\n",
-            m.net.len(),
+            phys.len(),
             fmt_rate(rx),
             fmt_rate(tx)
         ));
@@ -1472,6 +1474,7 @@ mod tests {
                     name: "eth0".into(),
                     rx_bps: 1024.0,
                     tx_bps: 512.0,
+                    virtual_nic: false,
                 }],
                 disk_io: vec![],
                 disks: vec![DiskUsage {
