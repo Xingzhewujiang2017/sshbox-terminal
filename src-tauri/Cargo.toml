@@ -51,6 +51,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 
+# 只为了 kill(pid, 0)：判"上次实例是否还活着"。Linux 上也可以读 /proc/<pid>，
+# 但 kill 在 macOS 也成立，且不会把"没权限"误判成"已死"。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 codegen-units = 1
 lto = true

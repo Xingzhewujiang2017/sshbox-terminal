@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt; // creation_flags(CREATE_NO_WINDOW)：控制台命令静默
 
 use chrono::{Datelike, Local, Timelike};
@@ -137,8 +138,11 @@ pub fn mark_stopped(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(format!("exit-{pid}.flag")));
 }
 
-/// 进程还活着吗？tasklist CSV 的 pid 列是引号包着的数字，按 `"1234"` 精确匹配，
+/// 进程还活着吗？
+///
+/// Windows：tasklist CSV 的 pid 列是引号包着的数字，按 `"1234"` 精确匹配，
 /// 不会把 1234 当 123。拿不到结果时保守当"活着"（宁漏报不误报）。
+#[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
@@ -146,12 +150,34 @@ fn pid_alive(pid: u32) -> bool {
         // （Windows Terminal 宿主），启动时还偶发连弹多次 —— 必须静默。
         .creation_flags(0x08000000)
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        // tasklist CSV 里 pid 是引号包着的（"1234"），按完整引号匹配才不会把
+        // 1234 当成 123。用 char 拼接避开转义（这里曾经把结尾引号写丢，
+        // 导致后面整段被当成字符串，报一串莫名其妙的 "prefix `page` is unknown"）。
+        .map(|o| {
+            let needle = format!("{q}{pid}{q}", q = '"');
+            String::from_utf8_lossy(&o.stdout).contains(&needle)
+        })
         .unwrap_or(true)
 }
 
-/// B1：OS 版本一行字（`cmd /c ver`，零依赖；失败退化成 "windows"）。
+/// 进程还活着吗？（Linux/macOS）
+///
+/// `kill(pid, 0)` 只做存在性检查、不发送任何信号。返回 `EPERM` 说明进程存在但
+/// 不属于我们 —— 同样算活着。没有 `ESRCH` 以外的错误码就不当"活着"，
+/// 免得把"没权限查"当成"还活着"从而永远不报异常退出。
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// B1：OS 版本一行字。
+/// Windows：`cmd /c ver`（零依赖；失败退化成 "windows"）。
 /// `ver` 在 UTF-8 代码页下会先吐一行 “Active code page: 65001”，剥掉。
+#[cfg(windows)]
 pub fn os_version() -> String {
     match std::process::Command::new("cmd")
         .args(["/c", "ver"])
@@ -175,12 +201,38 @@ pub fn os_version() -> String {
     }
 }
 
-/// B1：WebView2 Evergreen 运行时版本，读 EdgeUpdate 注册表 `pv`（毫秒级）。
+/// B1：OS 版本一行字（Linux/macOS）：/etc/os-release 的 PRETTY_NAME + 内核版本。
+#[cfg(unix)]
+pub fn os_version() -> String {
+    let pretty = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .map(|l| {
+                    l.trim_start_matches("PRETTY_NAME=")
+                        .trim_matches('"')
+                        .to_string()
+                })
+        })
+        .unwrap_or_else(|| std::env::consts::OS.to_string());
+    let kern = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if kern.is_empty() {
+        pretty
+    } else {
+        format!("{pretty} | kernel {kern}")
+    }
+}
+
+/// B1：渲染引擎版本（**字段名不骗人**：Windows 报 WebView2，Linux 报 WebKitGTK）。
 ///
-/// 不用 `wry::webview_version()`：那货首次调用会拉起浏览器运行时，
-/// 实测要 2–5 秒 —— 放 setup 里会拖死窗口创建，WebView2 初始导航
-/// 等不及就永久停在 ERR_CONNECTION_REFUSED（本批踩过的坑）。
-pub fn webview2_version() -> String {
+/// Windows 读 EdgeUpdate 注册表 `pv`（毫秒级）。不用 `wry::webview_version()`：
+/// 那货首次调用会拉起浏览器运行时，实测要 2–5 秒 —— 放 setup 里会拖死窗口创建，
+/// WebView2 初始导航等不及就永久停在 ERR_CONNECTION_REFUSED（本批踩过的坑）。
+#[cfg(windows)]
+pub fn renderer_version() -> String {
     // 注意：x64 机器上 Evergreen 运行时的 Clients 键实测在
     // WOW6432Node（32 位视图）下；KEY 只从 \Microsoft 开始，roots 负责拼前缀。
     const KEY: &str =
@@ -211,5 +263,52 @@ pub fn webview2_version() -> String {
             }
         }
     }
-    "未知".to_string()
+    "WebView2 未知".to_string()
+}
+
+/// 渲染引擎版本（Linux）：从包管理器查 WebKitGTK（openEuler/EulerOS 用 rpm，
+/// Debian 系用 dpkg）。查不到就写"未知"——**不编版本号**。
+#[cfg(unix)]
+pub fn renderer_version() -> String {
+    let from_rpm = |pkg: &str| -> Option<String> {
+        let o = std::process::Command::new("rpm")
+            .args(["-q", "--qf", "%{VERSION}", pkg])
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if v.is_empty() || v.contains("not installed") {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    for pkg in ["webkit2gtk4.1", "webkit2gtk-4.1", "libwebkit2gtk-4.1-0"] {
+        if let Some(v) = from_rpm(pkg) {
+            return format!("WebKitGTK {v}");
+        }
+    }
+    let from_dpkg = |pkg: &str| -> Option<String> {
+        let o = std::process::Command::new("dpkg-query")
+            .args(["-W", "-f=${Version}", pkg])
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    for pkg in ["libwebkit2gtk-4.1-0", "libwebkit2gtk-4.0-37"] {
+        if let Some(v) = from_dpkg(pkg) {
+            return format!("WebKitGTK {v}");
+        }
+    }
+    "WebKitGTK 未知".to_string()
 }

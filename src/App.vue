@@ -1328,7 +1328,9 @@ function statusDot(t: Tab) {
 <style>
 * { margin: 0; padding: 0; }
 html, body, #app { height: 100%; overflow: hidden; }
-body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(--ctp-crust); color: var(--ctp-text); }
+/* Linux 上 Segoe UI 不存在 → 落到微软雅黑（目标机有 msyh.ttc）；再退到
+   Noto CJK / Droid Sans Fallback（容器里 fc-match sans-serif:lang=zh 的默认）。 */
+body { font-family: 'Segoe UI', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Noto Sans SC', 'Droid Sans Fallback', sans-serif; background: var(--ctp-crust); color: var(--ctp-text); }
 </style>
 
 <style scoped>

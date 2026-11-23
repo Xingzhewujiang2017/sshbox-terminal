@@ -15,7 +15,21 @@ use serde::{Deserialize, Serialize};
 const APP_DIR: &str = "sshbox";
 const KEYRING_SERVICE: &str = "sshbox";
 
+/// 数据目录。
+///
+/// 默认 `dirs::config_dir()/sshbox`（Windows = `%APPDATA%\sshbox`，
+/// Linux = `$XDG_CONFIG_HOME/sshbox` 或 `~/.config/sshbox`）。
+///
+/// **`SSHBOX_HOME` 可以整体覆盖它**（值就是数据目录本身，不是父目录）：
+/// 容器/云桌面里 `~` 常常在容器层上、重建即丢，指到挂载卷才不会丢主机列表和
+/// 历史库。空值按未设置处理（`SSHBOX_HOME=` 不会把数据写到当前目录）。
 pub fn data_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("SSHBOX_HOME") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_DIR)
@@ -493,6 +507,30 @@ pub fn save_settings(s: &Settings) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SSHBOX_HOME` 是容器/云桌面里保住数据的唯一手段（`~` 常落在容器层上，
+    /// 重建即丢），所以覆盖逻辑必须有断言。空值按未设置处理 —— 否则
+    /// `SSHBOX_HOME=` 会把配置写到当前工作目录，比不设还糟。
+    #[test]
+    fn sshbox_home_overrides_data_dir() {
+        let key = "SSHBOX_HOME";
+        let old = std::env::var_os(key);
+
+        std::env::set_var(key, "/tmp/sshbox-test-home");
+        assert_eq!(data_dir(), PathBuf::from("/tmp/sshbox-test-home"));
+
+        std::env::set_var(key, "   ");
+        assert!(
+            data_dir().ends_with(APP_DIR),
+            "空白 SSHBOX_HOME 应退回默认目录，实际={:?}",
+            data_dir()
+        );
+
+        match old {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
 
     #[test]
     fn migrate_raises_only_legacy_max_tokens() {

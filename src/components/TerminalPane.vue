@@ -257,7 +257,12 @@ onMounted(async () => {
   term = new Terminal({
     cursorBlink: true,
     fontSize: 14,
-    fontFamily: 'Cascadia Mono, Consolas, "Courier New", monospace',
+    // Sarasa Mono SC 是随包自带的 CJK 等宽字体（OFL，1:2 严格）——
+    // 系统自带的等宽字体（DejaVu/Liberation/Droid Sans Mono）都不含中文，
+    // 中文会回退到比例字体，xterm 按"1 汉字=2 格"排版就必然错列。
+    // 字体文件在 P3 打进前端资源；没有它时退到系统等宽（英文仍正常，中文会歪）。
+    fontFamily:
+      '"Sarasa Mono SC", "Noto Sans Mono CJK SC", "Cascadia Mono", Consolas, "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace',
     theme: terminalTheme(),
     scrollback: 10000,
   })

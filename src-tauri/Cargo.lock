@@ -5037,6 +5037,7 @@ dependencies = [
  "chrono",
  "dirs 7.0.0",
  "keyring",
+ "libc",
  "log",
  "reqwest 0.12.28",
  "rusqlite",

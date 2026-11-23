@@ -37,7 +37,13 @@ pub struct LocalListing {
 }
 
 pub fn home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("C:\\"))
+    dirs::home_dir().unwrap_or_else(|| {
+        if cfg!(windows) {
+            PathBuf::from("C:\\")
+        } else {
+            PathBuf::from("/")
+        }
+    })
 }
 
 /// 盘符列表。
@@ -53,9 +59,38 @@ fn drives() -> Vec<String> {
         .collect()
 }
 
+/// Linux/macOS 的"盘符" = 挂载点。
+///
+/// 读 `/proc/self/mounts`，只留真实文件系统（伪文件系统如 proc/sysfs/tmpfs/
+/// cgroup 全排除 —— 它们出现在下拉框里毫无意义）。根 `/` 永远排第一：
+/// 容器里根可能是 overlay，被 fstype 过滤掉的话用户就无路可走了。
 #[cfg(not(windows))]
 fn drives() -> Vec<String> {
-    vec!["/".to_string()]
+    const REAL_FS: &[&str] = &[
+        "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "vfat", "exfat", "ntfs",
+        "ntfs3", "fuseblk", "fuse.sshfs", "nfs", "nfs4", "cifs", "smb3", "overlay",
+    ];
+    let mut out: Vec<String> = vec!["/".to_string()];
+    if let Ok(text) = std::fs::read_to_string("/proc/self/mounts") {
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 3 || !REAL_FS.contains(&f[2]) {
+                continue;
+            }
+            // 挂载点里的八进制转义（\040 空格等）还原成可读路径
+            let mut mnt = f[1].to_string();
+            for (esc, ch) in [("\\040", " "), ("\\011", "\t"), ("\\012", "\n")] {
+                mnt = mnt.replace(esc, ch);
+            }
+            if !out.contains(&mnt) {
+                out.push(mnt);
+            }
+            if out.len() >= 12 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// 去掉 Windows 扩展长度前缀。

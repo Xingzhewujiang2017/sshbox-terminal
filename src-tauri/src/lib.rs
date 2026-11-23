@@ -208,8 +208,13 @@ pub fn run() {
                 max_log_bytes,
             );
             std::thread::spawn(|| {
-                let wv = logbook::webview2_version();
-                log::info!("[env] OS {} | WebView2 {}", logbook::os_version(), wv);
+                // 字段名不骗人：Windows 是 WebView2，Linux 是 WebKitGTK ——
+                // 标签由 logbook::renderer_version() 自带，这里不再硬写 "WebView2"。
+                log::info!(
+                    "[env] OS {} | {}",
+                    logbook::os_version(),
+                    logbook::renderer_version()
+                );
             });
 
             // A1 验收入口（冒烟 C22）：强制在 setup 里 panic，验证 panic hook 落盘 +

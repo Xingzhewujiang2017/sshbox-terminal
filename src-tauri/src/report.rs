@@ -1135,10 +1135,26 @@ pub struct ReportResult {
 
 /// 报告默认落在桌面（用户要发给同事的东西，放配置目录里没人找得到）。
 fn default_dir() -> PathBuf {
+    // Linux 的"桌面"可能是 ~/Desktop，也可能是 ~/桌面（本地化目录名）——
+    // `dirs::desktop_dir()` 读 XDG user-dirs，两种都能认。
+    if let Some(d) = dirs::desktop_dir() {
+        if d.is_dir() {
+            return d;
+        }
+    }
     if let Some(home) = dirs::home_dir() {
-        let desktop = home.join("Desktop");
-        if desktop.is_dir() {
-            return desktop;
+        for name in ["Desktop", "桌面"] {
+            let p = home.join(name);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        // 容器/无桌面环境：写 Documents 比写 home 根目录干净
+        for name in ["Documents", "文档"] {
+            let p = home.join(name);
+            if p.is_dir() {
+                return p;
+            }
         }
         return home;
     }
