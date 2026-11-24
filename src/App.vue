@@ -634,8 +634,10 @@ function addTab(sid: string, host?: Host, label?: string, id?: string) {
   if (id) {
     const i = tabs.value.findIndex((t) => t.id === id)
     if (i >= 0) {
+      // 重连只更新这一格，**绝不抢焦点**。
+      // 踩过的坑：这里原来无条件 activeIdx = i，多标签同时掉线自动重连时，
+      // 界面会跟着依次跳到 .14 → .15 → .13，看起来像"自己在切换主机"。
       tabs.value[i] = { ...tabs.value[i], ...tab }
-      activeIdx.value = i
       return
     }
   }
@@ -792,6 +794,9 @@ function scheduleReconnect(t: Tab) {
     window.clearInterval(tick)
     t.nextRetryIn = undefined
     if (t.status !== 'connecting') return
+    // 用户可能在等待期间把这个标签关掉了：不能在关掉之后又把它连回来
+    // （addTab 找不到 id 会 push 一个新标签，等于"关不掉的标签"）。
+    if (!tabs.value.some((x) => x.id === t.id)) return
     await connectHost(t.host!, { tabId: t.id })
   }, delay * 1000)
 }

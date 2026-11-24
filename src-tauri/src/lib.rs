@@ -65,6 +65,11 @@ pub fn run() {
                 .level_for("tungstenite", log::LevelFilter::Info)
                 .level_for("tao", log::LevelFilter::Info)
                 .level_for("wry", log::LevelFilter::Info)
+                // russh 每个 SSH 包打一行 DEBUG：实测 33 分钟 73 万条，
+                // 5MB 日志 3 分钟就轮转一次，业务日志（48 条）全被埋掉。
+                // 出问题时反而什么也查不到 —— 这就是漏配的代价。
+                .level_for("russh", log::LevelFilter::Warn)
+                .level_for("russh::sshbuffer", log::LevelFilter::Warn)
                 // Q1 拍板：日志时间戳用本机本地时间（默认是 UTC，差 8 小时）
                 .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
                 .max_file_size(max_log_bytes)

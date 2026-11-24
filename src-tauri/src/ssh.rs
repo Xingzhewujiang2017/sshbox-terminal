@@ -378,8 +378,14 @@ pub async fn do_connect(
         forwards: forwards.clone(),
     };
 
+    // inactivity_timeout 设为 None 是刻意的：
+    // russh 0.63 的读循环里，`inactivity_timer` 只在"本轮没发过 keepalive"时
+    // 才重置（client/mod.rs 的 `if !sent_keepalive { reset }`）。一旦 keepalive
+    // 与收到数据交替发生，这个计时器就可能长时间不重置，到点直接
+    // InactivityTimeout 断连 —— 表现为"连上几分钟自己掉线"。
+    // 存活性改由 keepalive_max 兜底（服务器不回 keepalive 才算死）。
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(300)),
+        inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(15)),
         ..<_>::default()
     });
@@ -575,6 +581,8 @@ pub async fn do_connect(
         let closed2 = closed.clone();
         let ev_host_id = info.host_id.clone();
         let ev_label = info.label.clone();
+        let ev_host = info.host.clone();
+        let ev_port = info.port;
         tokio::spawn(async move {
             let emit = |data: &[u8]| {
                 let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
@@ -600,7 +608,17 @@ pub async fn do_connect(
                             Some(ChannelMsg::Data { ref data }) => emit(&data[..]),
                             Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => emit(&data[..]),
                             Some(ChannelMsg::Eof) | Some(ChannelMsg::ExitStatus { .. }) => {}
-                            Some(ChannelMsg::Close) | None => break,
+                            Some(ChannelMsg::Close) => {
+                                log::info!("[连接 {}:{}] 远端关闭通道", ev_host, ev_port);
+                                break;
+                            }
+                            None => {
+                                log::info!(
+                                    "[连接 {}:{}] 连接中断（读循环结束，可能是网络断开或服务端超时）",
+                                    ev_host, ev_port
+                                );
+                                break;
+                            }
                             _ => {}
                         }
                     }
