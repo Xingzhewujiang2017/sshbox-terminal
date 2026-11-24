@@ -12,7 +12,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 测试脚本用 `node --experimental-strip-types`（Node 22+ 才有），
+          # 20 会报 "node: bad option"，CI 直接红。
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npx vue-tsc --noEmit
