@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use russh::client;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 
 use crate::ssh::{ClientHandler, DiskUsage, SessionId, StaticInfo};
 use crate::store;
@@ -1571,7 +1570,6 @@ pub fn spawn(
     sid: SessionId,
     handle: Arc<client::Handle<ClientHandler>>,
     closed: Arc<AtomicBool>,
-    app: AppHandle,
 ) {
     stop(&sid);
     register_handle(sid.clone(), handle.clone());
@@ -1598,7 +1596,7 @@ pub fn spawn(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(sid.clone(), info.clone());
-                let _ = app.emit(
+                crate::emit::emit(
                     "ssh://static",
                     serde_json::json!({ "sid": sid, "info": info }),
                 );
@@ -1675,7 +1673,7 @@ pub fn spawn(
                         // few file cats, the GPU query is the only real cost.
                         let sec = sections(&sraw);
                         let svc = parse_services(&sec);
-                        let _ = app.emit(
+                        crate::emit::emit(
                             "ssh://services",
                             serde_json::json!({ "sid": sid, "services": svc }),
                         );
@@ -1684,7 +1682,7 @@ pub fn spawn(
                         // extra SSH exec per second costs more than the
                         // resolution it would buy.
                         let hw = parse_hardware(&sec);
-                        let _ = app.emit(
+                        crate::emit::emit(
                             "ssh://hardware",
                             serde_json::json!({ "sid": sid, "hardware": hw }),
                         );
@@ -1695,7 +1693,7 @@ pub fn spawn(
                         if let Some(p) = &pg {
                             push_recent_ping(&sid, p);
                         }
-                        let _ = app.emit(
+                        crate::emit::emit(
                             "ssh://ping",
                             serde_json::json!({ "sid": sid, "ping": pg, "ts": wall_secs() }),
                         );
@@ -1733,7 +1731,7 @@ pub fn spawn(
                         m.ts,
                     ));
                 }
-                let _ = app.emit(
+                crate::emit::emit(
                     "ssh://metrics",
                     serde_json::json!({ "sid": sid, "metrics": m }),
                 );
@@ -1746,7 +1744,7 @@ pub fn spawn(
                         if ev.resolved { "解除" } else { "触发" },
                         ev.alert.body
                     );
-                    let _ = app.emit(
+                    crate::emit::emit(
                         "ssh://alert",
                         serde_json::json!({ "sid": sid, "alert": ev.alert, "resolved": ev.resolved }),
                     );

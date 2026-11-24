@@ -10,7 +10,7 @@ use russh::client;
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::State;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::{history, hostkey, monitor, store};
@@ -255,9 +255,8 @@ impl ConnectParams {
 pub async fn connect(
     params: ConnectParams,
     state: State<'_, SessionManager>,
-    app: AppHandle,
 ) -> std::result::Result<SessionId, String> {
-    do_connect(params, state.inner(), app).await
+    do_connect(params, state.inner()).await
 }
 
 /// Connect using a stored host entry; the secret comes from the OS credential
@@ -270,7 +269,20 @@ pub async fn connect_host(
     accept_host_key: bool,
     save_password: Option<bool>,
     state: State<'_, SessionManager>,
-    app: AppHandle,
+) -> std::result::Result<SessionId, String> {
+    connect_host_impl(host_id, password, key_passphrase, accept_host_key, save_password, state.inner()).await
+}
+
+/// 同 [`connect_host`]，但不依赖 Tauri 的 `State`。
+/// web/Electron 壳直接调这个 —— 保证两个壳走的是同一条连接路径
+/// （主机密钥校验、凭据读取、"需要密码"的错误形状都一致）。
+pub async fn connect_host_impl(
+    host_id: String,
+    password: Option<String>,
+    key_passphrase: Option<String>,
+    accept_host_key: bool,
+    save_password: Option<bool>,
+    state: &SessionManager,
 ) -> std::result::Result<SessionId, String> {
     let Some(host) = store::get_host(&host_id) else {
         return Err(err_kind("host_missing", "主机记录不存在"));
@@ -342,7 +354,7 @@ pub async fn connect_host(
         }
     }
 
-    let sid = do_connect(params, state.inner(), app).await?;
+    let sid = do_connect(params, state).await?;
     store::mark_used(&host_id);
     Ok(sid)
 }
@@ -350,7 +362,6 @@ pub async fn connect_host(
 async fn do_connect(
     params: ConnectParams,
     state: &SessionManager,
-    app: AppHandle,
 ) -> std::result::Result<SessionId, String> {
     let port = params.effective_port();
     let policy = params.policy();
@@ -560,7 +571,6 @@ async fn do_connect(
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PtyCmd>();
     {
-        let app2 = app.clone();
         let sid2 = sid.clone();
         let closed2 = closed.clone();
         let ev_host_id = info.host_id.clone();
@@ -568,7 +578,7 @@ async fn do_connect(
         tokio::spawn(async move {
             let emit = |data: &[u8]| {
                 let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
-                let _ = app2.emit(
+                crate::emit::emit(
                     "ssh://data",
                     serde_json::json!({ "sid": sid2, "data": b64 }),
                 );
@@ -597,7 +607,7 @@ async fn do_connect(
                 }
             }
             closed2.store(true, Ordering::SeqCst);
-            let _ = app2.emit(
+            crate::emit::emit(
                 "ssh://closed",
                 serde_json::json!({ "sid": sid2, "host_id": ev_host_id, "label": ev_label }),
             );
@@ -634,7 +644,7 @@ async fn do_connect(
         .insert(sid.clone(), Arc::new(session));
 
     // Monitor shares this SSH connection (separate exec channels).
-    monitor::spawn(sid.clone(), handle, closed, app.clone());
+    monitor::spawn(sid.clone(), handle, closed);
 
     Ok(sid)
 }
@@ -765,7 +775,6 @@ pub fn monitor_sample_now(sid: SessionId) -> std::result::Result<(), String> {
 pub async fn monitor_restart(
     sid: SessionId,
     state: State<'_, SessionManager>,
-    app: AppHandle,
 ) -> std::result::Result<(), String> {
     let sessions = state.sessions.lock().await;
     let session = sessions
@@ -776,7 +785,6 @@ pub async fn monitor_restart(
         sid.clone(),
         session.handle.clone(),
         session.closed.clone(),
-        app,
     );
     Ok(())
 }

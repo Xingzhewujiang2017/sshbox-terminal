@@ -2,6 +2,7 @@ mod ai;
 mod ai_commands;
 mod alerts;
 mod commands;
+mod emit;
 mod forward;
 mod history;
 mod hostkey;
@@ -176,6 +177,9 @@ pub fn run() {
             localfs::local_remove,
         ])
         .setup(move |app| {
+            // 事件出口：桌面壳把业务层（ssh/monitor/sftp/ai）的事件转给窗口。
+            // web/Electron 壳注册另一个 sink —— 业务代码只认 emit::emit，不知道壳是谁。
+            crate::emit::set_sink(crate::emit::tauri_sink(app.handle().clone()));
             // Writer thread first: samples may start arriving as soon as a
             // session connects.
             history::init();

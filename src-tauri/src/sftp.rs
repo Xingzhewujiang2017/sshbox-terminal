@@ -156,7 +156,7 @@ pub struct TransferProgress {
 }
 
 fn emit(app: &AppHandle, p: &TransferProgress) {
-    let _ = app.emit("sftp://progress", p);
+    crate::emit::emit("sftp://progress", p);
 }
 
 // ---------------------------------------------------------------------------
@@ -422,7 +422,7 @@ async fn spawn_upload(
         p.task_id = tid.clone();
         let outcome = {
             let sink = |pr: &TransferProgress| {
-                let _ = app2.emit("sftp://progress", pr);
+                crate::emit::emit("sftp://progress", pr);
             };
             upload_task(&sink, &mut p, &sftp2, &local, &remote, resume, &cancel).await
         };
@@ -455,7 +455,7 @@ async fn spawn_download(
         p.task_id = tid.clone();
         let outcome = {
             let sink = |pr: &TransferProgress| {
-                let _ = app2.emit("sftp://progress", pr);
+                crate::emit::emit("sftp://progress", pr);
             };
             download_task(&sink, &mut p, &sftp2, &remote, &local, resume, &cancel).await
         };
@@ -907,7 +907,7 @@ pub async fn sftp_upload_drop(
             p.task_id = tid.clone();
             let outcome = {
                 let sink = |pr: &TransferProgress| {
-                    let _ = app2.emit("sftp://progress", pr);
+                    crate::emit::emit("sftp://progress", pr);
                 };
                 upload_task(&sink, &mut p, &sftp2, &local2, &remote2, true, &cancel).await
             };

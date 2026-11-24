@@ -239,26 +239,26 @@ pub async fn ai_chat(
         &messages,
         &req_id,
         move |text| {
-            let _ = app2.emit(
+            crate::emit::emit(
                 "ssh://ai/delta",
                 serde_json::json!({ "req_id": rid, "text": text }),
             );
         },
         move |text| {
-            let _ = app3.emit(
+            crate::emit::emit(
                 "ssh://ai/reasoning",
                 serde_json::json!({ "req_id": rid_r, "text": text }),
             );
         },
         move |p, c| {
-            let _ = app4.emit(
+            crate::emit::emit(
                 "ssh://ai/usage",
                 serde_json::json!({ "req_id": rid_u, "prompt_tokens": p, "completion_tokens": c, "total": p + c }),
             );
         },
         // 429 / 5xx 退避重试：面板据此显示"正在重试"，否则用户以为卡住了
         move |status, delay_ms| {
-            let _ = app5.emit(
+            crate::emit::emit(
                 "ssh://ai/retry",
                 serde_json::json!({ "req_id": rid_t, "status": status, "delay_ms": delay_ms }),
             );
@@ -272,7 +272,7 @@ pub async fn ai_chat(
                 t0.elapsed().as_millis(),
                 full.chars().count()
             );
-            let _ = app.emit(
+            crate::emit::emit(
                 "ssh://ai/done",
                 serde_json::json!({ "req_id": req_id, "text": full, "profile": p.name, "model": p.model }),
             );
@@ -285,7 +285,7 @@ pub async fn ai_chat(
                 t0.elapsed().as_millis(),
                 msg.chars().take(300).collect::<String>()
             );
-            let _ = app.emit(
+            crate::emit::emit(
                 "ssh://ai/error",
                 serde_json::json!({ "req_id": req_id, "message": msg }),
             );
