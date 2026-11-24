@@ -626,8 +626,11 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
             opt_s(a, "dest_dir"),
             &ctx.sessions,
         ).await?)),
-        // 桌面版是"在文件管理器里定位"；浏览器里没有这个概念，报告已经落盘
-        "report_reveal" => Ok(Value::Null),
+        // 桌面版用 tauri-plugin-opener；这里直接调系统文件管理器
+        "report_reveal" => {
+            reveal_in_file_manager(&s_arg(a, "path"))?;
+            Ok(Value::Null)
+        }
 
         // --- AI ---
         "ai_profile_save" => Ok(to_v(crate::ai_commands::ai_profile_save(
@@ -694,6 +697,49 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
 
         _ => Err(format!("spike 未实现：{}", cmd)),
     }
+}
+
+// ---------------------------------------------------------------- 文件管理器
+
+/// 在文件管理器里定位文件：打开它所在的目录。
+///
+/// 桌面版走 tauri-plugin-opener 的 `reveal_item_in_dir`；web/Electron 壳没有那个
+/// 插件，就按 Linux 上的常规做法依次试 xdg-open / gio / nautilus。
+/// 都找不到就明确报错 —— 不要静默成功，否则用户点了按钮以为没反应。
+fn reveal_in_file_manager(path: &str) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(format!("文件不存在：{}", path));
+    }
+    let dir = if p.is_dir() {
+        p.to_path_buf()
+    } else {
+        p.parent()
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    };
+    let d = dir.to_string_lossy().to_string();
+
+    let attempts: [(&str, &[&str]); 3] = [
+        ("xdg-open", &[d.as_str()]),
+        ("gio", &["open", d.as_str()]),
+        ("nautilus", &[d.as_str()]),
+    ];
+    for (bin, args) in attempts {
+        match Command::new(bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(_) => continue,
+        }
+    }
+    Err("打不开文件管理器：找不到 xdg-open / gio / nautilus".into())
 }
 
 // ---------------------------------------------------------------- 启动
