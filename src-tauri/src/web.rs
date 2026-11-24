@@ -112,7 +112,7 @@ async fn ws_loop(mut socket: WebSocket, ctx: Ctx) {
                     if socket.send(Message::Text(msg.into())).await.is_err() { break }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    println!("[web] 事件积压，丢了 {} 条", n);
+                    log::warn!("[web] 事件积压，丢了 {} 条", n);
                 }
                 Err(_) => break,
             },
@@ -142,7 +142,7 @@ async fn invoke(State(ctx): State<Ctx>, Json(req): Json<Value>) -> Response {
         Ok(v) => json!({ "ok": true, "data": v }),
         Err(e) => {
             if !quiet {
-                println!("[invoke] {} 失败: {}", cmd, e);
+                log::warn!("[invoke] {} 失败: {}", cmd, e);
             }
             json!({ "ok": false, "error": e })
         }
@@ -228,7 +228,7 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
         "ui_log" => {
             let msg = s_arg(a, "msg");
             let level = arg(a, "level").and_then(Value::as_str).unwrap_or("info");
-            println!("[ui][{}] {}", level, msg);
+            log::info!("[ui][{}] {}", level, msg);
             Ok(Value::Null)
         }
         "log_set_level" => Ok(json!("info")),
@@ -742,9 +742,93 @@ fn reveal_in_file_manager(path: &str) -> Result<(), String> {
     Err("打不开文件管理器：找不到 xdg-open / gio / nautilus".into())
 }
 
+
+// ---------------------------------------------------------------- 日志
+
+/// 极简文件日志：写 `<数据目录>/logs/sshbox-web.log`，同时打一份到 stderr。
+///
+/// 为什么必须有：桌面版用 tauri-plugin-log，日志落在 %LOCALAPPDATA%\com.z.sshbox\logs；
+/// web/Electron 壳不跑 Tauri 的 setup，`log::info!` 原本全部丢弃 —— 出问题时
+/// 后端一句话都没有，比 Windows 那边更难查。这里补一个够用的实现，不引新依赖。
+struct FileLogger {
+    file: std::sync::Mutex<std::fs::File>,
+}
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        if metadata.level() > log::Level::Info {
+            return false;
+        }
+        // 第三方库的 INFO 也吵：keyring 走 DBus 时 zbus 每握手一次刷十几行。
+        // 日志的价值在于"出问题时能一眼看到我们的记录"，噪音必须挡在外面。
+        let t = metadata.target();
+        !(t.starts_with("zbus")
+            || t.starts_with("tracing")
+            || t.starts_with("keyring")
+            || t.starts_with("russh")
+            || t.starts_with("hyper")
+            || t.starts_with("reqwest"))
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let now = chrono::Local::now().format("%Y-%m-%d][%H:%M:%S");
+        let line = format!(
+            "[{}][{}][{}] {}\n",
+            now,
+            record.level(),
+            record.target(),
+            record.args()
+        );
+        eprint!("{}", line);
+        if let Ok(mut f) = self.file.lock() {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut f) = self.file.lock() {
+            use std::io::Write;
+            let _ = f.flush();
+        }
+    }
+}
+
+fn init_logger() -> Option<std::path::PathBuf> {
+    let dir = store::data_dir().join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join("sshbox-web.log");
+    // 超过 5MB 就滚一份旧的，避免无限长
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > 5 * 1024 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("sshbox-web.log.1"));
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let logger = Box::new(FileLogger {
+        file: std::sync::Mutex::new(file),
+    });
+    if log::set_boxed_logger(logger).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    Some(path)
+}
+
 // ---------------------------------------------------------------- 启动
 
 pub async fn run(port: u16) -> anyhow::Result<()> {
+    if let Some(p) = init_logger() {
+        println!("日志：{}", p.display());
+    }
     // 和桌面版 setup 里一样的两步：历史落盘线程、配置迁移。
     // 少了 history::init() 曲线永远查不到数据（写线程没起）。
     crate::history::init();
