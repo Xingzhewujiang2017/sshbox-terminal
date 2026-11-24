@@ -359,7 +359,7 @@ pub async fn connect_host_impl(
     Ok(sid)
 }
 
-async fn do_connect(
+pub async fn do_connect(
     params: ConnectParams,
     state: &SessionManager,
 ) -> std::result::Result<SessionId, String> {

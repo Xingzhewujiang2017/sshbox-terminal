@@ -3,7 +3,7 @@
 //! 密钥一律走系统凭据管理器（`store::set_secret("ai:<id>", …)`），
 //! 只在前端问「有没有」时回一个布尔值 —— 明文永不回传、不落 settings.json。
 
-use tauri::{AppHandle, Emitter};
+use tauri::State;
 
 use crate::ai::{self, AiProfile, AiSettings, ChatMessage, Protocol};
 use crate::ssh::StaticInfo;
@@ -189,7 +189,6 @@ pub async fn ai_test(id: Option<String>) -> Result<String, String> {
 /// 流式对话：增量通过 `ssh://ai/delta` 事件推给前端，结束时 `ssh://ai/done`。
 #[tauri::command]
 pub async fn ai_chat(
-    app: AppHandle,
     req_id: String,
     kind: String,
     messages: Vec<ChatMessage>,
@@ -208,7 +207,6 @@ pub async fn ai_chat(
     };
     let key = store::get_secret(&ai::key_entry(&p.id)).ok();
     let rid = req_id.clone();
-    let app2 = app.clone();
     // 每次 AI 请求都留一行日志：模型、地址、耗时、结果。
     // 没有这行，"答案怎么是空的"只能靠猜——是密钥、模型名、超时还是模型真没说话，
     // 全靠这里的 endpoint + 耗时 + 错误文本区分。
@@ -228,11 +226,8 @@ pub async fn ai_chat(
     // 思考过程和正文分两条事件推给前端：面板默认折叠思考，展开才看
     // （deepseek 系模型正文前会先吐一大段 reasoning_content，混在一起很难读）
     let rid_r = req_id.clone();
-    let app3 = app.clone();
     let rid_u = req_id.clone();
-    let app4 = app.clone();
     let rid_t = req_id.clone();
-    let app5 = app.clone();
     let result = ai::send_stream(
         &p,
         key.as_deref(),
@@ -455,18 +450,12 @@ pub fn chat_messages(
 
 /// 统一入口：按 `kind` 组装上下文并流式回答。
 #[tauri::command]
-pub async fn ai_ask(
-    app: AppHandle,
-    req_id: String,
-    kind: String,
-    sid: Option<String>,
-    selection: Option<String>,
-    ask: Option<String>,
-    tail: Option<String>,
-    history: Option<Vec<ChatMessage>>,
-    profile_id: Option<String>,
-    state: tauri::State<'_, crate::ssh::SessionManager>,
-) -> Result<String, String> {
+pub async fn ai_ask(req_id: String, kind: String, sid: Option<String>, selection: Option<String>, ask: Option<String>, tail: Option<String>, history: Option<Vec<ChatMessage>>, profile_id: Option<String>, state: State<'_, crate::ssh::SessionManager>) -> Result<String, String> {
+    ai_ask_impl(req_id, kind, sid, selection, ask, tail, history, profile_id, state.inner()).await
+}
+
+/// 同 [`ai_ask`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn ai_ask_impl(req_id: String, kind: String, sid: Option<String>, selection: Option<String>, ask: Option<String>, tail: Option<String>, history: Option<Vec<ChatMessage>>, profile_id: Option<String>, state: &crate::ssh::SessionManager) -> Result<String, String> {
     // 主机背景来自会话信息 + 静态信息缓存，前端不用重复传
     let brief = {
         let sessions = state.sessions.lock().await;
@@ -503,7 +492,7 @@ pub async fn ai_ask(
         "command" => command_messages(&brief, &ask, &tail),
         _ => chat_messages(&brief, history, &ask, &tail),
     };
-    ai_chat(app, req_id, kind, messages, profile_id).await
+    ai_chat(req_id, kind, messages, profile_id).await
 }
 
 #[cfg(test)]

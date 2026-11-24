@@ -93,9 +93,11 @@ struct Running {
 }
 
 #[derive(Default)]
+#[derive(Clone)]
 pub struct ForwardManager {
     /// key = "{sid}:{rule_id}"
-    running: Mutex<HashMap<String, Running>>,
+    /// 用 Arc 包一层是为了能克隆进后台任务（克隆即共享同一张表）
+    running: Arc<Mutex<HashMap<String, Running>>>,
 }
 
 impl ForwardManager {
@@ -150,11 +152,12 @@ fn rule_of(host_id: &str, rule_id: &str) -> Result<ForwardRule, String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn forward_list(
-    sid: String,
-    mgr: State<'_, ForwardManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<Vec<ForwardStatus>, String> {
+pub async fn forward_list(sid: String, mgr: State<'_, ForwardManager>, sessions: State<'_, SessionManager>) -> Result<Vec<ForwardStatus>, String> {
+    forward_list_impl(sid, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`forward_list`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn forward_list_impl(sid: String, mgr: &ForwardManager, sessions: &SessionManager) -> Result<Vec<ForwardStatus>, String> {
     let host_id = host_id_of(&sid, &sessions).await?;
     let rules = crate::store::forwards_of(&host_id);
     let running = mgr.running.lock().await;
@@ -166,36 +169,37 @@ pub async fn forward_list(
 
 /// 新增/更新一条规则（写进 hosts.json）。
 #[tauri::command]
-pub async fn forward_save(
-    sid: String,
-    rule: ForwardRule,
-    sessions: State<'_, SessionManager>,
-) -> Result<(), String> {
+pub async fn forward_save(sid: String, rule: ForwardRule, sessions: State<'_, SessionManager>) -> Result<(), String> {
+    forward_save_impl(sid, rule, sessions.inner()).await
+}
+
+/// 同 [`forward_save`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn forward_save_impl(sid: String, rule: ForwardRule, sessions: &SessionManager) -> Result<(), String> {
     let host_id = host_id_of(&sid, &sessions).await?;
     crate::store::save_forward(&host_id, rule)
         .map_err(|err| err_kind("store_error", format!("{err:#}")))
 }
 
 #[tauri::command]
-pub async fn forward_delete(
-    sid: String,
-    id: String,
-    mgr: State<'_, ForwardManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<(), String> {
+pub async fn forward_delete(sid: String, id: String, mgr: State<'_, ForwardManager>, sessions: State<'_, SessionManager>) -> Result<(), String> {
+    forward_delete_impl(sid, id, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`forward_delete`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn forward_delete_impl(sid: String, id: String, mgr: &ForwardManager, sessions: &SessionManager) -> Result<(), String> {
     let host_id = host_id_of(&sid, &sessions).await?;
-    let _ = forward_stop(sid.clone(), id.clone(), mgr, sessions).await;
+    let _ = forward_stop_impl(sid.clone(), id.clone(), mgr, sessions).await;
     crate::store::delete_forward(&host_id, &id)
         .map_err(|err| err_kind("store_error", format!("{err:#}")))
 }
 
 #[tauri::command]
-pub async fn forward_start(
-    sid: String,
-    rule: ForwardRule,
-    mgr: State<'_, ForwardManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<u16, String> {
+pub async fn forward_start(sid: String, rule: ForwardRule, mgr: State<'_, ForwardManager>, sessions: State<'_, SessionManager>) -> Result<u16, String> {
+    forward_start_impl(sid, rule, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`forward_start`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn forward_start_impl(sid: String, rule: ForwardRule, mgr: &ForwardManager, sessions: &SessionManager) -> Result<u16, String> {
     let session = session_of(&sid, &sessions).await?;
     let key = ForwardManager::key(&sid, &rule.id);
     // 已经在跑就先停掉，避免同一个端口被绑两次
@@ -322,12 +326,12 @@ pub async fn forward_start(
 }
 
 #[tauri::command]
-pub async fn forward_stop(
-    sid: String,
-    id: String,
-    mgr: State<'_, ForwardManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<(), String> {
+pub async fn forward_stop(sid: String, id: String, mgr: State<'_, ForwardManager>, sessions: State<'_, SessionManager>) -> Result<(), String> {
+    forward_stop_impl(sid, id, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`forward_stop`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn forward_stop_impl(sid: String, id: String, mgr: &ForwardManager, sessions: &SessionManager) -> Result<(), String> {
     let key = ForwardManager::key(&sid, &id);
     let removed = mgr.running.lock().await.remove(&key);
     if let Some(mut rt) = removed {
@@ -352,11 +356,12 @@ pub async fn forward_stop(
 
 /// 关标签/断线时调用：把这个会话的所有转发停掉，别留悬空的监听端口。
 #[tauri::command]
-pub async fn forward_stop_all(
-    sid: String,
-    mgr: State<'_, ForwardManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<usize, String> {
+pub async fn forward_stop_all(sid: String, mgr: State<'_, ForwardManager>, sessions: State<'_, SessionManager>) -> Result<usize, String> {
+    forward_stop_all_impl(sid, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`forward_stop_all`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn forward_stop_all_impl(sid: String, mgr: &ForwardManager, sessions: &SessionManager) -> Result<usize, String> {
     let prefix = format!("{sid}:");
     let keys: Vec<String> = mgr
         .running

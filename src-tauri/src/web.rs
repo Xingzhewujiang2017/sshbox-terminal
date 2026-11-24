@@ -37,6 +37,8 @@ struct Ctx {
     ev: broadcast::Sender<String>,
     /// 和桌面版同一个会话管理器 —— 这样 monitor/sftp 等模块能直接复用
     sessions: Arc<SessionManager>,
+    forwards: Arc<crate::forward::ForwardManager>,
+    sftp: Arc<crate::sftp::SftpManager>,
     /// 进程内密码缓存。目标机没有 keyring 守护进程，`keyring` 会失败；
     /// 正式版必须接回凭据管理器（或自建加密文件 + 主密码）。
     passwords: Arc<Mutex<HashMap<String, String>>>,
@@ -171,6 +173,44 @@ fn s_arg(a: &Value, key: &str) -> String {
     arg(a, key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
+fn opt_s(a: &Value, key: &str) -> Option<String> {
+    arg(a, key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn b_arg(a: &Value, key: &str, dflt: bool) -> bool {
+    arg(a, key).and_then(Value::as_bool).unwrap_or(dflt)
+}
+
+fn f_arg(a: &Value, key: &str, dflt: f64) -> f64 {
+    arg(a, key).and_then(Value::as_f64).unwrap_or(dflt)
+}
+
+fn u_arg(a: &Value, key: &str) -> Option<u64> {
+    arg(a, key).and_then(Value::as_u64)
+}
+
+fn n_arg(a: &Value, key: &str) -> Option<usize> {
+    u_arg(a, key).map(|v| v as usize)
+}
+
+fn t_arg<T: serde::de::DeserializeOwned>(a: &Value, key: &str) -> Result<T, String> {
+    let v = arg(a, key).cloned().ok_or_else(|| format!("缺少参数 {}", key))?;
+    serde_json::from_value(v).map_err(|e| format!("参数 {} 无效: {}", key, e))
+}
+
+fn opt_t_arg<T: serde::de::DeserializeOwned>(a: &Value, key: &str) -> Result<Option<T>, String> {
+    match arg(a, key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|e| format!("参数 {} 无效: {}", key, e)),
+    }
+}
+
+fn to_v<T: serde::Serialize>(v: T) -> Value {
+    serde_json::to_value(v).unwrap_or(Value::Null)
+}
+
 async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
     match cmd {
         // --- 启动必需 ---
@@ -183,13 +223,8 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
             "known_hosts": store::known_hosts_path().to_string_lossy(),
             "credential_store_ok": false,
         })),
-        "known_hosts_list" => Ok(json!([])),
-        "ai_settings" => Ok(json!({
-            "active_profile_id": "",
-            "explain_profile_id": "",
-            "profiles": [],
-            "report_ai_summary": false,
-        })),
+        "known_hosts_list" => Ok(to_v(crate::commands::known_hosts_list())),
+        "ai_settings" => Ok(to_v(crate::ai_commands::ai_settings())),
         "ui_log" => {
             let msg = s_arg(a, "msg");
             let level = arg(a, "level").and_then(Value::as_str).unwrap_or("info");
@@ -364,9 +399,265 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
         // 验证件不落盘密码，所以"凭据管理器可用"恒为 false
         "credential_store_status" => Ok(json!(false)),
 
-        // --- 还没接的模块 ---
-        "forward_list" => Ok(json!([])),
-        "sftp_forget" => Ok(Value::Null),
+        // --- 历史（曲线/统计/导出）---
+        "history_range" => Ok(to_v(crate::history::history_range(
+            s_arg(a, "host_id"),
+            f_arg(a, "from", 0.0),
+            f_arg(a, "to", 0.0),
+            n_arg(a, "max_points"),
+        ).await?)),
+        "history_range_multi" => Ok(to_v(crate::history::history_range_multi(
+            t_arg::<Vec<String>>(a, "host_ids")?,
+            f_arg(a, "from", 0.0),
+            f_arg(a, "to", 0.0),
+            n_arg(a, "max_points"),
+        ).await?)),
+        "ping_range" => Ok(to_v(crate::history::ping_range(
+            s_arg(a, "host_id"),
+            f_arg(a, "from", 0.0),
+            f_arg(a, "to", 0.0),
+            n_arg(a, "max_points"),
+        ).await?)),
+        "ping_range_multi" => Ok(to_v(crate::history::ping_range_multi(
+            t_arg::<Vec<String>>(a, "host_ids")?,
+            f_arg(a, "from", 0.0),
+            f_arg(a, "to", 0.0),
+            n_arg(a, "max_points"),
+        ).await?)),
+        "history_hosts" => Ok(to_v(crate::history::history_hosts().await?)),
+        "history_stats" => Ok(to_v(crate::history::history_stats().await?)),
+        "history_export" => Ok(to_v(crate::history::history_export(
+            s_arg(a, "host_id"),
+            f_arg(a, "from", 0.0),
+            f_arg(a, "to", 0.0),
+            opt_s(a, "dest_dir"),
+        ).await?)),
+        "export_csv_text" => Ok(to_v(crate::history::export_csv_text(
+            s_arg(a, "filename"),
+            s_arg(a, "content"),
+            opt_s(a, "dest_dir"),
+        ).await?)),
+
+        // --- 本机文件浏览 ---
+        "local_list" => Ok(to_v(crate::localfs::local_list(opt_s(a, "path"))?)),
+        "local_kinds" => Ok(to_v(crate::localfs::local_kinds(
+            t_arg::<Vec<String>>(a, "paths")?,
+        ))),
+        "local_mkdir" => crate::localfs::local_mkdir(s_arg(a, "path")).map(|_| Value::Null),
+        "local_rename" => crate::localfs::local_rename(s_arg(a, "from"), s_arg(a, "to"))
+            .map(|_| Value::Null),
+        "local_remove" => crate::localfs::local_remove(
+            s_arg(a, "path"),
+            b_arg(a, "is_dir", false),
+            b_arg(a, "recursive", false),
+        )
+        .map(|_| Value::Null),
+
+        // --- 只读执行通道（演练台 / 时延测试）---
+        "exec_batch" => Ok(to_v(crate::lab::exec_batch(
+            s_arg(a, "sid"),
+            s_arg(a, "cmd"),
+            u_arg(a, "timeout_secs"),
+        ).await?)),
+        "ping_now" => Ok(to_v(crate::lab::ping_now(s_arg(a, "sid")).await?)),
+
+        // --- 端口转发 ---
+        "forward_list" => Ok(to_v(crate::forward::forward_list_impl(
+            s_arg(a, "sid"),
+            &ctx.forwards,
+            &ctx.sessions,
+        ).await?)),
+        "forward_save" => crate::forward::forward_save_impl(
+            s_arg(a, "sid"),
+            t_arg(a, "rule")?,
+            &ctx.sessions,
+        ).await
+        
+        .map(|_| Value::Null),
+        "forward_delete" => crate::forward::forward_delete_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "id"),
+            &ctx.forwards,
+            &ctx.sessions,
+        ).await
+        
+        .map(|_| Value::Null),
+        "forward_start" => Ok(json!(crate::forward::forward_start_impl(
+            s_arg(a, "sid"),
+            t_arg(a, "rule")?,
+            &ctx.forwards,
+            &ctx.sessions,
+        ).await?)),
+        "forward_stop" => crate::forward::forward_stop_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "id"),
+            &ctx.forwards,
+            &ctx.sessions,
+        ).await
+        
+        .map(|_| Value::Null),
+        "forward_stop_all" => Ok(json!(crate::forward::forward_stop_all_impl(
+            s_arg(a, "sid"),
+            &ctx.forwards,
+            &ctx.sessions,
+        ).await?)),
+
+        // --- SFTP ---
+        "sftp_list" => Ok(to_v(crate::sftp::sftp_list_impl(
+            s_arg(a, "sid"),
+            opt_s(a, "path"),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+        "sftp_stat" => Ok(to_v(crate::sftp::sftp_stat_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "path"),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+        "sftp_mkdir" => crate::sftp::sftp_mkdir_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "path"),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await
+        
+        .map(|_| Value::Null),
+        "sftp_rename" => crate::sftp::sftp_rename_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "from"),
+            s_arg(a, "to"),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await
+        
+        .map(|_| Value::Null),
+        "sftp_remove" => crate::sftp::sftp_remove_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "path"),
+            b_arg(a, "is_dir", false),
+            b_arg(a, "recursive", false),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await
+        
+        .map(|_| Value::Null),
+        "sftp_forget" => crate::sftp::sftp_forget_impl(s_arg(a, "sid"), &ctx.sftp).await
+            
+            .map(|_| Value::Null),
+        "sftp_upload" => Ok(json!(crate::sftp::sftp_upload_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "local"),
+            s_arg(a, "remote"),
+            b_arg(a, "resume", false),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+        "sftp_download" => Ok(json!(crate::sftp::sftp_download_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "remote"),
+            s_arg(a, "local"),
+            b_arg(a, "resume", false),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+        "sftp_upload_dir" => Ok(json!(crate::sftp::sftp_upload_dir_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "local"),
+            s_arg(a, "remote"),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+        "sftp_download_dir" => Ok(json!(crate::sftp::sftp_download_dir_impl(
+            s_arg(a, "sid"),
+            s_arg(a, "remote"),
+            s_arg(a, "local"),
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+        "sftp_cancel" => Ok(json!(crate::sftp::sftp_cancel_impl(
+            s_arg(a, "task_id"),
+            &ctx.sftp
+        ).await?)),
+        "sftp_upload_drop" => Ok(to_v(crate::sftp::sftp_upload_drop_impl(
+            s_arg(a, "sid"),
+            t_arg::<Vec<String>>(a, "paths")?,
+            &ctx.sftp,
+            &ctx.sessions,
+        ).await?)),
+
+        // --- 巡检报告 ---
+        "report_generate" => Ok(to_v(crate::report::report_generate_impl(
+            s_arg(a, "sid"),
+            u_arg(a, "hours"),
+            opt_s(a, "dest_dir"),
+            &ctx.sessions,
+        ).await?)),
+        // 桌面版是"在文件管理器里定位"；浏览器里没有这个概念，报告已经落盘
+        "report_reveal" => Ok(Value::Null),
+
+        // --- AI ---
+        "ai_profile_save" => Ok(to_v(crate::ai_commands::ai_profile_save(
+            t_arg(a, "profile")?,
+            opt_s(a, "key"),
+        )?)),
+        "ai_profile_delete" => Ok(to_v(crate::ai_commands::ai_profile_delete(s_arg(a, "id"))?)),
+        "ai_set_active" => Ok(to_v(crate::ai_commands::ai_set_active(s_arg(a, "id"))?)),
+        "ai_set_explain_profile" => Ok(to_v(crate::ai_commands::ai_set_explain_profile(
+            s_arg(a, "id"),
+        )?)),
+        "ai_set_report_summary" => crate::ai_commands::ai_set_report_summary(b_arg(a, "on", false))
+            .map(|_| Value::Null),
+        "ai_key_has" => Ok(json!(crate::ai_commands::ai_key_has(s_arg(a, "id")))),
+        "ai_key_delete" => crate::ai_commands::ai_key_delete(s_arg(a, "id")).map(|_| Value::Null),
+        "ai_presets" => Ok(to_v(crate::ai_commands::ai_presets())),
+        "ai_test" => Ok(json!(crate::ai_commands::ai_test(opt_s(a, "id")).await?)),
+        "ai_chat" => Ok(json!(crate::ai_commands::ai_chat(
+            s_arg(a, "req_id"),
+            arg(a, "kind").and_then(Value::as_str).unwrap_or("chat").to_string(),
+            t_arg(a, "messages")?,
+            opt_s(a, "profile_id"),
+        ).await?)),
+        "ai_cancel" => {
+            crate::ai_commands::ai_cancel(s_arg(a, "req_id"));
+            Ok(Value::Null)
+        }
+        "ai_protocol_label" => Ok(json!(crate::ai_commands::ai_protocol_label(s_arg(
+            a, "protocol"
+        )))),
+        "ai_ask" => Ok(json!(crate::ai_commands::ai_ask_impl(
+            s_arg(a, "req_id"),
+            s_arg(a, "kind"),
+            opt_s(a, "sid"),
+            opt_s(a, "selection"),
+            opt_s(a, "ask"),
+            opt_s(a, "tail"),
+            opt_t_arg(a, "history")?,
+            opt_s(a, "profile_id"),
+            &ctx.sessions,
+        ).await?)),
+
+        // --- 设置 / 主机排序 / 导入导出 / 已知主机 ---
+        "settings_set" => crate::commands::settings_set(t_arg(a, "settings")?).map(|_| Value::Null),
+        "host_reorder" => crate::commands::host_reorder(t_arg(a, "ids")?).map(|_| Value::Null),
+        "groups_reorder" => Ok(to_v(crate::commands::groups_reorder(t_arg(a, "order")?)?)),
+        "known_hosts_remove" => Ok(json!(crate::commands::known_hosts_remove(
+            s_arg(a, "host"),
+            u_arg(a, "port").unwrap_or(22) as u16
+        )?)),
+        "hosts_export" => Ok(json!(crate::commands::hosts_export(
+            s_arg(a, "path"),
+            b_arg(a, "include_secrets", false)
+        )?)),
+        "hosts_import" => Ok(json!(crate::commands::hosts_import(s_arg(a, "path"))?)),
+        "log_set_level" => Ok(to_v(crate::commands::log_set_level(s_arg(a, "level"))?)),
+
+        // --- 原始 connect（前端一般用 connect_host）---
+        "connect" => {
+            let params: crate::ssh::ConnectParams = t_arg(a, "params")?;
+            let sid = crate::ssh::do_connect(params, &ctx.sessions).await?;
+            Ok(json!(sid))
+        }
 
         _ => Err(format!("spike 未实现：{}", cmd)),
     }
@@ -375,6 +666,11 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
 // ---------------------------------------------------------------- 启动
 
 pub async fn run(port: u16) -> anyhow::Result<()> {
+    // 和桌面版 setup 里一样的两步：历史落盘线程、配置迁移。
+    // 少了 history::init() 曲线永远查不到数据（写线程没起）。
+    crate::history::init();
+    crate::store::migrate_settings_file();
+
     let (ev, _) = broadcast::channel::<String>(1024);
     // 业务层的事件出口：转成 WebSocket 消息广播出去
     {
@@ -386,6 +682,8 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     let ctx = Ctx {
         ev,
         sessions: Arc::new(SessionManager::default()),
+        forwards: Arc::new(crate::forward::ForwardManager::default()),
+        sftp: Arc::new(crate::sftp::SftpManager::default()),
         passwords: Arc::new(Mutex::new(HashMap::new())),
         dist: Arc::new(dist_dir()),
     };

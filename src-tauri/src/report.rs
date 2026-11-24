@@ -1338,12 +1338,12 @@ async fn ai_summary(d: &ReportData) -> Result<(String, Option<String>)> {
 }
 
 #[tauri::command]
-pub async fn report_generate(
-    sid: String,
-    state: State<'_, SessionManager>,
-    hours: Option<u64>,
-    dest_dir: Option<String>,
-) -> std::result::Result<ReportResult, String> {
+pub async fn report_generate(sid: String, hours: Option<u64>, dest_dir: Option<String>, state: State<'_, SessionManager>) -> std::result::Result<ReportResult, String> {
+    report_generate_impl(sid, hours, dest_dir, state.inner()).await
+}
+
+/// 同 [`report_generate`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn report_generate_impl(sid: String, hours: Option<u64>, dest_dir: Option<String>, state: &SessionManager) -> std::result::Result<ReportResult, String> {
     let handle = {
         let sessions = state.sessions.lock().await;
         sessions

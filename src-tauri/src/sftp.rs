@@ -155,7 +155,7 @@ pub struct TransferProgress {
     pub message: Option<String>,
 }
 
-fn emit(app: &AppHandle, p: &TransferProgress) {
+fn emit(p: &TransferProgress) {
     crate::emit::emit("sftp://progress", p);
 }
 
@@ -164,12 +164,12 @@ fn emit(app: &AppHandle, p: &TransferProgress) {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn sftp_list(
-    sid: String,
-    path: Option<String>,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<RemoteListing, String> {
+pub async fn sftp_list(sid: String, path: Option<String>, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<RemoteListing, String> {
+    sftp_list_impl(sid, path, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_list`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_list_impl(sid: String, path: Option<String>, mgr: &SftpManager, sessions: &SessionManager) -> Result<RemoteListing, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     // 家目录：SFTP 的 "." 解析成绝对路径，用它做初始目录
     let home = sftp.canonicalize(".").await.map_err(e)?;
@@ -238,12 +238,12 @@ pub async fn sftp_list(
 }
 
 #[tauri::command]
-pub async fn sftp_stat(
-    sid: String,
-    path: String,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<Option<RemoteStat>, String> {
+pub async fn sftp_stat(sid: String, path: String, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<Option<RemoteStat>, String> {
+    sftp_stat_impl(sid, path, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_stat`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_stat_impl(sid: String, path: String, mgr: &SftpManager, sessions: &SessionManager) -> Result<Option<RemoteStat>, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     match sftp.metadata(&path).await {
         Ok(md) => Ok(Some(RemoteStat {
@@ -256,24 +256,23 @@ pub async fn sftp_stat(
 }
 
 #[tauri::command]
-pub async fn sftp_mkdir(
-    sid: String,
-    path: String,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<(), String> {
+pub async fn sftp_mkdir(sid: String, path: String, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<(), String> {
+    sftp_mkdir_impl(sid, path, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_mkdir`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_mkdir_impl(sid: String, path: String, mgr: &SftpManager, sessions: &SessionManager) -> Result<(), String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     sftp.create_dir(&path).await.map_err(e)
 }
 
 #[tauri::command]
-pub async fn sftp_rename(
-    sid: String,
-    from: String,
-    to: String,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<(), String> {
+pub async fn sftp_rename(sid: String, from: String, to: String, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<(), String> {
+    sftp_rename_impl(sid, from, to, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_rename`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_rename_impl(sid: String, from: String, to: String, mgr: &SftpManager, sessions: &SessionManager) -> Result<(), String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     sftp.rename(&from, &to).await.map_err(e)
 }
@@ -305,14 +304,12 @@ fn remove_tree<'a>(
 }
 
 #[tauri::command]
-pub async fn sftp_remove(
-    sid: String,
-    path: String,
-    is_dir: bool,
-    recursive: bool,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<(), String> {
+pub async fn sftp_remove(sid: String, path: String, is_dir: bool, recursive: bool, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<(), String> {
+    sftp_remove_impl(sid, path, is_dir, recursive, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_remove`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_remove_impl(sid: String, path: String, is_dir: bool, recursive: bool, mgr: &SftpManager, sessions: &SessionManager) -> Result<(), String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     let md = sftp.symlink_metadata(&path).await.map_err(e)?;
     let real_dir = md.is_dir() && !md.is_symlink();
@@ -337,6 +334,11 @@ pub async fn sftp_remove(
 /// 标签关闭时调用：丢掉这条连接的 SFTP 通道。
 #[tauri::command]
 pub async fn sftp_forget(sid: String, mgr: State<'_, SftpManager>) -> Result<(), String> {
+    sftp_forget_impl(sid, mgr.inner()).await
+}
+
+/// 同 [`sftp_forget`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_forget_impl(sid: String, mgr: &SftpManager) -> Result<(), String> {
     mgr.forget(&sid).await;
     Ok(())
 }
@@ -359,7 +361,6 @@ pub type Sink<'a> = &'a (dyn Fn(&TransferProgress) + Send + Sync);
 
 /// 把一次传输的收尾统一在一处：定终态 → 推最后一帧 → 从任务表里摘掉自己。
 fn finish(
-    app: AppHandle,
     mgr: SftpManager,
     task_id: String,
     outcome: Outcome,
@@ -373,7 +374,7 @@ fn finish(
             "error".to_string()
         }
     };
-    emit(&app, &p);
+    emit(&p);
     tokio::spawn(async move {
         mgr.transfers.lock().await.remove(&task_id);
     });
@@ -400,7 +401,6 @@ fn begin(sid: &str, direction: &str, local: &str, remote: &str, total: u64) -> T
 
 /// 起一个上传任务。命令和"整目录上传"都走这里，避免同一段 spawn 写三遍。
 async fn spawn_upload(
-    app: &AppHandle,
     mgr: &SftpManager,
     sid: &str,
     sftp: &Arc<SftpSession>,
@@ -415,7 +415,7 @@ async fn spawn_upload(
         .await
         .insert(task_id.clone(), cancel.clone());
     let total = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
-    let (app2, mgr2, sid2, tid) = (app.clone(), mgr.clone(), sid.to_string(), task_id.clone());
+    let (mgr2, sid2, tid) = (mgr.clone(), sid.to_string(), task_id.clone());
     let sftp2 = sftp.clone();
     tokio::spawn(async move {
         let mut p = begin(&sid2, "up", &local, &remote, total);
@@ -426,14 +426,13 @@ async fn spawn_upload(
             };
             upload_task(&sink, &mut p, &sftp2, &local, &remote, resume, &cancel).await
         };
-        finish(app2, mgr2, tid, outcome, p);
+        finish(mgr2, tid, outcome, p);
     });
     task_id
 }
 
 /// 起一个下载任务。
 async fn spawn_download(
-    app: &AppHandle,
     mgr: &SftpManager,
     sid: &str,
     sftp: &Arc<SftpSession>,
@@ -448,7 +447,7 @@ async fn spawn_download(
         .lock()
         .await
         .insert(task_id.clone(), cancel.clone());
-    let (app2, mgr2, sid2, tid) = (app.clone(), mgr.clone(), sid.to_string(), task_id.clone());
+    let (mgr2, sid2, tid) = (mgr.clone(), sid.to_string(), task_id.clone());
     let sftp2 = sftp.clone();
     tokio::spawn(async move {
         let mut p = begin(&sid2, "down", &local, &remote, total);
@@ -459,25 +458,22 @@ async fn spawn_download(
             };
             download_task(&sink, &mut p, &sftp2, &remote, &local, resume, &cancel).await
         };
-        finish(app2, mgr2, tid, outcome, p);
+        finish(mgr2, tid, outcome, p);
     });
     task_id
 }
 
 #[tauri::command]
-pub async fn sftp_upload(
-    app: AppHandle,
-    sid: String,
-    local: String,
-    remote: String,
-    resume: bool,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<String, String> {
+pub async fn sftp_upload(sid: String, local: String, remote: String, resume: bool, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<String, String> {
+    sftp_upload_impl(sid, local, remote, resume, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_upload`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_upload_impl(sid: String, local: String, remote: String, resume: bool, mgr: &SftpManager, sessions: &SessionManager) -> Result<String, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     std::fs::metadata(&local)
         .map_err(|err| err_kind("local_fs_error", format!("读取本地文件失败：{err}")))?;
-    Ok(spawn_upload(&app, mgr.inner(), &sid, &sftp, local, remote, resume).await)
+    Ok(spawn_upload(mgr, &sid, &sftp, local, remote, resume).await)
 }
 
 /// 传输主体。返回 `Outcome`：正常完成 / 用户取消 / 出错。
@@ -563,32 +559,27 @@ async fn upload_inner(
 }
 
 #[tauri::command]
-pub async fn sftp_download(
-    app: AppHandle,
-    sid: String,
-    remote: String,
-    local: String,
-    resume: bool,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<String, String> {
+pub async fn sftp_download(sid: String, remote: String, local: String, resume: bool, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<String, String> {
+    sftp_download_impl(sid, remote, local, resume, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_download`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_download_impl(sid: String, remote: String, local: String, resume: bool, mgr: &SftpManager, sessions: &SessionManager) -> Result<String, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     let total = sftp.metadata(&remote).await.map_err(e)?.len();
-    Ok(spawn_download(&app, mgr.inner(), &sid, &sftp, remote, local, total, resume).await)
+    Ok(spawn_download(mgr, &sid, &sftp, remote, local, total, resume).await)
 }
 
 /// 整目录上传：本地递归走一遍，远端按需建目录，每个文件一条独立任务。
 ///
 /// 返回文件条数；目录结构本身不占进度条（秒建），只有文件才推进度。
 #[tauri::command]
-pub async fn sftp_upload_dir(
-    app: AppHandle,
-    sid: String,
-    local: String,
-    remote: String,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<usize, String> {
+pub async fn sftp_upload_dir(sid: String, local: String, remote: String, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<usize, String> {
+    sftp_upload_dir_impl(sid, local, remote, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_upload_dir`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_upload_dir_impl(sid: String, local: String, remote: String, mgr: &SftpManager, sessions: &SessionManager) -> Result<usize, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     let root = std::path::PathBuf::from(&local);
     if !root.is_dir() {
@@ -599,7 +590,7 @@ pub async fn sftp_upload_dir(
         .await
         .map_err(|err| err_kind("local_fs_error", format!("遍历本地目录失败：{err}")))?;
 
-    let mgr2 = mgr.inner().clone();
+    let mgr2 = mgr.clone();
     let mut made: Vec<String> = vec![remote.clone()];
     if sftp.metadata(&remote).await.is_err() {
         sftp.create_dir(&remote).await.map_err(e)?;
@@ -611,7 +602,6 @@ pub async fn sftp_upload_dir(
             ensure_remote_dir(&sftp, &parent, &mut made).await?;
         }
         spawn_upload(
-            &app,
             &mgr2,
             &sid,
             &sftp,
@@ -626,14 +616,12 @@ pub async fn sftp_upload_dir(
 
 /// 整目录下载：远端递归列一遍，本地按需建目录。
 #[tauri::command]
-pub async fn sftp_download_dir(
-    app: AppHandle,
-    sid: String,
-    remote: String,
-    local: String,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<usize, String> {
+pub async fn sftp_download_dir(sid: String, remote: String, local: String, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<usize, String> {
+    sftp_download_dir_impl(sid, remote, local, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_download_dir`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_download_dir_impl(sid: String, remote: String, local: String, mgr: &SftpManager, sessions: &SessionManager) -> Result<usize, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     let md = sftp.metadata(&remote).await.map_err(e)?;
     if !md.is_dir() {
@@ -643,7 +631,7 @@ pub async fn sftp_download_dir(
     std::fs::create_dir_all(&local)
         .map_err(|err| err_kind("local_fs_error", format!("建本地目录失败：{err}")))?;
 
-    let mgr2 = mgr.inner().clone();
+    let mgr2 = mgr.clone();
     let sep = if local.contains('\\') { "\\" } else { "/" };
     for (remote_file, rel) in &files {
         let local_file = format!(
@@ -662,7 +650,6 @@ pub async fn sftp_download_dir(
             .map(|m| m.len())
             .unwrap_or(0);
         spawn_download(
-            &app,
             &mgr2,
             &sid,
             &sftp,
@@ -847,6 +834,11 @@ async fn download_inner(
 
 #[tauri::command]
 pub async fn sftp_cancel(task_id: String, mgr: State<'_, SftpManager>) -> Result<bool, String> {
+    sftp_cancel_impl(task_id, mgr.inner()).await
+}
+
+/// 同 [`sftp_cancel`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_cancel_impl(task_id: String, mgr: &SftpManager) -> Result<bool, String> {
     let map = mgr.transfers.lock().await;
     match map.get(&task_id) {
         Some(flag) => {
@@ -862,13 +854,12 @@ pub async fn sftp_cancel(task_id: String, mgr: State<'_, SftpManager>) -> Result
 /// 固定目录而不是"当前 pwd"：拿远端 shell 的 cwd 要往 PTY 里塞命令、还得解析
 /// 提示符，脆且会污染终端输出；固定目录可预测、可复用。
 #[tauri::command]
-pub async fn sftp_upload_drop(
-    app: AppHandle,
-    sid: String,
-    paths: Vec<String>,
-    mgr: State<'_, SftpManager>,
-    sessions: State<'_, SessionManager>,
-) -> Result<Vec<String>, String> {
+pub async fn sftp_upload_drop(sid: String, paths: Vec<String>, mgr: State<'_, SftpManager>, sessions: State<'_, SessionManager>) -> Result<Vec<String>, String> {
+    sftp_upload_drop_impl(sid, paths, mgr.inner(), sessions.inner()).await
+}
+
+/// 同 [`sftp_upload_drop`]，不依赖 Tauri 的 State（web/Electron 壳用）。
+pub async fn sftp_upload_drop_impl(sid: String, paths: Vec<String>, mgr: &SftpManager, sessions: &SessionManager) -> Result<Vec<String>, String> {
     let sftp = mgr.acquire(&sid, &sessions).await?;
     let home = sftp.canonicalize(".").await.map_err(e)?;
     let dir = join_path(&home, "sshbox-uploads");
@@ -893,9 +884,8 @@ pub async fn sftp_upload_drop(
             .await
             .insert(task_id.clone(), cancel.clone());
 
-        let (app2, mgr2, sid2, remote2, tid) = (
-            app.clone(),
-            mgr.inner().clone(),
+        let (mgr2, sid2, remote2, tid) = (
+            mgr.clone(),
             sid.clone(),
             remote.clone(),
             task_id.clone(),
@@ -911,7 +901,7 @@ pub async fn sftp_upload_drop(
                 };
                 upload_task(&sink, &mut p, &sftp2, &local2, &remote2, true, &cancel).await
             };
-            finish(app2, mgr2, tid, outcome, p);
+            finish(mgr2, tid, outcome, p);
         });
         out.push(remote);
     }
