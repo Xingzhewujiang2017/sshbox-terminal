@@ -14,6 +14,7 @@ mod report;
 mod sftp;
 mod ssh;
 mod store;
+mod vault;
 
 // 实验性：浏览器当界面的 HTTP+WS 服务。只在 --features web 时编进来，
 // 正常构建（Windows 桌面版）完全不受影响。

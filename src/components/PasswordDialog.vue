@@ -62,7 +62,7 @@ function submit() {
 
       <label v-if="!isPassphrase" class="check">
         <input v-model="save" type="checkbox" />
-        <span>保存到系统凭据管理器</span>
+        <span>保存密码（加密存储）</span>
       </label>
 
       <div class="btns">

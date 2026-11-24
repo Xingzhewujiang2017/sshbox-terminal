@@ -240,6 +240,9 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
             if password.as_deref().unwrap_or("").is_empty() {
                 password = ctx.passwords.lock().ok().and_then(|m| m.get(&host_id).cloned());
             }
+            if password.as_deref().unwrap_or("").is_empty() {
+                password = crate::vault::get(&host_id);
+            }
             let key_passphrase = arg(a, "key_passphrase")
                 .and_then(Value::as_str)
                 .map(str::to_string);
@@ -355,11 +358,18 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
             .map_err(|e| format!("主机数据无效: {}", e))?;
             let saved = store::upsert_host(host).map_err(|e| e.to_string())?;
             if let Some(pw) = arg(a, "password").and_then(Value::as_str).filter(|p| !p.is_empty()) {
-                if let Ok(mut m) = ctx.passwords.lock() {
-                    m.insert(saved.id.clone(), pw.to_string());
+                // 保险箱已解锁就落加密文件；没解锁就只放内存（关掉即失效）
+                let mut stored = false;
+                if crate::vault::is_unlocked() {
+                    match crate::vault::set(&saved.id, pw) {
+                        Ok(()) => stored = true,
+                        Err(e) => println!("[web] 写入保险箱失败: {}", e),
+                    }
                 }
-                if let Err(e) = store::set_secret(&saved.id, pw) {
-                    println!("[web] 凭据管理器不可用（验证件里属预期）: {}", e);
+                if !stored {
+                    if let Ok(mut m) = ctx.passwords.lock() {
+                        m.insert(saved.id.clone(), pw.to_string());
+                    }
                 }
             }
             Ok(serde_json::to_value(saved).unwrap_or(Value::Null))
@@ -377,10 +387,13 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
         "credential_set" => {
             let id = s_arg(a, "id");
             let pw = s_arg(a, "password");
-            if let Ok(mut m) = ctx.passwords.lock() {
-                m.insert(id.clone(), pw.clone());
+            if crate::vault::is_unlocked() {
+                crate::vault::set(&id, &pw)?;
+            } else {
+                if let Ok(mut m) = ctx.passwords.lock() {
+                    m.insert(id.clone(), pw.clone());
+                }
             }
-            let _ = store::set_secret(&id, &pw);
             Ok(Value::Null)
         }
         "credential_delete" => {
@@ -388,16 +401,36 @@ async fn dispatch(ctx: &Ctx, cmd: &str, a: &Value) -> Result<Value, String> {
             if let Ok(mut m) = ctx.passwords.lock() {
                 m.remove(&id);
             }
-            let _ = store::delete_secret(&id);
+            if crate::vault::is_unlocked() {
+                let _ = crate::vault::remove(&id);
+            }
             Ok(Value::Null)
         }
         "credential_has" => {
             let id = s_arg(a, "id");
-            let has = ctx.passwords.lock().map(|m| m.contains_key(&id)).unwrap_or(false);
-            Ok(json!(has))
+            let mem = ctx.passwords.lock().map(|m| m.contains_key(&id)).unwrap_or(false);
+            Ok(json!(mem || crate::vault::get(&id).is_some()))
         }
-        // 验证件不落盘密码，所以"凭据管理器可用"恒为 false
-        "credential_store_status" => Ok(json!(false)),
+        // 有保险箱文件 = 能持久化密码（前端据此决定要不要显示"保存密码"）
+        "credential_store_status" => Ok(json!(crate::vault::exists() || crate::vault::is_unlocked())),
+
+        // --- 凭据保险箱（主密码）---
+        "vault_status" => Ok(json!({
+            "initialized": crate::vault::exists(),
+            "unlocked": crate::vault::is_unlocked(),
+        })),
+        "vault_init" => {
+            crate::vault::init(&s_arg(a, "master"))?;
+            Ok(Value::Null)
+        }
+        "vault_unlock" => {
+            crate::vault::unlock(&s_arg(a, "master"))?;
+            Ok(Value::Null)
+        }
+        "vault_lock" => {
+            crate::vault::lock();
+            Ok(Value::Null)
+        }
 
         // --- 历史（曲线/统计/导出）---
         "history_range" => Ok(to_v(crate::history::history_range(

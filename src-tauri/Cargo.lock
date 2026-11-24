@@ -5147,6 +5147,7 @@ dependencies = [
  "libc",
  "log",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "russh",
  "russh-sftp",

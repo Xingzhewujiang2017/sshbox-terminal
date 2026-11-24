@@ -631,6 +631,12 @@ export const api = {
   reportReveal: (path: string) => call<void>('report_reveal', { path }),
 
   // known_hosts
+  // 凭据保险箱（Linux/Electron 壳用；Windows 桌面版没有这几个命令）
+  vaultStatus: () => call<{ initialized: boolean; unlocked: boolean }>('vault_status'),
+  vaultInit: (master: string) => call<void>('vault_init', { master }),
+  vaultUnlock: (master: string) => call<void>('vault_unlock', { master }),
+  vaultLock: () => call<void>('vault_lock'),
+
   knownHostsList: () => call<KnownHostEntry[]>('known_hosts_list'),
   knownHostsRemove: (host: string, port: number) =>
     call<number>('known_hosts_remove', { host, port }),

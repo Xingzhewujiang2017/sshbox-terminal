@@ -15,7 +15,7 @@ use std::time::Instant;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::State;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
 

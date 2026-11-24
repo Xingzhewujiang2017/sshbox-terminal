@@ -19,6 +19,7 @@ import HostList from './components/HostList.vue'
 import HostDialog from './components/HostDialog.vue'
 import HostKeyDialog from './components/HostKeyDialog.vue'
 import PasswordDialog from './components/PasswordDialog.vue'
+import VaultDialog from './components/VaultDialog.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import {
   applyTheme,
@@ -122,6 +123,33 @@ function toast(kind: 'error' | 'info', text: string) {
   if (kind === 'info') window.setTimeout(() => (banner.value = null), 4000)
 }
 
+// --- 凭据保险箱（Linux/Electron 壳）----------------------------------------
+// Windows 桌面版没有 vault_* 命令，调用会抛错 —— 直接忽略，不弹框。
+const vaultPrompt = ref<null | { mode: 'setup' | 'unlock' }>(null)
+const vaultError = ref('')
+
+async function checkVault() {
+  try {
+    const st = await api.vaultStatus()
+    if (!st.unlocked) vaultPrompt.value = { mode: st.initialized ? 'unlock' : 'setup' }
+  } catch {
+    /* 桌面版没有这个能力 */
+  }
+}
+
+async function onVaultSubmit(master: string) {
+  const mode = vaultPrompt.value?.mode
+  vaultError.value = ''
+  try {
+    if (mode === 'setup') await api.vaultInit(master)
+    else await api.vaultUnlock(master)
+    vaultPrompt.value = null
+    toast('info', mode === 'setup' ? '主密码已设置：主机密码将加密保存' : '凭据保险箱已解锁')
+  } catch (e) {
+    vaultError.value = (e as Error).message
+  }
+}
+
 // --- data loading ----------------------------------------------------------
 async function loadAll() {
   hosts.value = await api.hostsList()
@@ -150,6 +178,7 @@ onMounted(async () => {
   } catch (e) {
     toast('error', `初始化失败: ${(e as Error).message}`)
   }
+  void checkVault()
   listen<{ sid: string; host_id?: string; label?: string }>('ssh://closed', (ev) => {
     const t = tabs.value.find((x) => x.sid === ev.payload.sid)
     if (t) markClosed(t)
@@ -1294,6 +1323,14 @@ function statusDot(t: Tab) {
       :attempt-error="passwordPrompt.attemptError"
       @submit="(pw, save) => passwordPrompt?.submit(pw, save)"
       @cancel="passwordPrompt = null"
+    />
+
+    <VaultDialog
+      v-if="vaultPrompt"
+      :mode="vaultPrompt.mode"
+      :error="vaultError"
+      @submit="onVaultSubmit"
+      @skip="vaultPrompt = null"
     />
 
     <SettingsDialog
